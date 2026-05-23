@@ -240,8 +240,8 @@ Those builds are available as
 Tagged versions create a GitHub Release and upload the platform archives:
 
 ```bash
-git tag v0.2.2
-git push origin v0.2.2
+git tag v0.2.3
+git push origin v0.2.3
 ```
 
 ## Design Notes
@@ -304,3 +304,7 @@ Unsupported flags are rejected instead of silently changing semantics.
 
 The explicit `search` subcommand is optional. `./indexsearch PATTERN` searches
 directly, like `rg PATTERN`.
+
+Use `is --help` for the top-level command summary and
+`is <command> --help` for command-specific options, such as `is install --help`
+or `is watch --help`.

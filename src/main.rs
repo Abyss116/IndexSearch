@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -289,18 +289,30 @@ fn run() -> Result<()> {
     match args[0].as_str() {
         "index" => {
             args.remove(0);
+            if maybe_print_command_help("index", &args) {
+                std::process::exit(0);
+            }
             std::process::exit(command_index(&args)?);
         }
         "update" => {
             args.remove(0);
+            if maybe_print_command_help("update", &args) {
+                std::process::exit(0);
+            }
             std::process::exit(command_update(&args)?);
         }
         "compact" => {
             args.remove(0);
+            if maybe_print_command_help("compact", &args) {
+                std::process::exit(0);
+            }
             std::process::exit(command_compact(&args)?);
         }
         "watch" => {
             args.remove(0);
+            if maybe_print_command_help("watch", &args) {
+                std::process::exit(0);
+            }
             std::process::exit(command_watch(&args)?);
         }
         "watch-daemon" => {
@@ -308,27 +320,45 @@ fn run() -> Result<()> {
             std::process::exit(command_watch_daemon(&args)?);
         }
         "list-watches" | "watch-list" => {
-            args.remove(0);
+            let command = args.remove(0);
+            if maybe_print_command_help(&command, &args) {
+                std::process::exit(0);
+            }
             std::process::exit(command_list_watches(&args)?);
         }
         "unwatch" => {
             args.remove(0);
+            if maybe_print_command_help("unwatch", &args) {
+                std::process::exit(0);
+            }
             std::process::exit(command_unwatch(&args)?);
         }
         "watch-log" => {
             args.remove(0);
+            if maybe_print_command_help("watch-log", &args) {
+                std::process::exit(0);
+            }
             std::process::exit(command_watch_log(&args)?);
         }
         "install" => {
             args.remove(0);
+            if maybe_print_command_help("install", &args) {
+                std::process::exit(0);
+            }
             std::process::exit(command_install(&args)?);
         }
         "status" => {
             args.remove(0);
+            if maybe_print_command_help("status", &args) {
+                std::process::exit(0);
+            }
             std::process::exit(command_status(&args)?);
         }
         "search" => {
             args.remove(0);
+            if maybe_print_command_help("search", &args) {
+                std::process::exit(0);
+            }
             std::process::exit(command_search(&args)?);
         }
         "-h" | "--help" => {
@@ -344,48 +374,389 @@ fn run() -> Result<()> {
 }
 
 fn print_help() {
+    let style = HelpStyle::new();
+    help_section(&style, "Usage");
     println!(
-        "usage: indexsearch [OPTIONS] PATTERN [PATH ...]\n       indexsearch <index|update|compact|watch|list-watches|unwatch|watch-log|install|status|search> [ARGS]\n\n\
-Common rg-like options:\n\
-  -i, --ignore-case        case insensitive search\n\
-  -s, --case-sensitive     case sensitive search\n\
-  -S, --smart-case         smart case search\n\
-  -F, --fixed-strings      treat pattern as a literal\n\
-  -w, --word-regexp        require word boundaries\n\
-  -e, --regexp PATTERN     search pattern\n\
-  -g, --glob GLOB          include/exclude path glob\n\
-  -n, --line-number        show line numbers\n\
-  -N, --no-line-number     suppress line numbers\n\
-      --column             show columns\n\
-  -H, --with-filename      always show file names\n\
-  -I, --no-filename        never show file names\n\
-  -l, --files-with-matches print matching file paths\n\
-  -c, --count              print match counts per file\n\
-  -o, --only-matching      print only matching text\n\
-  -q, --quiet              suppress normal output\n\
-      --files              print indexed searchable files\n\
-      --json               print JSON Lines matches\n\
-      --vimgrep            print path:line:column:line\n\
-  -m, --max-count NUM      max matching lines per file\n\
-      --max-filesize SIZE  skip larger files while indexing\n\
-      --hidden             index/search hidden paths\n\
-  -L, --follow             follow symlinks while indexing\n\
-      --git                update from Git changed paths when possible\n\
-      --git-untracked      include untracked files with --git update\n\
-      --stats              print search stats\n\n\
-Index/update options:\n\
-      --max-filesize SIZE  skip larger files while indexing\n\
-      --hidden             include hidden paths while indexing\n\
-  -L, --follow             follow symlinks while indexing\n\
-      --git                update from Git changed paths when possible\n\
-      --git-untracked      include untracked files with --git update\n\n\
-Watch options:\n\
-      --idle-seconds NUM           idle seconds before checking auto compact (default: 5)\n\
-      --compact-delta-count NUM    compact after this many delta segments (default: 16)\n\
-      --compact-delta-bytes SIZE   compact after this total delta size (default: 256mb)\n\n\
-Install options:\n\
-      --dir PATH           install indexsearch and is into PATH"
+        "  {} {} {}",
+        style.cmd("indexsearch"),
+        style.opt("[OPTIONS]"),
+        style.meta("PATTERN [PATH ...]")
     );
+    println!(
+        "  {} {} {}",
+        style.cmd("indexsearch"),
+        style.meta("<COMMAND>"),
+        style.opt("[ARGS]")
+    );
+    println!();
+
+    help_section(&style, "Commands");
+    help_command(
+        &style,
+        "index [PATH]",
+        "rebuild the base index from scratch",
+    );
+    help_command(
+        &style,
+        "update [PATH]",
+        "incrementally update or rebuild the index",
+    );
+    help_command(
+        &style,
+        "compact [PATH]",
+        "fold delta indexes into the base index",
+    );
+    help_command(
+        &style,
+        "watch [PATH]",
+        "start a background watcher for a root",
+    );
+    help_command(&style, "list-watches", "list active watcher records");
+    help_command(&style, "unwatch <ID|PATH>", "stop a watcher");
+    help_command(
+        &style,
+        "watch-log [PATH]",
+        "print watcher activity for a root",
+    );
+    help_command(
+        &style,
+        "install [--dir PATH]",
+        "install indexsearch and the is alias",
+    );
+    help_command(&style, "status [PATH]", "print index status");
+    help_command(
+        &style,
+        "search [OPTIONS] PATTERN [PATH ...]",
+        "explicit search mode",
+    );
+    println!();
+
+    help_section(&style, "Common Search Options");
+    help_option(&style, "-i, --ignore-case", "case insensitive search");
+    help_option(&style, "-s, --case-sensitive", "case sensitive search");
+    help_option(&style, "-S, --smart-case", "smart case search");
+    help_option(&style, "-F, --fixed-strings", "treat pattern as a literal");
+    help_option(&style, "-w, --word-regexp", "require word boundaries");
+    help_option(&style, "-e, --regexp PATTERN", "search pattern");
+    help_option(&style, "-g, --glob GLOB", "include or exclude path glob");
+    help_option(&style, "-n, --line-number", "show line numbers");
+    help_option(&style, "-N, --no-line-number", "suppress line numbers");
+    help_option(&style, "--column", "show columns");
+    help_option(&style, "-H, --with-filename", "always show file names");
+    help_option(&style, "-I, --no-filename", "never show file names");
+    help_option(
+        &style,
+        "-l, --files-with-matches",
+        "print matching file paths",
+    );
+    help_option(&style, "-c, --count", "print match counts per file");
+    help_option(&style, "-o, --only-matching", "print only matching text");
+    help_option(&style, "-q, --quiet", "suppress normal output");
+    help_option(&style, "--files", "print indexed searchable files");
+    help_option(&style, "--json", "print JSON Lines matches");
+    help_option(&style, "--vimgrep", "print path:line:column:line");
+    help_option(&style, "-m, --max-count NUM", "max matching lines per file");
+    help_option(&style, "--stats", "print search stats");
+    println!();
+
+    help_section(&style, "Indexing Options");
+    help_option(
+        &style,
+        "--max-filesize SIZE",
+        "skip larger files while indexing",
+    );
+    help_option(&style, "--hidden", "include hidden paths while indexing");
+    help_option(&style, "-L, --follow", "follow symlinks while indexing");
+    help_option(
+        &style,
+        "--git",
+        "update from Git changed paths when possible",
+    );
+    help_option(
+        &style,
+        "--git-untracked",
+        "include untracked files with --git update",
+    );
+    println!();
+
+    println!(
+        "Run {} for command-specific options.",
+        style.cmd("indexsearch <COMMAND> --help")
+    );
+}
+
+fn maybe_print_command_help(command: &str, args: &[String]) -> bool {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_command_help(command);
+        true
+    } else {
+        false
+    }
+}
+
+fn print_command_help(command: &str) {
+    match command {
+        "index" => print_index_help(),
+        "update" => print_update_help(),
+        "compact" => print_compact_help(),
+        "watch" => print_watch_help(),
+        "list-watches" | "watch-list" => print_list_watches_help(),
+        "unwatch" => print_unwatch_help(),
+        "watch-log" => print_watch_log_help(),
+        "install" => print_install_help(),
+        "status" => print_status_help(),
+        "search" => print_search_help(),
+        _ => print_help(),
+    }
+}
+
+fn print_index_help() {
+    let style = HelpStyle::new();
+    command_usage(
+        &style,
+        "index",
+        "[OPTIONS] [PATH]",
+        "rebuild the base index from scratch",
+    );
+    help_section(&style, "Options");
+    help_option(
+        &style,
+        "--max-filesize SIZE",
+        "skip larger files while indexing",
+    );
+    help_option(&style, "--hidden", "include hidden paths while indexing");
+    help_option(&style, "-L, --follow", "follow symlinks while indexing");
+}
+
+fn print_update_help() {
+    let style = HelpStyle::new();
+    command_usage(
+        &style,
+        "update",
+        "[OPTIONS] [PATH]",
+        "incrementally update or rebuild the index",
+    );
+    help_section(&style, "Options");
+    help_option(
+        &style,
+        "--max-filesize SIZE",
+        "skip larger files while indexing",
+    );
+    help_option(&style, "--hidden", "include hidden paths while indexing");
+    help_option(&style, "-L, --follow", "follow symlinks while indexing");
+    help_option(
+        &style,
+        "--git",
+        "update from Git changed paths when possible",
+    );
+    help_option(
+        &style,
+        "--git-untracked",
+        "include untracked files with --git update",
+    );
+}
+
+fn print_compact_help() {
+    let style = HelpStyle::new();
+    command_usage(
+        &style,
+        "compact",
+        "[PATH]",
+        "fold delta indexes into the base index",
+    );
+}
+
+fn print_watch_help() {
+    let style = HelpStyle::new();
+    command_usage(
+        &style,
+        "watch",
+        "[OPTIONS] [PATH]",
+        "start a background watcher for a root",
+    );
+    help_section(&style, "Options");
+    help_option(
+        &style,
+        "--idle-seconds NUM",
+        "idle seconds before checking auto compact (default: 5)",
+    );
+    help_option(
+        &style,
+        "--compact-delta-count NUM",
+        "compact after this many delta segments (default: 16)",
+    );
+    help_option(
+        &style,
+        "--compact-delta-bytes SIZE",
+        "compact after this total delta size (default: 256mb)",
+    );
+}
+
+fn print_list_watches_help() {
+    let style = HelpStyle::new();
+    command_usage(&style, "list-watches", "", "list active watcher records");
+}
+
+fn print_unwatch_help() {
+    let style = HelpStyle::new();
+    command_usage(&style, "unwatch", "<ID|PATH>", "stop a watcher");
+}
+
+fn print_watch_log_help() {
+    let style = HelpStyle::new();
+    command_usage(
+        &style,
+        "watch-log",
+        "[PATH]",
+        "print watcher activity for a root",
+    );
+}
+
+fn print_install_help() {
+    let style = HelpStyle::new();
+    command_usage(
+        &style,
+        "install",
+        "[OPTIONS] [DIR]",
+        "install indexsearch and the is alias",
+    );
+    help_section(&style, "Options");
+    help_option(
+        &style,
+        "--dir PATH",
+        "install into PATH instead of the user bin directory",
+    );
+}
+
+fn print_status_help() {
+    let style = HelpStyle::new();
+    command_usage(&style, "status", "[PATH]", "print index status");
+}
+
+fn print_search_help() {
+    let style = HelpStyle::new();
+    command_usage(
+        &style,
+        "search",
+        "[OPTIONS] PATTERN [PATH ...]",
+        "search the indexed tree",
+    );
+    help_section(&style, "Options");
+    help_option(&style, "-i, --ignore-case", "case insensitive search");
+    help_option(&style, "-s, --case-sensitive", "case sensitive search");
+    help_option(&style, "-S, --smart-case", "smart case search");
+    help_option(&style, "-F, --fixed-strings", "treat pattern as a literal");
+    help_option(&style, "-w, --word-regexp", "require word boundaries");
+    help_option(&style, "-e, --regexp PATTERN", "search pattern");
+    help_option(&style, "-g, --glob GLOB", "include or exclude path glob");
+    help_option(&style, "-n, --line-number", "show line numbers");
+    help_option(&style, "-N, --no-line-number", "suppress line numbers");
+    help_option(&style, "--column", "show columns");
+    help_option(&style, "-H, --with-filename", "always show file names");
+    help_option(&style, "-I, --no-filename", "never show file names");
+    help_option(
+        &style,
+        "-l, --files-with-matches",
+        "print matching file paths",
+    );
+    help_option(&style, "-c, --count", "print match counts per file");
+    help_option(&style, "-o, --only-matching", "print only matching text");
+    help_option(&style, "-q, --quiet", "suppress normal output");
+    help_option(&style, "--files", "print indexed searchable files");
+    help_option(&style, "--json", "print JSON Lines matches");
+    help_option(&style, "--vimgrep", "print path:line:column:line");
+    help_option(&style, "-m, --max-count NUM", "max matching lines per file");
+    help_option(
+        &style,
+        "--max-filesize SIZE",
+        "skip larger files while auto-indexing",
+    );
+    help_option(
+        &style,
+        "--hidden",
+        "include hidden paths while auto-indexing",
+    );
+    help_option(
+        &style,
+        "-L, --follow",
+        "follow symlinks while auto-indexing",
+    );
+    help_option(&style, "--stats", "print search stats");
+}
+
+fn command_usage(style: &HelpStyle, command: &str, args: &str, description: &str) {
+    help_section(style, "Usage");
+    if args.is_empty() {
+        println!("  {} {}", style.cmd("indexsearch"), style.cmd(command));
+    } else {
+        println!(
+            "  {} {} {}",
+            style.cmd("indexsearch"),
+            style.cmd(command),
+            style.meta(args)
+        );
+    }
+    println!();
+    help_section(style, "Description");
+    println!("  {description}");
+    println!();
+}
+
+fn help_section(style: &HelpStyle, text: &str) {
+    println!("{}", style.heading(text));
+}
+
+fn help_command(style: &HelpStyle, command: &str, description: &str) {
+    help_row(style.cmd(command), command.len(), 42, description);
+}
+
+fn help_option(style: &HelpStyle, option: &str, description: &str) {
+    help_row(style.opt(option), option.len(), 34, description);
+}
+
+fn help_row(label: String, label_len: usize, width: usize, description: &str) {
+    let padding = width.saturating_sub(label_len).max(1);
+    println!("  {label}{}{}", " ".repeat(padding), description);
+}
+
+struct HelpStyle {
+    color: bool,
+}
+
+impl HelpStyle {
+    fn new() -> Self {
+        let force_color = env::var("CLICOLOR_FORCE").is_ok_and(|value| value != "0");
+        Self {
+            color: env::var_os("NO_COLOR").is_none()
+                && (force_color
+                    || (std::io::stdout().is_terminal()
+                        && env::var("TERM").map(|term| term != "dumb").unwrap_or(true))),
+        }
+    }
+
+    fn heading(&self, text: &str) -> String {
+        self.paint(text, "1;36")
+    }
+
+    fn cmd(&self, text: &str) -> String {
+        self.paint(text, "1;32")
+    }
+
+    fn opt(&self, text: &str) -> String {
+        self.paint(text, "1;33")
+    }
+
+    fn meta(&self, text: &str) -> String {
+        self.paint(text, "2")
+    }
+
+    fn paint(&self, text: &str, code: &str) -> String {
+        if self.color {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
+    }
 }
 
 fn command_index(args: &[String]) -> Result<i32> {
@@ -1232,7 +1603,7 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
         };
         match arg.as_str() {
             "-h" | "--help" => {
-                print_help();
+                print_search_help();
                 std::process::exit(0);
             }
             "-i" | "--ignore-case" => options.ignore_case = true,

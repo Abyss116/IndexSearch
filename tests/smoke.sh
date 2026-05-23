@@ -10,6 +10,19 @@ printf 'auto_config_symbol\n' > "$no_cfg_tmp/a.txt"
 ./indexsearch index "$no_cfg_tmp" >/dev/null
 [[ -f "$no_cfg_tmp/index-search-project.txt" ]]
 ./indexsearch -q -F auto_config_symbol "$no_cfg_tmp"
+help_out="$(./indexsearch --help)"
+grep -q 'Commands' <<<"$help_out"
+grep -q 'Common Search Options' <<<"$help_out"
+! grep -q '<init|' <<<"$help_out"
+install_help="$(./indexsearch install --help)"
+grep -q 'install indexsearch and the is alias' <<<"$install_help"
+grep -q -- '--dir PATH' <<<"$install_help"
+watch_help="$(./indexsearch watch --help)"
+grep -q -- '--compact-delta-count NUM' <<<"$watch_help"
+color_help="$(env -u NO_COLOR CLICOLOR_FORCE=1 ./indexsearch --help)"
+grep -q $'\033\\[' <<<"$color_help"
+plain_help="$(NO_COLOR=1 CLICOLOR_FORCE=1 ./indexsearch --help)"
+! grep -q $'\033\\[' <<<"$plain_help"
 
 cat > "$tmp/index-search-project.txt" <<'CFG'
 [IndexSearch.paths.ignore]
