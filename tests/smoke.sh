@@ -4,6 +4,13 @@ set -euo pipefail
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+no_cfg_tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp" "$no_cfg_tmp"' EXIT
+printf 'auto_config_symbol\n' > "$no_cfg_tmp/a.txt"
+./indexsearch index "$no_cfg_tmp" >/dev/null
+[[ -f "$no_cfg_tmp/index-search-project.txt" ]]
+./indexsearch -q -F auto_config_symbol "$no_cfg_tmp"
+
 cat > "$tmp/index-search-project.txt" <<'CFG'
 [IndexSearch.paths.ignore]
 out/

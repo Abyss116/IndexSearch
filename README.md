@@ -53,7 +53,6 @@ cargo build --release
 Then use it from any shell:
 
 ```bash
-is init .
 is index .
 is update .
 is -n "SomeSymbol" .
@@ -61,6 +60,9 @@ is -i -w -g "*.cpp" "render pass" .
 ```
 
 The index is written to `.indexsearch/index.bin`.
+If `index-search-project.txt` does not exist, `index`, `update`, `watch`, and
+search-time auto-indexing create a default one before building the index. Edit
+that file and rerun `is index .` or `is update .` to rebuild with new rules.
 
 `index` always rebuilds from scratch. `update` scans the current tree, compares
 each indexed path against the previous index using stored `mtime` and `size`,
@@ -238,8 +240,8 @@ Those builds are available as
 Tagged versions create a GitHub Release and upload the platform archives:
 
 ```bash
-git tag v0.2.1
-git push origin v0.2.1
+git tag v0.2.2
+git push origin v0.2.2
 ```
 
 ## Design Notes
@@ -288,7 +290,6 @@ Unsupported flags are rejected instead of silently changing semantics.
 ## Commands
 
 ```bash
-./indexsearch init [PATH]
 ./indexsearch index [PATH]
 ./indexsearch update [PATH]
 ./indexsearch compact [PATH]

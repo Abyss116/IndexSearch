@@ -29,6 +29,9 @@ const WATCH_DIR: &str = "watches";
 const LOCK_FILE: &str = "index.lock";
 const STATE_FILE: &str = "state.txt";
 const WATCH_LOG_FILE: &str = "watch.log";
+const DEFAULT_PROJECT_CONFIG: &str = "[IndexSearch.paths.ignore]\n.git/\n.hg/\n.svn/\n.indexsearch/\n\n\
+[IndexSearch.files.ignore]\n*.png\n*.jpg\n*.jpeg\n*.gif\n*.pdf\n*.zip\n*.gz\n*.dll\n*.exe\n*.pdb\n*.o\n*.obj\n\n\
+[IndexSearch.files.include]\n*\n";
 const MAGIC: &[u8; 8] = b"ISIDXR02";
 const VERSION: u32 = 2;
 const DEFAULT_MAX_FILE_SIZE: u64 = 20 * 1024 * 1024;
@@ -284,10 +287,6 @@ fn run() -> Result<()> {
         std::process::exit(2);
     }
     match args[0].as_str() {
-        "init" => {
-            args.remove(0);
-            std::process::exit(command_init(&args)?);
-        }
         "index" => {
             args.remove(0);
             std::process::exit(command_index(&args)?);
@@ -346,7 +345,7 @@ fn run() -> Result<()> {
 
 fn print_help() {
     println!(
-        "usage: indexsearch [OPTIONS] PATTERN [PATH ...]\n       indexsearch <init|index|update|compact|watch|list-watches|unwatch|watch-log|install|status|search> [ARGS]\n\n\
+        "usage: indexsearch [OPTIONS] PATTERN [PATH ...]\n       indexsearch <index|update|compact|watch|list-watches|unwatch|watch-log|install|status|search> [ARGS]\n\n\
 Common rg-like options:\n\
   -i, --ignore-case        case insensitive search\n\
   -s, --case-sensitive     case sensitive search\n\
@@ -389,30 +388,9 @@ Install options:\n\
     );
 }
 
-fn command_init(args: &[String]) -> Result<i32> {
-    let root = args
-        .first()
-        .map(PathBuf::from)
-        .unwrap_or(std::env::current_dir()?);
-    fs::create_dir_all(&root)?;
-    let path = root.join(PROJECT_FILE);
-    if path.exists() {
-        eprintln!("indexsearch: config already exists: {}", path.display());
-        return Ok(1);
-    }
-    fs::write(
-        &path,
-        "[IndexSearch.paths.ignore]\n.git/\n.hg/\n.svn/\n.indexsearch/\n\n\
-[IndexSearch.files.ignore]\n*.png\n*.jpg\n*.jpeg\n*.gif\n*.pdf\n*.zip\n*.gz\n*.dll\n*.exe\n*.pdb\n*.o\n*.obj\n\n\
-[IndexSearch.files.include]\n*\n",
-    )?;
-    println!("{}", path.display());
-    Ok(0)
-}
-
 fn command_index(args: &[String]) -> Result<i32> {
     let (options, start) = parse_index_args(args)?;
-    let cfg = load_config(&start)?;
+    let cfg = load_or_create_config(&start)?;
     let _lock = acquire_exclusive_lock(&cfg.root)?;
     let timer = Instant::now();
     let mut timings = Timings::default();
@@ -446,7 +424,7 @@ fn command_index(args: &[String]) -> Result<i32> {
 
 fn command_update(args: &[String]) -> Result<i32> {
     let (options, start) = parse_index_args(args)?;
-    let cfg = load_config(&start)?;
+    let cfg = load_or_create_config(&start)?;
     let _lock = acquire_exclusive_lock(&cfg.root)?;
     let path = index_path(&cfg.root);
     let timer = Instant::now();
@@ -610,7 +588,7 @@ fn parse_index_args(args: &[String]) -> Result<(Options, PathBuf)> {
 
 fn command_watch(args: &[String]) -> Result<i32> {
     let (watch_options, start) = parse_watch_args(args)?;
-    let cfg = load_config(&start)?;
+    let cfg = load_or_create_config(&start)?;
     fs::create_dir_all(watch_registry_dir())?;
     let id = watch_id(&cfg.root);
     let record_path = watch_record_path(&id);
@@ -1186,7 +1164,11 @@ fn command_search(args: &[String]) -> Result<i32> {
         .first()
         .map(PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
-    let cfg = load_config(&start)?;
+    let cfg = if options.auto_index {
+        load_or_create_config(&start)?
+    } else {
+        load_config(&start)?
+    };
     let _lock = acquire_shared_lock(&cfg.root)?;
     let path = index_path(&cfg.root);
     let mut index = MappedIndex::open(&path);
@@ -1317,16 +1299,27 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
 }
 
 fn load_config(start: &Path) -> Result<ProjectConfig> {
+    load_config_inner(start, false)
+}
+
+fn load_or_create_config(start: &Path) -> Result<ProjectConfig> {
+    load_config_inner(start, true)
+}
+
+fn load_config_inner(start: &Path, create_default: bool) -> Result<ProjectConfig> {
     let root = discover_root(start)?;
     let path = root.join(PROJECT_FILE);
     let text = if path.exists() {
         fs::read_to_string(&path)?
     } else {
-        "[IndexSearch.paths.ignore]\n.git/\n.hg/\n.svn/\n.indexsearch/\n\n\
-[IndexSearch.files.ignore]\n*.png\n*.jpg\n*.jpeg\n*.gif\n*.pdf\n*.zip\n*.gz\n*.dll\n*.exe\n*.pdb\n*.o\n*.obj\n\n\
-[IndexSearch.files.include]\n*\n"
-            .to_string()
+        if create_default {
+            fs::create_dir_all(&root)?;
+            fs::write(&path, DEFAULT_PROJECT_CONFIG)?;
+            eprintln!("indexsearch: created default config: {}", path.display());
+        }
+        DEFAULT_PROJECT_CONFIG.to_string()
     };
+    let has_config = path.exists();
     let sections = parse_sections(&text);
     let paths_ignore = MatcherSet::new(&clean_section(sections.get("IndexSearch.paths.ignore")))?;
     let files_ignore = MatcherSet::new(&clean_section(sections.get("IndexSearch.files.ignore")))?;
@@ -1337,7 +1330,7 @@ fn load_config(start: &Path) -> Result<ProjectConfig> {
     let files_include = MatcherSet::new(&include_lines)?;
     Ok(ProjectConfig {
         root,
-        path: path.exists().then_some(path),
+        path: has_config.then_some(path),
         paths_ignore,
         files_ignore,
         files_include,
@@ -1350,6 +1343,7 @@ fn discover_root(start: &Path) -> Result<PathBuf> {
     if path.is_file() {
         path = path.parent().unwrap_or(Path::new(".")).to_path_buf();
     }
+    let fallback = path.clone();
     loop {
         if path.join(PROJECT_FILE).exists() {
             return Ok(path);
@@ -1358,7 +1352,7 @@ fn discover_root(start: &Path) -> Result<PathBuf> {
             break;
         }
     }
-    Ok(fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf()))
+    Ok(fallback)
 }
 
 fn parse_sections(text: &str) -> BTreeMap<String, Vec<String>> {
