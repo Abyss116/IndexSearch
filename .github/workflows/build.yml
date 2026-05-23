@@ -11,6 +11,9 @@ on:
 permissions:
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     name: ${{ matrix.name }}
@@ -116,5 +119,6 @@ jobs:
           set -euo pipefail
           find release-assets -maxdepth 2 -type f -print
           gh release create "$GITHUB_REF_NAME" release-assets/*/* \
+            --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes
