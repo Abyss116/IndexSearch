@@ -1,0 +1,113 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            artifact: indexsearch-linux-x86_64
+            archive: indexsearch-linux-x86_64.tar.gz
+          - name: macos-aarch64
+            os: macos-latest
+            artifact: indexsearch-macos-aarch64
+            archive: indexsearch-macos-aarch64.tar.gz
+          - name: macos-x86_64
+            os: macos-13
+            artifact: indexsearch-macos-x86_64
+            archive: indexsearch-macos-x86_64.tar.gz
+          - name: windows-x86_64
+            os: windows-latest
+            artifact: indexsearch-windows-x86_64
+            archive: indexsearch-windows-x86_64.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select stable Rust
+        run: rustup default stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.name }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.name }}-cargo-
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Stage package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/${{ matrix.artifact }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/release/indexsearch.exe "dist/${{ matrix.artifact }}/"
+          else
+            cp target/release/indexsearch "dist/${{ matrix.artifact }}/"
+            chmod +x "dist/${{ matrix.artifact }}/indexsearch"
+          fi
+          cp README.md "dist/${{ matrix.artifact }}/"
+          cp index-search-project.txt "dist/${{ matrix.artifact }}/"
+
+      - name: Create tar archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: tar -czf "${{ matrix.archive }}" -C dist "${{ matrix.artifact }}"
+
+      - name: Create zip archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "dist/${{ matrix.artifact }}/*" -DestinationPath "${{ matrix.archive }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          find release-assets -maxdepth 2 -type f -print
+          gh release create "$GITHUB_REF_NAME" release-assets/*/* \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

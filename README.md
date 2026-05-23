@@ -22,13 +22,37 @@ can stand in for `rg` in workflows where a pre-indexed tree is faster.
 
 ## Quick Start
 
+Prebuilt binaries are attached to tagged GitHub releases. Continuous builds are
+also available from the latest GitHub Actions run on `main`.
+
+Release assets are named by platform:
+
+- `indexsearch-linux-x86_64.tar.gz`
+- `indexsearch-macos-aarch64.tar.gz`
+- `indexsearch-macos-x86_64.tar.gz`
+- `indexsearch-windows-x86_64.zip`
+
+After extracting the archive, install the binary and short `is` alias:
+
 ```bash
-make
-./indexsearch init .
-./indexsearch index .
-./indexsearch update .
-./indexsearch -n "SomeSymbol" .
-./indexsearch -i -w -g "*.cpp" "render pass" .
+./indexsearch install
+```
+
+Or build from source:
+
+```bash
+cargo build --release
+./target/release/indexsearch install
+```
+
+Then use it from any shell:
+
+```bash
+is init .
+is index .
+is update .
+is -n "SomeSymbol" .
+is -i -w -g "*.cpp" "render pass" .
 ```
 
 The index is written to `.indexsearch/index.bin`.
@@ -43,7 +67,7 @@ For Git worktrees, `update --git` avoids the full tree scan by asking Git for
 changed tracked paths and writing only a small delta segment:
 
 ```bash
-./indexsearch update --git .
+is update --git .
 ```
 
 Use `--git-untracked` when new untracked files should be included too. Delta
@@ -60,7 +84,7 @@ commit, then layering any working-tree changes on top.
 Use `compact` when you want to fold accumulated deltas back into the base index:
 
 ```bash
-./indexsearch compact .
+is compact .
 ```
 
 Compaction is explicit for now, so update latency stays predictable. A watcher
@@ -73,10 +97,10 @@ A persistent watcher should be implemented as a separate foreground/service
 command using the same delta writer as `update --git`:
 
 ```bash
-./indexsearch watch .
-./indexsearch list-watches
-./indexsearch watch-log .
-./indexsearch unwatch .
+is watch .
+is list-watches
+is watch-log .
+is unwatch .
 ```
 
 Each watched root runs as its own background process and is tracked under
@@ -85,7 +109,7 @@ Overlapping watches are normalized: if a parent directory is already watched,
 watching a child directory is treated as already covered; if a new parent watch
 is started, existing child watches are stopped.
 Per-project watcher activity is appended to `.indexsearch/watch.log`; use
-`indexsearch watch-log .` to inspect initial indexing, automatic delta updates,
+`is watch-log .` to inspect initial indexing, automatic delta updates,
 and idle compaction timings.
 
 The policy is:
@@ -103,7 +127,7 @@ the base index.
 Useful watcher knobs:
 
 ```bash
-./indexsearch watch . --idle-seconds 5 --compact-delta-count 16 --compact-delta-bytes 256mb
+is watch . --idle-seconds 5 --compact-delta-count 16 --compact-delta-bytes 256mb
 ```
 
 With a watcher running, Git is no longer required for ordinary file edits inside
@@ -131,6 +155,45 @@ By default this installs to `~/.local/bin` on macOS/Linux and
 `%USERPROFILE%\.local\bin` on Windows. On Unix, `is` is a symlink to
 `indexsearch`; on Windows it is a small `is.cmd` shim. Use `--dir PATH` to
 override.
+
+## Build From Source
+
+Requirements:
+
+- Rust stable toolchain with Cargo.
+- A C toolchain that can link Rust binaries for your platform.
+
+Build, test, and run locally:
+
+```bash
+cargo build --release
+cargo test --locked
+./target/release/indexsearch --version
+```
+
+On macOS/Linux, `./tests/smoke.sh` runs an end-to-end CLI smoke test.
+
+The release binary is written to `target/release/indexsearch` on macOS/Linux and
+`target\release\indexsearch.exe` on Windows.
+
+To install from a source checkout:
+
+```bash
+cargo run --release -- install
+```
+
+## Release Builds
+
+GitHub Actions builds downloadable binaries for Linux x86_64, macOS arm64,
+macOS x86_64, and Windows x86_64 on every push to `main` and every pull request.
+Those builds are available as workflow artifacts.
+
+Tagged versions create a GitHub Release and upload the platform archives:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
 
 ## Design Notes
 
