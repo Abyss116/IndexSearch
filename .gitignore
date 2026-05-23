@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.indexsearch/
+.pytest_cache/
+.venv/
+build/
+dist/
+*.egg-info/
+indexsearch
+target/

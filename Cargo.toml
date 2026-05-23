@@ -1,0 +1,22 @@
+[package]
+name = "indexsearch"
+version = "0.2.0"
+edition = "2024"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dependencies]
+aho-corasick = "1.1"
+anyhow = "1.0"
+fs2 = "0.4"
+globset = "0.4"
+memchr = "2.7"
+memmap2 = "0.9"
+notify = "8.2"
+rayon = "1.10"
+regex = "1.11"
+walkdir = "2.5"
