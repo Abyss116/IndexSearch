@@ -22,21 +22,26 @@ can stand in for `rg` in workflows where a pre-indexed tree is faster.
 
 ## Quick Start
 
-Prebuilt binaries are attached to tagged GitHub releases. Continuous builds are
-also available from the latest GitHub Actions run on `main`.
+Prebuilt binaries are attached to the
+[latest GitHub Release](https://github.com/Abyss116/IndexSearch/releases/latest).
+Continuous builds are also available from the
+[latest GitHub Actions run on `main`](https://github.com/Abyss116/IndexSearch/actions/workflows/build.yml?query=branch%3Amain).
 
-Release assets are named by platform:
+Direct release downloads:
 
-- `indexsearch-linux-x86_64.tar.gz`
-- `indexsearch-macos-aarch64.tar.gz`
-- `indexsearch-macos-x86_64.tar.gz`
-- `indexsearch-windows-x86_64.zip`
+- [Linux x86_64](https://github.com/Abyss116/IndexSearch/releases/latest/download/indexsearch-linux-x86_64.tar.gz)
+- [macOS arm64](https://github.com/Abyss116/IndexSearch/releases/latest/download/indexsearch-macos-aarch64.tar.gz)
+- [macOS x86_64](https://github.com/Abyss116/IndexSearch/releases/latest/download/indexsearch-macos-x86_64.tar.gz)
+- [Windows x86_64](https://github.com/Abyss116/IndexSearch/releases/latest/download/indexsearch-windows-x86_64.zip)
 
 After extracting the archive, install the binary and short `is` alias:
 
 ```bash
 ./indexsearch install
 ```
+
+Each release archive also includes the Unreal Engine template, agent skill, and
+cross-platform agent-instruction installer.
 
 Or build from source:
 
@@ -156,6 +161,47 @@ By default this installs to `~/.local/bin` on macOS/Linux and
 `indexsearch`; on Windows it is a small `is.cmd` shim. Use `--dir PATH` to
 override.
 
+## Unreal Engine Template
+
+Use the bundled UE-oriented project template when indexing Unreal Engine source
+trees or UE game projects:
+
+```bash
+cp templates/unreal-engine/index-search-project.txt /path/to/UnrealEngine/index-search-project.txt
+cd /path/to/UnrealEngine
+is watch .
+```
+
+The template keeps source, shader, config, plugin, project, script, and build
+rule files searchable while skipping common UE generated folders, binary assets,
+archives, object files, and debug artifacts.
+
+The same template is also bundled inside the agent skill at
+`skills/indexsearch/assets/unreal-engine-index-search-project.txt`.
+
+## Agent Skill
+
+This repository includes an IndexSearch agent skill package:
+
+- `skills/indexsearch/SKILL.md` for Codex and Claude Code style skill loaders.
+- `agent-rules/AGENTS.md` for tools that read `AGENTS.md`, including OpenCode
+  and Cursor.
+- `agent-rules/CLAUDE.md` for Claude Code project instructions.
+- `agent-rules/cursor/indexsearch.mdc` for Cursor Project Rules.
+
+Install the skill or rules with the cross-platform helper:
+
+```bash
+python3 scripts/install-agent-instructions.py --target codex --scope user
+python3 scripts/install-agent-instructions.py --target claude --scope user
+python3 scripts/install-agent-instructions.py --target opencode --scope user
+python3 scripts/install-agent-instructions.py --target all --scope project --project /path/to/project --ue-template
+```
+
+For project installs, the helper can also copy the UE template as
+`index-search-project.txt` with `--ue-template`. Existing generated instruction
+blocks are replaced in place; unrelated content is preserved.
+
 ## Build From Source
 
 Requirements:
@@ -186,13 +232,14 @@ cargo run --release -- install
 
 GitHub Actions builds downloadable binaries for Linux x86_64, macOS arm64,
 macOS x86_64, and Windows x86_64 on every push to `main` and every pull request.
-Those builds are available as workflow artifacts.
+Those builds are available as
+[workflow artifacts](https://github.com/Abyss116/IndexSearch/actions/workflows/build.yml).
 
 Tagged versions create a GitHub Release and upload the platform archives:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
 ## Design Notes

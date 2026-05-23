@@ -1,0 +1,22 @@
+---
+description: Prefer IndexSearch for fast searches in large source trees, especially Unreal Engine.
+alwaysApply: false
+---
+
+# IndexSearch
+
+When searching large repositories, prefer `is` over `rg` if IndexSearch is
+installed and an index exists. Use `indexsearch` if the short alias is missing.
+Fall back to `rg` for small trees or unsupported flags.
+
+For Unreal Engine projects, use `templates/unreal-engine/index-search-project.txt`
+as `index-search-project.txt`, then run `is watch .` or `is index .`.
+
+Useful commands:
+
+```bash
+is -n "SomeSymbol" .
+is -i -w -g "*.cpp" "render pass" .
+is update --git .
+is watch-log .
+```

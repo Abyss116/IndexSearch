@@ -83,6 +83,11 @@ jobs:
           fi
           cp README.md "dist/${{ matrix.artifact }}/"
           cp index-search-project.txt "dist/${{ matrix.artifact }}/"
+          cp -R templates "dist/${{ matrix.artifact }}/"
+          cp -R skills "dist/${{ matrix.artifact }}/"
+          cp -R agent-rules "dist/${{ matrix.artifact }}/"
+          mkdir -p "dist/${{ matrix.artifact }}/scripts"
+          cp scripts/install-agent-instructions.py "dist/${{ matrix.artifact }}/scripts/"
 
       - name: Create tar archive
         if: runner.os != 'Windows'
