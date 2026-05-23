@@ -21,18 +21,22 @@ jobs:
         include:
           - name: linux-x86_64
             os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
             artifact: indexsearch-linux-x86_64
             archive: indexsearch-linux-x86_64.tar.gz
           - name: macos-aarch64
             os: macos-latest
+            target: aarch64-apple-darwin
             artifact: indexsearch-macos-aarch64
             archive: indexsearch-macos-aarch64.tar.gz
           - name: macos-x86_64
-            os: macos-13
+            os: macos-latest
+            target: x86_64-apple-darwin
             artifact: indexsearch-macos-x86_64
             archive: indexsearch-macos-x86_64.tar.gz
           - name: windows-x86_64
             os: windows-latest
+            target: x86_64-pc-windows-msvc
             artifact: indexsearch-windows-x86_64
             archive: indexsearch-windows-x86_64.zip
 
@@ -43,6 +47,9 @@ jobs:
       - name: Select stable Rust
         run: rustup default stable
 
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
       - name: Cache Cargo
         uses: actions/cache@v4
         with:
@@ -50,15 +57,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ matrix.name }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ matrix.name }}-cargo-
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
 
       - name: Test
         run: cargo test --locked
 
       - name: Build release
-        run: cargo build --release --locked
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Stage package
         shell: bash
@@ -66,9 +73,9 @@ jobs:
           set -euo pipefail
           mkdir -p "dist/${{ matrix.artifact }}"
           if [ "${{ runner.os }}" = "Windows" ]; then
-            cp target/release/indexsearch.exe "dist/${{ matrix.artifact }}/"
+            cp "target/${{ matrix.target }}/release/indexsearch.exe" "dist/${{ matrix.artifact }}/"
           else
-            cp target/release/indexsearch "dist/${{ matrix.artifact }}/"
+            cp "target/${{ matrix.target }}/release/indexsearch" "dist/${{ matrix.artifact }}/"
             chmod +x "dist/${{ matrix.artifact }}/indexsearch"
           fi
           cp README.md "dist/${{ matrix.artifact }}/"
