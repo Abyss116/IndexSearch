@@ -186,15 +186,26 @@ stdout redirected to `/dev/null`.
 
 | Workload | Pattern | Matches `is/qgrep/rg` | `is` | qgrep | `rg` | `is` vs qgrep |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Literal: common token | `Nanite` | 14664 / 14672 / 13013 | 8.05ms | 21.91ms | 3058.55ms | 2.7x |
-| Literal: long symbol | `SkeletalMeshComponent` | 7593 / 7593 / 7592 | 6.16ms | 18.60ms | 3011.87ms | 3.0x |
-| Literal: missing | `DefinitelyMissingIndexSearchNeedle` | 0 / 0 / 0 | 3.60ms | 10.65ms | 2999.15ms | 3.0x |
-| Case-insensitive literal | `skeletalmeshcomponent` | 7603 / 7603 / 7602 | 7.51ms | 20.83ms | 3049.63ms | 2.8x |
-| Word regex | `\bActor\b` | 23674 / 23677 / 23664 | 33.06ms | 55.77ms | 2971.59ms | 1.7x |
-| Regex: alternation | `(Nanite\|Lumen\|SkeletalMeshComponent)` | 34487 / 34498 / 31426 | 25.59ms | 118.20ms | 2974.07ms | 4.6x |
-| Regex: prefix/suffix | `Skeletal[A-Za-z0-9_]*Component` | 7917 / 7917 / 7916 | 12.21ms | 23.20ms | 3010.84ms | 1.9x |
-| Regex: qualified call | `[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(` | 1487173 / 1487316 / 1481426 | 128.78ms | 366.19ms | 3099.02ms | 2.8x |
-| Glob: `*.cpp` literal | `Nanite` in `*.cpp` | 10061 / 10061 / 10061 | 5.89ms | 20.77ms | 1286.60ms | 3.5x |
+| Literal: common token | `Nanite` | 14664 / 14672 / 13013 | 6.77ms | 20.19ms | 3040.87ms | 3.0x |
+| Literal: long symbol | `SkeletalMeshComponent` | 7593 / 7593 / 7592 | 6.30ms | 17.99ms | 2997.93ms | 2.9x |
+| Literal: missing | `DefinitelyMissingIndexSearchNeedle` | 0 / 0 / 0 | 3.70ms | 10.95ms | 3001.30ms | 3.0x |
+| Case-insensitive literal | `skeletalmeshcomponent` | 7603 / 7603 / 7602 | 6.64ms | 19.01ms | 3041.92ms | 2.9x |
+| Word regex | `\bActor\b` | 23674 / 23677 / 23664 | 33.01ms | 55.19ms | 3009.37ms | 1.7x |
+| Regex: alternation | `(Nanite\|Lumen\|SkeletalMeshComponent)` | 34487 / 34498 / 31426 | 26.69ms | 120.20ms | 2986.67ms | 4.5x |
+| Regex: prefix/suffix | `Skeletal[A-Za-z0-9_]*Component` | 7917 / 7917 / 7916 | 11.20ms | 21.27ms | 3013.93ms | 1.9x |
+| Regex: qualified call | `[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(` | 1487173 / 1487316 / 1481426 | 124.77ms | 365.74ms | 3112.35ms | 2.9x |
+| Glob: `*.cpp` literal | `Nanite` in `*.cpp` | 10061 / 10061 / 10061 | 6.44ms | 21.25ms | 1320.87ms | 3.3x |
+
+For `-q` existence checks, IndexSearch stops as soon as a verified match is
+found. Quiet timings are median wall-clock time across 31 IndexSearch runs and
+7 qgrep runs:
+
+| Workload | Pattern | `is -q` | qgrep search to `/dev/null` | `is` vs qgrep |
+| --- | --- | ---: | ---: | ---: |
+| Quiet literal hit | `Nanite` | 3.67ms | 20.99ms | 5.7x |
+| Quiet literal miss | `DefinitelyMissingIndexSearchNeedle` | 3.27ms | 11.78ms | 3.6x |
+| Quiet word regex | `\bActor\b` | 4.03ms | 53.23ms | 13.2x |
+| Quiet qualified regex | `[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(` | 3.28ms | 341.42ms | 104.1x |
 
 To reproduce the search benchmark:
 

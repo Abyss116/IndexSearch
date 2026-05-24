@@ -48,6 +48,10 @@ grep -q 'src/a.cc:2:needle here' <<<"$result"
 grep -q 'src/b.txt:1:Needle there' <<<"$result"
 ! grep -q 'c.bin' <<<"$result"
 ! grep -q 'out/d.cc' <<<"$result"
+quiet_hit="$(./indexsearch -q -F needle "$tmp")"
+[[ -z "$quiet_hit" ]]
+./indexsearch -q -F needle "$tmp"
+! ./indexsearch -q -F missing_symbol "$tmp"
 
 single="$(./indexsearch -I -n -F 'hello_world' "$tmp/src/a.cc")"
 [[ "$single" == '1:hello_world = 1' ]]

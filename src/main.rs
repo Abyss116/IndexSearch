@@ -1827,7 +1827,7 @@ fn run_search_with_index(
     profile: Option<SearchProfile>,
     total_timer: Instant,
 ) -> Result<i32> {
-    let output = search_with_index_output(&index, options)?;
+    let output = search_output_for_options(&index, options)?;
     let write_timer = Instant::now();
     let stdout = std::io::stdout();
     let mut out = BufWriter::new(stdout.lock());
@@ -1845,6 +1845,48 @@ fn run_search_with_index(
         }
     }
     Ok(output.code)
+}
+
+fn search_output_for_options(index: &MappedIndex, options: &Options) -> Result<SearchOutput> {
+    if quiet_search_fast_path(options) {
+        return search_quiet_with_index_output(index, options);
+    }
+    search_with_index_output(index, options)
+}
+
+fn quiet_search_fast_path(options: &Options) -> bool {
+    options.quiet && !options.stats && !options.files
+}
+
+#[cold]
+#[inline(never)]
+fn search_quiet_with_index_output(index: &MappedIndex, options: &Options) -> Result<SearchOutput> {
+    let mut profile = SearchProfile::default();
+    let delta_timer = if options.profile {
+        Some(Instant::now())
+    } else {
+        None
+    };
+    let deltas = load_deltas(&index.root)?;
+    if let Some(delta_timer) = delta_timer {
+        profile.record("search_load_deltas", delta_timer.elapsed());
+    }
+    let execute_timer = if options.profile {
+        Some(Instant::now())
+    } else {
+        None
+    };
+    let found = execute_search_any_segments(index, &deltas, options)?;
+    let mut stderr = Vec::new();
+    if let Some(execute_timer) = execute_timer {
+        profile.record("search_execute_any_segments", execute_timer.elapsed());
+        append_profile_events(&mut stderr, &profile)?;
+    }
+    Ok(SearchOutput {
+        code: if found { 0 } else { 1 },
+        stdout: Vec::new(),
+        stderr,
+    })
 }
 
 fn search_with_index_output(index: &MappedIndex, options: &Options) -> Result<SearchOutput> {
@@ -2102,7 +2144,7 @@ fn handle_search_daemon_client(
             profile.record("daemon_parse_args", parse_timer.elapsed());
         }
         let search_timer = Instant::now();
-        let mut output = search_with_index_output(index, &options)?;
+        let mut output = search_output_for_options(index, &options)?;
         if options.profile {
             profile.record("daemon_search_with_index_output", search_timer.elapsed());
             append_profile_events(&mut output.stderr, &profile)?;
@@ -3849,6 +3891,90 @@ fn execute_search_rendered_segments(
     Ok(results)
 }
 
+#[cold]
+#[inline(never)]
+fn execute_search_any_segments(
+    base: &MappedIndex,
+    deltas: &[DeltaSegment],
+    options: &Options,
+) -> Result<bool> {
+    let exclusions = segment_exclusions(base, deltas)?;
+    if execute_search_any(base, options, &exclusions[0])? {
+        return Ok(true);
+    }
+    for (idx, delta) in deltas.iter().enumerate() {
+        if execute_search_any(&delta.index, options, &exclusions[idx + 1])? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cold]
+#[inline(never)]
+fn search_candidate_files(
+    index: &MappedIndex,
+    options: &Options,
+    excluded_paths: &HashSet<String>,
+) -> Result<Vec<u32>> {
+    let candidates = if let Some(candidates) = word_fragment_candidate_files(index, options)? {
+        candidates
+    } else if let Some(prefixes) = boundary_word_prefixes(options) {
+        if let Some(candidates) = prefix_candidate_files(index, &prefixes)? {
+            candidates
+        } else {
+            let alternatives = query_trigram_alternatives(options);
+            candidate_files(index, &alternatives)?
+        }
+    } else if let Some(spec) = qualified_call_spec(&options.pattern) {
+        if let Some(candidates) = qualified_call_candidate_files(index, &spec)? {
+            candidates
+        } else {
+            let alternatives = query_trigram_alternatives(options);
+            candidate_files(index, &alternatives)?
+        }
+    } else {
+        let alternatives = query_trigram_alternatives(options);
+        candidate_files(index, &alternatives)?
+    };
+    let candidates = chunk_bloom_filter_candidates(index, options, candidates)?;
+    if excluded_paths.is_empty() && options.paths.is_empty() && options.globs.is_empty() {
+        return Ok(candidates);
+    }
+    let path_filter = PathFilter::new(options, &index.root)?;
+    if excluded_paths.is_empty() && path_filter.is_unrestricted() {
+        return Ok(candidates);
+    }
+    Ok(candidates
+        .into_iter()
+        .filter_map(|id| {
+            let path = bytes_to_string(index.file_path(id as usize).ok()?);
+            path_filter.allows(&path, excluded_paths).then_some(id)
+        })
+        .collect())
+}
+
+#[cold]
+#[inline(never)]
+fn execute_search_any(
+    index: &MappedIndex,
+    options: &Options,
+    excluded_paths: &HashSet<String>,
+) -> Result<bool> {
+    let candidates = search_candidate_files(index, options, excluded_paths)?;
+    if candidates.is_empty() {
+        return Ok(false);
+    }
+    let matcher = QueryMatcher::new(options)?;
+    Ok(candidates.par_iter().any(|id| {
+        let mut scratch = Vec::new();
+        let Ok((_path_bytes, content)) = index.file_for_search(*id as usize, &mut scratch) else {
+            return false;
+        };
+        matcher.search_file_has_match(content, options)
+    }))
+}
+
 fn execute_search_rendered(
     index: &MappedIndex,
     options: &Options,
@@ -4201,6 +4327,73 @@ impl QueryMatcher {
             output,
             match_count: matches.len(),
         }))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn search_file_has_match(&self, content: &[u8], options: &Options) -> bool {
+        match self {
+            QueryMatcher::Fixed {
+                needle,
+                finder,
+                ac,
+                whole_word,
+                ignore_case,
+            } => {
+                if needle.is_empty() {
+                    return false;
+                }
+                if *ignore_case {
+                    let Some(ac) = ac else {
+                        return false;
+                    };
+                    return ac.find_iter(content).any(|found| {
+                        !*whole_word || content_word_boundary(content, found.start(), found.end())
+                    });
+                }
+                finder.find_iter(content).any(|start| {
+                    !*whole_word || content_word_boundary(content, start, start + needle.len())
+                })
+            }
+            QueryMatcher::WordPrefix {
+                ac,
+                boundary_start,
+                boundary_end,
+            } => ac.find_iter(content).any(|found| {
+                let start = found.start();
+                if *boundary_start && start > 0 && is_word_byte(content[start - 1]) {
+                    return false;
+                }
+                let mut end = found.end();
+                while end < content.len() && is_word_byte(content[end]) {
+                    end += 1;
+                }
+                !(*boundary_end && end < content.len() && is_word_byte(content[end]))
+            }),
+            QueryMatcher::LiteralSet { ac } => ac.is_match(content),
+            QueryMatcher::QualifiedCall { spec, finder } => {
+                qualified_call_has_match(content, spec, finder)
+            }
+            QueryMatcher::OrderedLiterals {
+                literals,
+                finder: Some(finder),
+                ignore_case: false,
+            } => ordered_literals_has_match(content, literals, finder),
+            QueryMatcher::OrderedWordSpanLiterals {
+                literals,
+                finder: Some(finder),
+                ignore_case: false,
+            } => ordered_wordspan_has_match(content, literals, finder),
+            QueryMatcher::Regex(regex) => {
+                let mut found = false;
+                for_each_line(content, |_, line| {
+                    found = regex.is_match(line);
+                    !found
+                });
+                found
+            }
+            _ => !self.search_file(content, options).is_empty(),
+        }
     }
 
     fn search_file(&self, content: &[u8], options: &Options) -> Vec<MatchLine> {
@@ -4932,6 +5125,63 @@ fn find_ordered_wordspan_match(content: &[u8], literals: &[Vec<u8>]) -> Option<(
     None
 }
 
+#[cold]
+#[inline(never)]
+fn ordered_literals_has_match(
+    content: &[u8],
+    literals: &[Vec<u8>],
+    finder: &memmem::Finder<'_>,
+) -> bool {
+    if literals.is_empty() {
+        return false;
+    }
+    for start in finder.find_iter(content) {
+        let line_start = memrchr(b'\n', &content[..start]).map_or(0, |pos| pos + 1);
+        let line_end = memchr(b'\n', &content[start..])
+            .map(|pos| start + pos)
+            .unwrap_or(content.len());
+        let line = &content[line_start..line_end];
+        let mut pos = start.saturating_sub(line_start) + literals[0].len();
+        let mut ok = true;
+        for literal in literals.iter().skip(1) {
+            if let Some(found) = memmem::find(&line[pos..], literal) {
+                pos += found + literal.len();
+            } else {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return true;
+        }
+    }
+    false
+}
+
+#[cold]
+#[inline(never)]
+fn ordered_wordspan_has_match(
+    content: &[u8],
+    literals: &[Vec<u8>],
+    finder: &memmem::Finder<'_>,
+) -> bool {
+    if literals.is_empty() {
+        return false;
+    }
+    for start in finder.find_iter(content) {
+        let line_start = memrchr(b'\n', &content[..start]).map_or(0, |pos| pos + 1);
+        let line_end = memchr(b'\n', &content[start..])
+            .map(|pos| start + pos)
+            .unwrap_or(content.len());
+        let line = &content[line_start..line_end];
+        let first_start = start.saturating_sub(line_start);
+        if find_ordered_wordspan_match_at(line, first_start, literals).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
 fn find_ordered_wordspan_match_at(
     line: &[u8],
     start: usize,
@@ -5097,6 +5347,33 @@ fn search_qualified_call_rendered(
         output,
         match_count,
     }))
+}
+
+#[cold]
+#[inline(never)]
+fn qualified_call_has_match(
+    content: &[u8],
+    spec: &QualifiedCallSpec,
+    finder: &memmem::Finder<'_>,
+) -> bool {
+    for found in finder.find_iter(content) {
+        if found == 0 || found + 2 >= content.len() {
+            continue;
+        }
+        let token_start = rewind_word(content, found);
+        if qualified_call_match_start(content, token_start, found, spec).is_none() {
+            continue;
+        }
+        let method_start = found + 2;
+        if method_start >= content.len() || !is_word_byte(content[method_start]) {
+            continue;
+        }
+        let method_end = advance_word(content, method_start);
+        if method_end < content.len() && content[method_end] == b'(' {
+            return true;
+        }
+    }
+    false
 }
 
 fn qualified_call_match_start(
@@ -6188,6 +6465,12 @@ fn for_each_line(mut content: &[u8], mut f: impl FnMut(usize, &[u8]) -> bool) {
 fn word_boundary(line: &[u8], start: usize, len: usize) -> bool {
     let before = start == 0 || !is_word(line[start - 1]);
     let after = start + len >= line.len() || !is_word(line[start + len]);
+    before && after
+}
+
+fn content_word_boundary(content: &[u8], start: usize, end: usize) -> bool {
+    let before = start == 0 || !is_word(content[start - 1]);
+    let after = end >= content.len() || !is_word(content[end]);
     before && after
 }
 
