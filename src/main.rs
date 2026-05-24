@@ -1,24 +1,26 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, IsTerminal, Write};
+use std::io::{BufWriter, IsTerminal, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use anyhow::{Context, Result, anyhow, bail};
 use fs2::FileExt;
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use memchr::{memchr, memmem};
+use memchr::{memchr, memmem, memrchr};
 use memmap2::Mmap;
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use rayon::prelude::*;
 use regex::bytes::{Regex, RegexBuilder};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use walkdir::{DirEntry, WalkDir};
 
 const PROJECT_FILE: &str = "index-search-project.txt";
@@ -29,12 +31,37 @@ const WATCH_DIR: &str = "watches";
 const LOCK_FILE: &str = "index.lock";
 const STATE_FILE: &str = "state.txt";
 const WATCH_LOG_FILE: &str = "watch.log";
+const SEARCH_DAEMON_FILE: &str = "search-daemon.txt";
+const SEARCH_DAEMON_REQUEST_MAGIC: &[u8; 8] = b"ISDREQ1\n";
+const SEARCH_DAEMON_RESPONSE_MAGIC: &[u8; 8] = b"ISDRES1\n";
+const SEARCH_DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_millis(20);
+const SEARCH_DAEMON_START_TIMEOUT: Duration = Duration::from_millis(250);
 const DEFAULT_PROJECT_CONFIG: &str = "[IndexSearch.paths.ignore]\n.git/\n.hg/\n.svn/\n.indexsearch/\n\n\
-[IndexSearch.files.ignore]\n*.png\n*.jpg\n*.jpeg\n*.gif\n*.pdf\n*.zip\n*.gz\n*.dll\n*.exe\n*.pdb\n*.o\n*.obj\n\n\
+[IndexSearch.files.ignore]\nindex-search-project.txt\n*.png\n*.jpg\n*.jpeg\n*.gif\n*.pdf\n*.zip\n*.gz\n*.dll\n*.exe\n*.pdb\n*.o\n*.obj\n\n\
 [IndexSearch.files.include]\n*\n";
 const MAGIC: &[u8; 8] = b"ISIDXR02";
-const VERSION: u32 = 2;
+const VERSION: u32 = 4;
 const DEFAULT_MAX_FILE_SIZE: u64 = 20 * 1024 * 1024;
+const ENABLE_CHUNK_EXTENSION: bool = false;
+const CHUNK_SIZE: usize = 32 * 1024;
+const CHUNK_OVERLAP: usize = 64;
+const CHUNK_BLOOM_BYTES: usize = 256;
+const CHUNK_FOOTER_MAGIC: &[u8; 8] = b"ISCHNK01";
+const CHUNK_FOOTER_SIZE: usize = 56;
+const WORD_FRAGMENT_TAG: u32 = 0x2000_0000;
+const WORD_FRAGMENT_MIN_LEN: usize = 6;
+const WORD_FRAGMENT_MAX_LEN: usize = 6;
+const WORD_FRAGMENT_MIN_FILES: u32 = 32;
+const WORD_FRAGMENT_MAX_FILES: u32 = 8192;
+const SPECIAL_QUALIFIED_CALL: u32 = 0x8000_0001;
+const QUALIFIED_CLASS_FRAGMENT_TAG: u32 = 0xC000_0000;
+const QUALIFIED_CLASS_FRAGMENT_MAX_LEN: usize = 4;
+const PREFIX_POSTING_TAG: u32 = 0x4000_0000;
+const PREFIX_MIN_LEN: usize = 5;
+const PREFIX_MAX_LEN: usize = 6;
+const TRIGRAM_SPACE: usize = 1 << 24;
+const TRIGRAM_WORD_BITS: usize = 64;
+const TRIGRAM_BITSET_WORDS: usize = TRIGRAM_SPACE / TRIGRAM_WORD_BITS;
 
 #[derive(Clone)]
 struct ProjectConfig {
@@ -88,6 +115,8 @@ struct Options {
     only_matching: bool,
     json: bool,
     auto_index: bool,
+    auto_update: bool,
+    daemon: bool,
     git_update: bool,
     git_untracked: bool,
     hidden: bool,
@@ -111,7 +140,7 @@ struct BuiltIndex {
     root: PathBuf,
     config_hash: u64,
     files: Vec<FileEntry>,
-    postings: BTreeMap<u32, Vec<u32>>,
+    postings: HashMap<u32, Vec<u32>>,
 }
 
 #[derive(Default)]
@@ -197,26 +226,37 @@ struct IndexState {
     git_head: Option<String>,
 }
 
-#[derive(Clone, Copy)]
-enum ChangeKind {
-    Reused,
-    Added,
-    Updated,
+struct TrigramScratch {
+    bits: Vec<u64>,
+    touched_words: Vec<usize>,
 }
 
-#[derive(Clone, Copy)]
+impl TrigramScratch {
+    fn new() -> Self {
+        Self {
+            bits: vec![0; TRIGRAM_BITSET_WORDS],
+            touched_words: Vec::with_capacity(4096),
+        }
+    }
+}
+
+struct PathFilter {
+    prefixes: Vec<String>,
+    matcher: Option<(MatcherSet, MatcherSet)>,
+}
+
 struct FileView<'a> {
-    path: &'a [u8],
-    content: &'a [u8],
+    content: Cow<'a, [u8]>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PostingView<'a> {
-    data: &'a [u32],
+    data: Cow<'a, [u32]>,
 }
 
 struct MappedIndex {
     mmap: Mmap,
+    version: u32,
     root: PathBuf,
     config_hash: u64,
     file_count: usize,
@@ -226,10 +266,12 @@ struct MappedIndex {
     postings_data_offset: usize,
     path_blob_offset: usize,
     content_blob_offset: usize,
+    chunk_info: Option<ChunkInfo>,
 }
 
 #[derive(Clone, Copy)]
 struct Header {
+    version: u32,
     config_hash: u64,
     file_count: u64,
     posting_count: u64,
@@ -259,6 +301,25 @@ struct PostingRecord {
     count: u64,
 }
 
+#[derive(Clone, Copy)]
+struct ChunkInfo {
+    chunk_count: usize,
+    chunk_table_offset: usize,
+    chunk_posting_count: usize,
+    chunk_posting_table_offset: usize,
+    chunk_posting_data_offset: usize,
+    chunk_blob_offset: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+struct ChunkRecord {
+    file_id: u32,
+    start: u64,
+    size: u32,
+    line_no: u32,
+}
+
 #[derive(Clone)]
 struct MatchLine {
     line_no: usize,
@@ -267,10 +328,33 @@ struct MatchLine {
     matched: Vec<u8>,
 }
 
+struct RenderedFileResult {
+    output: Vec<u8>,
+    match_count: usize,
+}
+
+struct SearchOutput {
+    code: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
 #[derive(Clone)]
-struct FileResult {
-    path: String,
-    matches: Vec<MatchLine>,
+struct QualifiedCallSpec {
+    class_prefix: Option<Vec<u8>>,
+    class_min_extra: usize,
+}
+
+struct SearchDaemonRecord {
+    pid: u32,
+    port: u16,
+    token: String,
+    root: PathBuf,
+    exe_path: PathBuf,
+    exe_size: u64,
+    exe_mtime: i64,
+    index_size: u64,
+    index_mtime: i64,
 }
 
 fn main() {
@@ -285,6 +369,10 @@ fn run() -> Result<()> {
     if args.is_empty() {
         print_help();
         std::process::exit(2);
+    }
+    if args[0] == "--" {
+        args.remove(0);
+        std::process::exit(command_search(&args)?);
     }
     match args[0].as_str() {
         "index" => {
@@ -318,6 +406,10 @@ fn run() -> Result<()> {
         "watch-daemon" => {
             args.remove(0);
             std::process::exit(command_watch_daemon(&args)?);
+        }
+        "search-daemon" => {
+            args.remove(0);
+            std::process::exit(command_search_daemon(&args)?);
         }
         "list-watches" | "watch-list" => {
             let command = args.remove(0);
@@ -457,6 +549,7 @@ fn print_help() {
     help_option(&style, "--vimgrep", "print path:line:column:line");
     help_option(&style, "-m, --max-count NUM", "max matching lines per file");
     help_option(&style, "--stats", "print search stats");
+    help_option(&style, "--no-daemon", "do not use the search daemon");
     println!();
 
     help_section(&style, "Indexing Options");
@@ -477,11 +570,25 @@ fn print_help() {
         "--git-untracked",
         "include untracked files with --git update",
     );
+    help_option(
+        &style,
+        "--no-auto-index",
+        "search fails instead of building a missing/stale index",
+    );
+    help_option(
+        &style,
+        "--auto-update",
+        "search performs a fast Git changed-path refresh first",
+    );
     println!();
 
     println!(
         "Run {} for command-specific options.",
         style.cmd("indexsearch <COMMAND> --help")
+    );
+    println!(
+        "Use {} to search for a pattern that is also a command name.",
+        style.cmd("indexsearch -- PATTERN [PATH ...]")
     );
 }
 
@@ -648,6 +755,11 @@ fn print_search_help() {
     help_option(&style, "-F, --fixed-strings", "treat pattern as a literal");
     help_option(&style, "-w, --word-regexp", "require word boundaries");
     help_option(&style, "-e, --regexp PATTERN", "search pattern");
+    help_option(
+        &style,
+        "-- PATTERN",
+        "treat following arguments as pattern and paths",
+    );
     help_option(&style, "-g, --glob GLOB", "include or exclude path glob");
     help_option(&style, "-n, --line-number", "show line numbers");
     help_option(&style, "-N, --no-line-number", "suppress line numbers");
@@ -681,7 +793,23 @@ fn print_search_help() {
         "-L, --follow",
         "follow symlinks while auto-indexing",
     );
+    help_option(
+        &style,
+        "--no-auto-index",
+        "do not build a missing or stale index during search",
+    );
+    help_option(
+        &style,
+        "--auto-update",
+        "fast Git changed-path refresh before search",
+    );
+    help_option(
+        &style,
+        "--auto-update-untracked",
+        "include untracked files with --auto-update",
+    );
     help_option(&style, "--stats", "print search stats");
+    help_option(&style, "--no-daemon", "do not use the search daemon");
 }
 
 fn command_usage(style: &HelpStyle, command: &str, args: &str, description: &str) {
@@ -803,9 +931,10 @@ fn command_update(args: &[String]) -> Result<i32> {
     let mut scanned = 0;
     let mut skipped = 0;
     let old = MappedIndex::open(&path).ok();
-    let (index, stats, rebuilt) = if let Some(ref old_index) = old {
+    let index = if let Some(ref old_index) = old {
         if old_index.config_hash == cfg.hash {
-            let (index, stats) = if options.git_update {
+            let try_git_update = options.git_update || is_git_root(&cfg.root)?;
+            if try_git_update {
                 let git_timer = Instant::now();
                 let changes = collect_git_changes(&cfg.root, options.git_untracked)?;
                 timings.git += git_timer.elapsed().as_secs_f64();
@@ -855,45 +984,36 @@ fn command_update(args: &[String]) -> Result<i32> {
                         println!("delta: {}", delta_dir(&cfg.root).display());
                         return Ok(0);
                     }
-                    None => update_index(
-                        &cfg,
-                        &options,
-                        old_index,
-                        &mut scanned,
-                        &mut skipped,
-                        Some(&mut timings),
-                    )?,
+                    None => {
+                        return update_from_filesystem_scan(
+                            &cfg,
+                            &options,
+                            &path,
+                            &timer,
+                            &mut timings,
+                        );
+                    }
                 }
             } else {
-                update_index(
-                    &cfg,
-                    &options,
-                    old_index,
-                    &mut scanned,
-                    &mut skipped,
-                    Some(&mut timings),
-                )?
-            };
-            (index, stats, false)
+                return update_from_filesystem_scan(&cfg, &options, &path, &timer, &mut timings);
+            }
         } else {
-            let index = build_index(
+            build_index(
                 &cfg,
                 &options,
                 &mut scanned,
                 &mut skipped,
                 Some(&mut timings),
-            )?;
-            (index, UpdateStats::default(), true)
+            )?
         }
     } else {
-        let index = build_index(
+        build_index(
             &cfg,
             &options,
             &mut scanned,
             &mut skipped,
             Some(&mut timings),
-        )?;
-        (index, UpdateStats::default(), true)
+        )?
     };
     drop(old);
     let write_timer = Instant::now();
@@ -902,30 +1022,87 @@ fn command_update(args: &[String]) -> Result<i32> {
     save_index_state(&cfg.root)?;
     timings.write += write_timer.elapsed().as_secs_f64();
     let elapsed = timer.elapsed().as_secs_f64();
-    if rebuilt {
-        println!(
-            "indexed {} files ({} skipped, {} scanned) in {:.3}s",
-            index.files.len(),
-            skipped,
-            scanned,
-            elapsed
-        );
-    } else {
-        println!(
-            "updated {} files ({} reused, {} added, {} modified, {} removed, {} skipped, {} scanned) in {:.3}s",
-            index.files.len(),
-            stats.reused,
-            stats.added,
-            stats.updated,
-            stats.removed,
-            skipped,
-            scanned,
-            elapsed
-        );
-    }
+    println!(
+        "indexed {} files ({} skipped, {} scanned) in {:.3}s",
+        index.files.len(),
+        skipped,
+        scanned,
+        elapsed
+    );
     print_timings(&timings);
     println!("root: {}", cfg.root.display());
     println!("index: {}", path.display());
+    Ok(0)
+}
+
+fn update_from_filesystem_scan(
+    cfg: &ProjectConfig,
+    options: &Options,
+    path: &Path,
+    timer: &Instant,
+    timings: &mut Timings,
+) -> Result<i32> {
+    let mut scanned = 0;
+    let mut skipped = 0;
+    let (changes, visible_before) =
+        collect_filesystem_changes(cfg, options, &mut scanned, &mut skipped, timings)?;
+
+    if changes.is_empty() {
+        save_index_state(&cfg.root)?;
+        let elapsed = timer.elapsed().as_secs_f64();
+        println!(
+            "updated {} files ({} reused, 0 added, 0 modified, 0 removed, {} skipped, {} scanned) in {:.3}s",
+            visible_before, visible_before, skipped, scanned, elapsed
+        );
+        print_timings(timings);
+        println!("root: {}", cfg.root.display());
+        println!("index: {}", path.display());
+        return Ok(0);
+    }
+
+    let process_timer = Instant::now();
+    let full_scan_count = scanned;
+    let mut changed_scanned = 0;
+    let mut changed_skipped = 0;
+    let (delta, meta, stats) = build_delta_index(
+        cfg,
+        options,
+        &changes,
+        &mut changed_scanned,
+        &mut changed_skipped,
+    )?;
+    timings.process += process_timer.elapsed().as_secs_f64();
+    skipped += changed_skipped;
+    scanned = full_scan_count;
+
+    if stats.added == 0 && stats.updated == 0 && stats.removed == 0 {
+        save_index_state(&cfg.root)?;
+    } else {
+        let write_timer = Instant::now();
+        save_delta(&cfg.root, &delta, &meta)?;
+        save_index_state(&cfg.root)?;
+        timings.write += write_timer.elapsed().as_secs_f64();
+    }
+
+    let elapsed = timer.elapsed().as_secs_f64();
+    let visible_count = stats.reused + stats.updated + stats.added;
+    println!(
+        "updated {} files ({} reused, {} added, {} modified, {} removed, {} skipped, {} scanned) in {:.3}s",
+        visible_count,
+        stats.reused,
+        stats.added,
+        stats.updated,
+        stats.removed,
+        skipped,
+        scanned,
+        elapsed
+    );
+    print_timings(timings);
+    println!("root: {}", cfg.root.display());
+    println!("index: {}", path.display());
+    if stats.added != 0 || stats.updated != 0 || stats.removed != 0 {
+        println!("delta: {}", delta_dir(&cfg.root).display());
+    }
     Ok(0)
 }
 
@@ -1048,7 +1225,8 @@ fn command_watch(args: &[String]) -> Result<i32> {
     }
 
     let exe = env::current_exe()?;
-    let child = Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .arg("watch-daemon")
         .arg(&cfg.root)
         .arg("--idle-seconds")
@@ -1059,8 +1237,9 @@ fn command_watch(args: &[String]) -> Result<i32> {
         .arg(watch_options.compact_delta_bytes.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    detach_background_command(&mut command);
+    let child = command.spawn()?;
     let record = WatchRecord {
         id,
         root: cfg.root.clone(),
@@ -1259,7 +1438,7 @@ fn run_watch_daemon(cfg: &ProjectConfig, watch_options: WatchOptions) -> Result<
     )?;
     watcher.watch(&cfg.root, RecursiveMode::Recursive)?;
 
-    let mut pending = HashSet::new();
+    let mut pending = HashSet::default();
     let idle = Duration::from_secs(watch_options.idle_seconds.max(1));
     loop {
         match rx.recv_timeout(idle) {
@@ -1535,11 +1714,25 @@ fn command_search(args: &[String]) -> Result<i32> {
         .first()
         .map(PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
+    if !options.auto_update && options.daemon {
+        if let Some(root) = find_existing_index_root(&start) {
+            if let Some(code) = try_search_daemon(&root, args)? {
+                return Ok(code);
+            }
+            let _lock = acquire_shared_lock(&root)?;
+            if let Ok(index) = MappedIndex::open(&index_path(&root)) {
+                return run_search_with_index(index, &options);
+            }
+        }
+    }
     let cfg = if options.auto_index {
         load_or_create_config(&start)?
     } else {
         load_config(&start)?
     };
+    if options.auto_update {
+        refresh_index_for_search(&cfg, &options)?;
+    }
     let _lock = acquire_shared_lock(&cfg.root)?;
     let path = index_path(&cfg.root);
     let mut index = MappedIndex::open(&path);
@@ -1562,37 +1755,326 @@ fn command_search(args: &[String]) -> Result<i32> {
         index = MappedIndex::open(&path);
     }
     let index = index?;
-    let deltas = load_deltas(&cfg.root)?;
+    run_search_with_index(index, &options)
+}
+
+fn run_search_with_index(index: MappedIndex, options: &Options) -> Result<i32> {
+    let output = search_with_index_output(&index, options)?;
+    let stdout = std::io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    out.write_all(&output.stdout)?;
+    out.flush()?;
+    let stderr = std::io::stderr();
+    let mut err = BufWriter::new(stderr.lock());
+    err.write_all(&output.stderr)?;
+    err.flush()?;
+    Ok(output.code)
+}
+
+fn search_with_index_output(index: &MappedIndex, options: &Options) -> Result<SearchOutput> {
+    let deltas = load_deltas(&index.root)?;
     if options.files {
-        if !options.quiet {
-            print_visible_files(&index, &deltas, &options)?;
-        }
-        return Ok(0);
+        let stdout = if options.quiet {
+            Vec::new()
+        } else {
+            render_visible_files(index, &deltas, options)?
+        };
+        return Ok(SearchOutput {
+            code: 0,
+            stdout,
+            stderr: Vec::new(),
+        });
     }
     let timer = Instant::now();
     let mut searched = 0;
-    let results = execute_search_segments(&index, &deltas, &options, &mut searched)?;
+    let results = execute_search_rendered_segments(index, &deltas, options, &mut searched)?;
+    let mut stdout = Vec::new();
     if !options.quiet {
-        print_results(&results, &options);
+        write_rendered_results(&mut stdout, &results)?;
     }
+    let mut stderr = Vec::new();
     if options.stats {
-        let match_count: usize = results.iter().map(|r| r.matches.len()).sum();
-        eprintln!("{match_count} matches");
-        eprintln!("{} matched files", results.len());
-        eprintln!("{searched} candidate files");
-        eprintln!("{:.6} seconds", timer.elapsed().as_secs_f64());
+        let match_count: usize = results.iter().map(|r| r.match_count).sum();
+        writeln!(stderr, "{match_count} matches")?;
+        writeln!(stderr, "{} matched files", results.len())?;
+        writeln!(stderr, "{searched} candidate files")?;
+        writeln!(stderr, "{:.6} seconds", timer.elapsed().as_secs_f64())?;
     }
-    Ok(if results.is_empty() { 1 } else { 0 })
+    Ok(SearchOutput {
+        code: if results.is_empty() { 1 } else { 0 },
+        stdout,
+        stderr,
+    })
+}
+
+fn find_existing_index_root(start: &Path) -> Option<PathBuf> {
+    let path = if start.is_absolute() {
+        start.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(start)
+    };
+    path.ancestors()
+        .find(|ancestor| index_path(ancestor).is_file())
+        .map(Path::to_path_buf)
+}
+
+fn try_search_daemon(root: &Path, args: &[String]) -> Result<Option<i32>> {
+    if env::var_os("INDEXSEARCH_NO_DAEMON").is_some() {
+        return Ok(None);
+    }
+    if let Some(record) = read_valid_search_daemon_record(root)? {
+        if let Ok(output) = request_search_daemon(&record, args) {
+            write_search_output(&output)?;
+            return Ok(Some(output.code));
+        }
+        let _ = fs::remove_file(search_daemon_record_path(root));
+    }
+    start_search_daemon(root)?;
+    let start = Instant::now();
+    while start.elapsed() < SEARCH_DAEMON_START_TIMEOUT {
+        if let Some(record) = read_valid_search_daemon_record(root)? {
+            if let Ok(output) = request_search_daemon(&record, args) {
+                write_search_output(&output)?;
+                return Ok(Some(output.code));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(None)
+}
+
+fn write_search_output(output: &SearchOutput) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    out.write_all(&output.stdout)?;
+    out.flush()?;
+    let stderr = std::io::stderr();
+    let mut err = BufWriter::new(stderr.lock());
+    err.write_all(&output.stderr)?;
+    err.flush()?;
+    Ok(())
+}
+
+fn start_search_daemon(root: &Path) -> Result<()> {
+    let exe = env::current_exe()?;
+    let mut command = Command::new(exe);
+    command
+        .arg("search-daemon")
+        .arg("--detach")
+        .arg(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    detach_background_command(&mut command);
+    command.spawn()?;
+    Ok(())
+}
+
+fn command_search_daemon(args: &[String]) -> Result<i32> {
+    let mut detach = false;
+    let mut root = None;
+    for arg in args {
+        if arg == "--detach" {
+            detach = true;
+        } else {
+            root = Some(PathBuf::from(arg));
+        }
+    }
+    let root = root.context("search-daemon requires a root")?;
+    if detach {
+        daemonize_current_process()?;
+    }
+    run_search_daemon(&root)
+}
+
+fn run_search_daemon(root: &Path) -> Result<i32> {
+    let index_meta = fs::metadata(index_path(root))?;
+    let exe = env::current_exe()?;
+    let exe_meta = fs::metadata(&exe)?;
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    let token = search_daemon_token(root);
+    let record = SearchDaemonRecord {
+        pid: std::process::id(),
+        port,
+        token,
+        root: root.to_path_buf(),
+        exe_path: exe,
+        exe_size: exe_meta.len(),
+        exe_mtime: mtime_ns(&exe_meta),
+        index_size: index_meta.len(),
+        index_mtime: mtime_ns(&index_meta),
+    };
+    write_search_daemon_record(&record)?;
+    let index = {
+        let _lock = acquire_shared_lock(root)?;
+        MappedIndex::open(&index_path(record.root.as_path()))?
+    };
+    loop {
+        let (mut stream, _) = listener.accept()?;
+        let _ = handle_search_daemon_client(&mut stream, &record, &index);
+    }
+}
+
+fn handle_search_daemon_client(
+    stream: &mut TcpStream,
+    record: &SearchDaemonRecord,
+    index: &MappedIndex,
+) -> Result<()> {
+    let cwd = read_search_daemon_request(stream, &record.token)?;
+    let current_dir = env::current_dir().ok();
+    if let Some(cwd) = cwd.cwd.as_ref() {
+        let _ = env::set_current_dir(cwd);
+    }
+    let output = match parse_search_args(&cwd.args).and_then(|options| {
+        if options.auto_update {
+            bail!("daemon does not run auto-update searches");
+        }
+        search_with_index_output(index, &options)
+    }) {
+        Ok(output) => output,
+        Err(err) => SearchOutput {
+            code: 2,
+            stdout: Vec::new(),
+            stderr: format!("indexsearch: {err:#}\n").into_bytes(),
+        },
+    };
+    if let Some(dir) = current_dir {
+        let _ = env::set_current_dir(dir);
+    }
+    write_search_daemon_response(stream, &output)
+}
+
+struct SearchDaemonRequest {
+    cwd: Option<PathBuf>,
+    args: Vec<String>,
+}
+
+fn request_search_daemon(record: &SearchDaemonRecord, args: &[String]) -> Result<SearchOutput> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], record.port));
+    let mut stream = TcpStream::connect_timeout(&addr, SEARCH_DAEMON_CONNECT_TIMEOUT)?;
+    stream.set_nodelay(true)?;
+    write_search_daemon_request(&mut stream, record, args)?;
+    read_search_daemon_response(&mut stream)
+}
+
+fn write_search_daemon_request(
+    stream: &mut TcpStream,
+    record: &SearchDaemonRecord,
+    args: &[String],
+) -> Result<()> {
+    stream.write_all(SEARCH_DAEMON_REQUEST_MAGIC)?;
+    write_bytes_frame(stream, record.token.as_bytes())?;
+    let cwd = env::current_dir()
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    write_bytes_frame(stream, cwd.as_bytes())?;
+    write_u32(stream, args.len() as u32)?;
+    for arg in args {
+        write_bytes_frame(stream, arg.as_bytes())?;
+    }
+    stream.flush()?;
+    Ok(())
+}
+
+fn read_search_daemon_request(
+    stream: &mut TcpStream,
+    expected_token: &str,
+) -> Result<SearchDaemonRequest> {
+    let mut magic = [0u8; 8];
+    stream.read_exact(&mut magic)?;
+    if &magic != SEARCH_DAEMON_REQUEST_MAGIC {
+        bail!("invalid search daemon request");
+    }
+    let token = read_string_frame(stream)?;
+    if token != expected_token {
+        bail!("invalid search daemon token");
+    }
+    let cwd = read_string_frame(stream)?;
+    let argc = read_u32_from_reader(stream)? as usize;
+    let mut args = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        args.push(read_string_frame(stream)?);
+    }
+    Ok(SearchDaemonRequest {
+        cwd: (!cwd.is_empty()).then(|| PathBuf::from(cwd)),
+        args,
+    })
+}
+
+fn write_search_daemon_response(stream: &mut TcpStream, output: &SearchOutput) -> Result<()> {
+    stream.write_all(SEARCH_DAEMON_RESPONSE_MAGIC)?;
+    write_u32(stream, output.code as u32)?;
+    write_bytes_frame(stream, &output.stdout)?;
+    write_bytes_frame(stream, &output.stderr)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn read_search_daemon_response(stream: &mut TcpStream) -> Result<SearchOutput> {
+    let mut magic = [0u8; 8];
+    stream.read_exact(&mut magic)?;
+    if &magic != SEARCH_DAEMON_RESPONSE_MAGIC {
+        bail!("invalid search daemon response");
+    }
+    let code = read_u32_from_reader(stream)? as i32;
+    let stdout = read_bytes_frame(stream)?;
+    let stderr = read_bytes_frame(stream)?;
+    Ok(SearchOutput {
+        code,
+        stdout,
+        stderr,
+    })
+}
+
+fn refresh_index_for_search(cfg: &ProjectConfig, options: &Options) -> Result<()> {
+    let _lock = acquire_exclusive_lock(&cfg.root)?;
+    let path = index_path(&cfg.root);
+    let existing = MappedIndex::open(&path).ok();
+    if existing
+        .as_ref()
+        .map(|index| index.config_hash != cfg.hash)
+        .unwrap_or(true)
+    {
+        let mut scanned = 0;
+        let mut skipped = 0;
+        let built = build_index(cfg, options, &mut scanned, &mut skipped, None)?;
+        save_index(&built, &path)?;
+        remove_delta_dir(&cfg.root)?;
+        save_index_state(&cfg.root)?;
+        return Ok(());
+    }
+
+    let Some(changes) = collect_git_changes(&cfg.root, options.git_untracked)? else {
+        return Ok(());
+    };
+    if changes.is_empty() {
+        save_index_state(&cfg.root)?;
+        return Ok(());
+    }
+
+    let mut scanned = 0;
+    let mut skipped = 0;
+    let (delta, meta, stats) =
+        build_delta_index(cfg, options, &changes, &mut scanned, &mut skipped)?;
+    if stats.added != 0 || stats.updated != 0 || stats.removed != 0 {
+        save_delta(&cfg.root, &delta, &meta)?;
+    }
+    save_index_state(&cfg.root)?;
+    Ok(())
 }
 
 fn parse_search_args(args: &[String]) -> Result<Options> {
     let mut options = Options {
         auto_index: true,
+        daemon: true,
         max_filesize: DEFAULT_MAX_FILE_SIZE,
         ..Options::default()
     };
     let mut regexps = Vec::new();
     let mut i = 0;
+    let mut positional_only = false;
     while i < args.len() {
         let arg = &args[i];
         let mut need_value = |name: &str| -> Result<String> {
@@ -1601,6 +2083,15 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
                 .cloned()
                 .ok_or_else(|| anyhow!("missing value for {name}"))
         };
+        if positional_only {
+            if options.pattern.is_empty() && regexps.is_empty() && !options.files {
+                options.pattern = arg.clone();
+            } else {
+                options.paths.push(arg.clone());
+            }
+            i += 1;
+            continue;
+        }
         match arg.as_str() {
             "-h" | "--help" => {
                 print_search_help();
@@ -1629,6 +2120,13 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
             "--hidden" => options.hidden = true,
             "-L" | "--follow" => options.follow = true,
             "--no-auto-index" => options.auto_index = false,
+            "--auto-update" => options.auto_update = true,
+            "--no-daemon" => options.daemon = false,
+            "--auto-update-untracked" => {
+                options.auto_update = true;
+                options.git_untracked = true;
+            }
+            "--" => positional_only = true,
             "--no-heading" | "--no-messages" | "--no-ignore" | "--no-ignore-vcs" => {}
             "--color" | "--colors" | "--sort" | "--sortr" | "-j" | "--threads" => {
                 let _ = need_value(arg)?;
@@ -1805,15 +2303,15 @@ fn build_index(
     }
     let process_timer = Instant::now();
     let skipped_reads = AtomicU64::new(0);
-    let mut files: Vec<(usize, FileEntry, Vec<u32>)> = entries
+    let mut files: Vec<(usize, FileEntry, Vec<u32>, Vec<u32>)> = entries
         .par_iter()
-        .filter_map(|entry| {
+        .map_init(TrigramScratch::new, |scratch, entry| {
             let bytes = fs::read(&entry.path).ok()?;
             if is_binary(&bytes) {
                 skipped_reads.fetch_add(1, AtomicOrdering::Relaxed);
                 return None;
             }
-            let grams = file_trigrams(&bytes);
+            let (grams, fragments) = index_grams_and_word_fragments(&bytes, scratch);
             Some((
                 entry.ordinal,
                 FileEntry {
@@ -1823,17 +2321,29 @@ fn build_index(
                     content: bytes,
                 },
                 grams,
+                fragments,
             ))
         })
+        .filter_map(|result| result)
         .collect();
-    files.sort_by_key(|(idx, _, _)| *idx);
+    files.sort_by_key(|(idx, _, _, _)| *idx);
 
-    let mut postings: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    let mut postings: HashMap<u32, Vec<u32>> = HashMap::default();
+    let selected_fragments = selected_word_fragments(
+        files
+            .iter()
+            .map(|(_, _, _, fragments)| fragments.as_slice()),
+    );
     let mut out_files = Vec::with_capacity(files.len());
-    for (_, file, grams) in files {
+    for (_, file, grams, fragments) in files {
         let id = out_files.len() as u32;
         for gram in grams {
             postings.entry(gram).or_default().push(id);
+        }
+        for fragment in fragments {
+            if selected_fragments.contains(&fragment) {
+                postings.entry(fragment).or_default().push(id);
+            }
         }
         out_files.push(file);
     }
@@ -1847,103 +2357,6 @@ fn build_index(
         files: out_files,
         postings,
     })
-}
-
-fn update_index(
-    cfg: &ProjectConfig,
-    options: &Options,
-    old: &MappedIndex,
-    scanned: &mut u64,
-    skipped: &mut u64,
-    mut timings: Option<&mut Timings>,
-) -> Result<(BuiltIndex, UpdateStats)> {
-    let scan_timer = Instant::now();
-    let entries = scan_indexable_files(cfg, options, scanned, skipped)?;
-    if let Some(timings) = timings.as_deref_mut() {
-        timings.scan += scan_timer.elapsed().as_secs_f64();
-    }
-    let process_timer = Instant::now();
-    let mut old_files = HashMap::with_capacity(old.file_count);
-    for id in 0..old.file_count {
-        let file = old.file(id)?;
-        let rec = old.file_record(id)?;
-        old_files.insert(bytes_to_string(file.path), (id, rec.mtime, rec.size));
-    }
-
-    let skipped_reads = AtomicU64::new(0);
-    let mut stats = UpdateStats::default();
-    let mut seen_old = HashSet::with_capacity(entries.len());
-    let mut jobs = Vec::with_capacity(entries.len());
-    for entry in entries {
-        if let Some(&(id, old_mtime, old_size)) = old_files.get(&entry.rel) {
-            seen_old.insert(entry.rel.clone());
-            if old_mtime == entry.mtime && old_size == entry.size {
-                jobs.push((entry, Some(id), ChangeKind::Reused));
-                continue;
-            }
-            jobs.push((entry, None, ChangeKind::Updated));
-        } else {
-            jobs.push((entry, None, ChangeKind::Added));
-        }
-    }
-    stats.removed = old_files.len().saturating_sub(seen_old.len()) as u64;
-
-    let mut files: Vec<(usize, ChangeKind, FileEntry, Vec<u32>)> = jobs
-        .par_iter()
-        .filter_map(|(entry, old_id, kind)| {
-            let bytes = if let Some(old_id) = old_id {
-                old.file(*old_id).ok()?.content.to_vec()
-            } else {
-                let bytes = fs::read(&entry.path).ok()?;
-                if is_binary(&bytes) {
-                    skipped_reads.fetch_add(1, AtomicOrdering::Relaxed);
-                    return None;
-                }
-                bytes
-            };
-            let grams = file_trigrams(&bytes);
-            Some((
-                entry.ordinal,
-                *kind,
-                FileEntry {
-                    path: entry.rel.clone(),
-                    mtime: entry.mtime,
-                    size: bytes.len() as u64,
-                    content: bytes,
-                },
-                grams,
-            ))
-        })
-        .collect();
-    files.sort_by_key(|(idx, _, _, _)| *idx);
-
-    let mut postings: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    let mut out_files = Vec::with_capacity(files.len());
-    for (_, kind, file, grams) in files {
-        match kind {
-            ChangeKind::Reused => stats.reused += 1,
-            ChangeKind::Added => stats.added += 1,
-            ChangeKind::Updated => stats.updated += 1,
-        }
-        let id = out_files.len() as u32;
-        for gram in grams {
-            postings.entry(gram).or_default().push(id);
-        }
-        out_files.push(file);
-    }
-    *skipped += skipped_reads.load(AtomicOrdering::Relaxed);
-    if let Some(timings) = timings {
-        timings.process += process_timer.elapsed().as_secs_f64();
-    }
-    Ok((
-        BuiltIndex {
-            root: cfg.root.clone(),
-            config_hash: cfg.hash,
-            files: out_files,
-            postings,
-        },
-        stats,
-    ))
 }
 
 fn read_current_file_entry(
@@ -1966,7 +2379,8 @@ fn read_current_file_entry(
     if is_binary(&bytes) {
         return Ok(None);
     }
-    let grams = file_trigrams(&bytes);
+    let mut scratch = TrigramScratch::new();
+    let grams = index_grams(&bytes, &mut scratch);
     Ok(Some((
         FileEntry {
             path: rel,
@@ -1988,7 +2402,7 @@ fn build_delta_index(
     *scanned = changes.len() as u64;
     let existing = current_visible_paths(&cfg.root)?;
     let mut files = Vec::new();
-    let mut postings: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    let mut postings: HashMap<u32, Vec<u32>> = HashMap::default();
     let mut meta = DeltaMeta::default();
     let mut stats = UpdateStats::default();
 
@@ -2041,19 +2455,81 @@ fn build_delta_index(
     ))
 }
 
+fn collect_filesystem_changes(
+    cfg: &ProjectConfig,
+    options: &Options,
+    scanned: &mut u64,
+    skipped: &mut u64,
+    timings: &mut Timings,
+) -> Result<(Vec<ChangedPath>, usize)> {
+    let scan_timer = Instant::now();
+    let entries = scan_indexable_files(cfg, options, scanned, skipped)?;
+    timings.scan += scan_timer.elapsed().as_secs_f64();
+
+    let current = current_visible_file_meta(&cfg.root)?;
+    let visible_before = current.len();
+    let mut seen = HashSet::with_capacity_and_hasher(entries.len(), Default::default());
+    let mut changes = Vec::new();
+
+    for entry in entries {
+        seen.insert(entry.rel.clone());
+        match current.get(&entry.rel) {
+            Some((mtime, size)) if *mtime == entry.mtime && *size == entry.size => {}
+            _ => changes.push(ChangedPath {
+                rel: entry.rel,
+                deleted: false,
+            }),
+        }
+    }
+
+    for rel in current.keys() {
+        if !seen.contains(rel) {
+            changes.push(ChangedPath {
+                rel: rel.clone(),
+                deleted: true,
+            });
+        }
+    }
+
+    Ok((changes, visible_before))
+}
+
+fn current_visible_file_meta(root: &Path) -> Result<BTreeMap<String, (i64, u64)>> {
+    let base = MappedIndex::open(&index_path(root))?;
+    let deltas = load_deltas(root)?;
+    let mut files = BTreeMap::new();
+    for id in 0..base.file_count {
+        let rec = base.file_record(id)?;
+        files.insert(bytes_to_string(base.file_path(id)?), (rec.mtime, rec.size));
+    }
+    for delta in &deltas {
+        for tombstone in &delta.meta.tombstones {
+            files.remove(tombstone);
+        }
+        for id in 0..delta.index.file_count {
+            let rec = delta.index.file_record(id)?;
+            files.insert(
+                bytes_to_string(delta.index.file_path(id)?),
+                (rec.mtime, rec.size),
+            );
+        }
+    }
+    Ok(files)
+}
+
 fn current_visible_paths(root: &Path) -> Result<HashSet<String>> {
     let base = MappedIndex::open(&index_path(root))?;
     let deltas = load_deltas(root)?;
-    let mut paths = HashSet::new();
+    let mut paths = HashSet::default();
     for id in 0..base.file_count {
-        paths.insert(bytes_to_string(base.file(id)?.path));
+        paths.insert(bytes_to_string(base.file_path(id)?));
     }
     for delta in &deltas {
         for tombstone in &delta.meta.tombstones {
             paths.remove(tombstone);
         }
         for id in 0..delta.index.file_count {
-            paths.insert(bytes_to_string(delta.index.file(id)?.path));
+            paths.insert(bytes_to_string(delta.index.file_path(id)?));
         }
     }
     Ok(paths)
@@ -2071,10 +2547,26 @@ fn compact_segments(
     for (idx, delta) in deltas.iter().enumerate() {
         append_visible_files(&delta.index, &exclusions[idx + 1], &mut files)?;
     }
-    let mut postings: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-    for (id, file) in files.iter().enumerate() {
-        for gram in file_trigrams(&file.content) {
+    let mut postings: HashMap<u32, Vec<u32>> = HashMap::default();
+    let indexed_files: Vec<(Vec<u32>, Vec<u32>)> = files
+        .par_iter()
+        .map_init(TrigramScratch::new, |scratch, file| {
+            index_grams_and_word_fragments(&file.content, scratch)
+        })
+        .collect();
+    let selected_fragments = selected_word_fragments(
+        indexed_files
+            .iter()
+            .map(|(_, fragments)| fragments.as_slice()),
+    );
+    for id in 0..files.len() {
+        for &gram in &indexed_files[id].0 {
             postings.entry(gram).or_default().push(id as u32);
+        }
+        for &fragment in &indexed_files[id].1 {
+            if selected_fragments.contains(&fragment) {
+                postings.entry(fragment).or_default().push(id as u32);
+            }
         }
     }
     Ok(BuiltIndex {
@@ -2092,7 +2584,7 @@ fn append_visible_files(
 ) -> Result<()> {
     for id in 0..index.file_count {
         let file = index.file(id)?;
-        let path = bytes_to_string(file.path);
+        let path = bytes_to_string(index.file_path(id)?);
         if excluded_paths.contains(&path) {
             continue;
         }
@@ -2107,40 +2599,41 @@ fn append_visible_files(
     Ok(())
 }
 
-fn print_visible_files(
+fn render_visible_files(
     base: &MappedIndex,
     deltas: &[DeltaSegment],
     options: &Options,
-) -> Result<()> {
+) -> Result<Vec<u8>> {
     let exclusions = segment_exclusions(base, deltas)?;
-    print_segment_files(base, &exclusions[0], options)?;
+    let mut out = Vec::new();
+    write_segment_files(&mut out, base, &exclusions[0], options)?;
     for (idx, delta) in deltas.iter().enumerate() {
-        print_segment_files(&delta.index, &exclusions[idx + 1], options)?;
+        write_segment_files(&mut out, &delta.index, &exclusions[idx + 1], options)?;
     }
-    Ok(())
+    Ok(out)
 }
 
-fn print_segment_files(
+fn write_segment_files<W: Write>(
+    out: &mut W,
     index: &MappedIndex,
     excluded_paths: &HashSet<String>,
     options: &Options,
 ) -> Result<()> {
     for id in 0..index.file_count {
-        let file = index.file(id)?;
-        let path = bytes_to_string(file.path);
+        let path = bytes_to_string(index.file_path(id)?);
         if excluded_paths.contains(&path) {
             continue;
         }
         if path_allowed(options, &index.root, &path)? {
-            println!("{path}");
+            writeln!(out, "{path}")?;
         }
     }
     Ok(())
 }
 
 fn segment_exclusions(base: &MappedIndex, deltas: &[DeltaSegment]) -> Result<Vec<HashSet<String>>> {
-    let mut exclusions = vec![HashSet::new(); deltas.len() + 1];
-    let mut shadowed = HashSet::new();
+    let mut exclusions = vec![HashSet::default(); deltas.len() + 1];
+    let mut shadowed = HashSet::default();
     for idx in (0..deltas.len()).rev() {
         exclusions[idx + 1] = shadowed.clone();
         add_segment_overlay(&deltas[idx], &mut shadowed)?;
@@ -2155,7 +2648,7 @@ fn add_segment_overlay(delta: &DeltaSegment, shadowed: &mut HashSet<String>) -> 
         shadowed.insert(tombstone.clone());
     }
     for id in 0..delta.index.file_count {
-        shadowed.insert(bytes_to_string(delta.index.file(id)?.path));
+        shadowed.insert(bytes_to_string(delta.index.file_path(id)?));
     }
     Ok(())
 }
@@ -2534,6 +3027,103 @@ fn is_binary(bytes: &[u8]) -> bool {
         .is_some_and(|prefix| prefix.contains(&0))
 }
 
+#[allow(dead_code)]
+struct ChunkExtensionBuild {
+    records: Vec<ChunkRecord>,
+    bloom_data: Vec<u8>,
+}
+
+#[allow(dead_code)]
+fn build_chunk_extension(files: &[FileEntry]) -> ChunkExtensionBuild {
+    struct FileChunkBuild {
+        records: Vec<ChunkRecord>,
+        bloom_data: Vec<u8>,
+    }
+
+    let builds: Vec<FileChunkBuild> = files
+        .par_iter()
+        .enumerate()
+        .map(|(file_id, file)| {
+            let mut records = Vec::new();
+            let mut bloom_data = Vec::new();
+            let mut line_no = 1u32;
+            for (chunk_index, chunk) in file.content.chunks(CHUNK_SIZE).enumerate() {
+                let start = chunk_index * CHUNK_SIZE;
+                let slice_start = start.saturating_sub(CHUNK_OVERLAP);
+                let slice_end = (start + chunk.len() + CHUNK_OVERLAP).min(file.content.len());
+                bloom_data.extend_from_slice(&chunk_bloom(&file.content[slice_start..slice_end]));
+                records.push(ChunkRecord {
+                    file_id: file_id as u32,
+                    start: start as u64,
+                    size: chunk.len() as u32,
+                    line_no,
+                });
+                line_no = line_no.saturating_add(bytecount_newlines(chunk) as u32);
+            }
+            FileChunkBuild {
+                records,
+                bloom_data,
+            }
+        })
+        .collect();
+
+    let mut records = Vec::new();
+    let mut bloom_data = Vec::new();
+    for build in builds {
+        for rec in build.records {
+            records.push(rec);
+        }
+        bloom_data.extend_from_slice(&build.bloom_data);
+    }
+    ChunkExtensionBuild {
+        records,
+        bloom_data,
+    }
+}
+
+fn chunk_bloom(bytes: &[u8]) -> [u8; CHUNK_BLOOM_BYTES] {
+    let mut bloom = [0u8; CHUNK_BLOOM_BYTES];
+    if bytes.len() < 3 {
+        return bloom;
+    }
+    for window in bytes.windows(3) {
+        let gram = trigram(window[0], window[1], window[2]);
+        set_chunk_bloom_bit(&mut bloom, gram, 0x9e37_79b9);
+        set_chunk_bloom_bit(&mut bloom, gram, 0x85eb_ca6b);
+    }
+    bloom
+}
+
+fn set_chunk_bloom_bit(bloom: &mut [u8; CHUNK_BLOOM_BYTES], gram: u32, salt: u32) {
+    let bit = chunk_bloom_bit(gram, salt);
+    bloom[bit / 8] |= 1u8 << (bit % 8);
+}
+
+fn chunk_bloom_maybe(bloom: &[u8], gram: u32) -> bool {
+    chunk_bloom_has_bit(bloom, gram, 0x9e37_79b9) && chunk_bloom_has_bit(bloom, gram, 0x85eb_ca6b)
+}
+
+fn chunk_bloom_has_bit(bloom: &[u8], gram: u32, salt: u32) -> bool {
+    let bit = chunk_bloom_bit(gram, salt);
+    bloom
+        .get(bit / 8)
+        .is_some_and(|byte| byte & (1u8 << (bit % 8)) != 0)
+}
+
+fn chunk_bloom_bit(gram: u32, salt: u32) -> usize {
+    let mut hash = gram ^ salt;
+    hash ^= hash >> 16;
+    hash = hash.wrapping_mul(0x7feb_352d);
+    hash ^= hash >> 15;
+    hash = hash.wrapping_mul(0x846c_a68b);
+    hash ^= hash >> 16;
+    (hash as usize) & (CHUNK_BLOOM_BYTES * 8 - 1)
+}
+
+fn bytecount_newlines(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|&&byte| byte == b'\n').count()
+}
+
 fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
     fs::create_dir_all(path.parent().context("index path has no parent")?)?;
     let file_name = path
@@ -2549,26 +3139,30 @@ fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
         let path_offset = path_blob.len() as u64;
         path_blob.extend_from_slice(file.path.as_bytes());
         let content_offset = content_blob.len() as u64;
-        content_blob.extend_from_slice(&file.content);
+        let compressed = lz4_flex::compress_prepend_size(&file.content);
+        content_blob.extend_from_slice(&compressed);
         file_records.push(FileRecord {
             path_offset,
             path_size: file.path.len() as u64,
             content_offset,
-            content_size: file.content.len() as u64,
+            content_size: compressed.len() as u64,
             mtime: file.mtime,
             size: file.size,
         });
     }
-    let mut posting_records = Vec::with_capacity(index.postings.len());
+    let mut posting_entries: Vec<_> = index.postings.iter().collect();
+    posting_entries.sort_by_key(|entry| *entry.0);
+    let mut posting_records = Vec::with_capacity(posting_entries.len());
     let mut posting_data = Vec::new();
-    for (&gram, ids) in &index.postings {
+    for (&gram, ids) in posting_entries {
         posting_records.push(PostingRecord {
             gram,
             offset: posting_data.len() as u64,
             count: ids.len() as u64,
         });
-        posting_data.extend_from_slice(ids);
+        write_varint_postings(ids, &mut posting_data);
     }
+    let chunk_extension = ENABLE_CHUNK_EXTENSION.then(|| build_chunk_extension(&index.files));
     let mut cursor = 96_u64;
     let root_offset = cursor;
     cursor += root.len() as u64;
@@ -2578,12 +3172,27 @@ fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
     cursor = align_to(cursor, 8);
     let posting_table_offset = cursor;
     cursor += posting_records.len() as u64 * 24;
-    cursor = align_to(cursor, 4);
     let postings_data_offset = cursor;
-    cursor += posting_data.len() as u64 * 4;
+    cursor += posting_data.len() as u64;
     let path_blob_offset = cursor;
     cursor += path_blob.len() as u64;
     let content_blob_offset = cursor;
+    cursor += content_blob.len() as u64;
+    let mut chunk_table_offset = 0;
+    let mut chunk_posting_table_offset = 0;
+    let mut chunk_posting_data_offset = 0;
+    let mut chunk_blob_offset = 0;
+    if let Some(chunk_extension) = &chunk_extension {
+        cursor = align_to(cursor, 8);
+        chunk_table_offset = cursor;
+        cursor += chunk_extension.records.len() as u64 * 24;
+        cursor = align_to(cursor, 8);
+        chunk_posting_table_offset = cursor;
+        cursor += 0;
+        chunk_posting_data_offset = cursor;
+        cursor += 0;
+        chunk_blob_offset = cursor;
+    }
 
     let mut writer = BufWriter::new(File::create(&tmp_path)?);
     writer.write_all(MAGIC)?;
@@ -2629,11 +3238,36 @@ fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
         posting_table_offset + posting_records.len() as u64 * 24,
         postings_data_offset,
     )?;
-    for id in &posting_data {
-        write_u32(&mut writer, *id)?;
-    }
+    writer.write_all(&posting_data)?;
     writer.write_all(&path_blob)?;
     writer.write_all(&content_blob)?;
+    if let Some(chunk_extension) = &chunk_extension {
+        write_padding(
+            &mut writer,
+            content_blob_offset + content_blob.len() as u64,
+            chunk_table_offset,
+        )?;
+        for rec in &chunk_extension.records {
+            write_u32(&mut writer, rec.file_id)?;
+            write_u32(&mut writer, rec.size)?;
+            write_u64(&mut writer, rec.start)?;
+            write_u32(&mut writer, rec.line_no)?;
+            write_u32(&mut writer, 0)?;
+        }
+        write_padding(
+            &mut writer,
+            chunk_table_offset + chunk_extension.records.len() as u64 * 24,
+            chunk_posting_table_offset,
+        )?;
+        writer.write_all(&chunk_extension.bloom_data)?;
+        writer.write_all(CHUNK_FOOTER_MAGIC)?;
+        write_u64(&mut writer, chunk_extension.records.len() as u64)?;
+        write_u64(&mut writer, chunk_table_offset)?;
+        write_u64(&mut writer, 0)?;
+        write_u64(&mut writer, chunk_posting_table_offset)?;
+        write_u64(&mut writer, chunk_posting_data_offset)?;
+        write_u64(&mut writer, chunk_blob_offset)?;
+    }
     writer.flush()?;
     drop(writer);
     if let Err(err) = fs::rename(&tmp_path, path) {
@@ -2686,10 +3320,12 @@ impl MappedIndex {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         let header = parse_header(&mmap)?;
+        let chunk_info = parse_chunk_info(&mmap, header.version)?;
         let root_bytes = checked_slice(&mmap, header.root_offset, header.root_size)?;
         let root = PathBuf::from(String::from_utf8_lossy(root_bytes).to_string());
         Ok(Self {
             mmap,
+            version: header.version,
             root,
             config_hash: header.config_hash,
             file_count: header.file_count as usize,
@@ -2699,6 +3335,7 @@ impl MappedIndex {
             postings_data_offset: header.postings_data_offset as usize,
             path_blob_offset: header.path_blob_offset as usize,
             content_blob_offset: header.content_blob_offset as usize,
+            chunk_info,
         })
     }
 
@@ -2708,17 +3345,77 @@ impl MappedIndex {
         }
         let rec = self.file_record(id)?;
         Ok(FileView {
-            path: checked_slice(
-                &self.mmap,
-                self.path_blob_offset as u64 + rec.path_offset,
-                rec.path_size,
-            )?,
-            content: checked_slice(
-                &self.mmap,
-                self.content_blob_offset as u64 + rec.content_offset,
-                rec.content_size,
-            )?,
+            content: self.file_content_for_id(id, &rec)?,
         })
+    }
+
+    fn file_for_search<'a>(
+        &'a self,
+        id: usize,
+        scratch: &'a mut Vec<u8>,
+    ) -> Result<(&'a [u8], &'a [u8])> {
+        if id >= self.file_count {
+            bail!("file id out of bounds");
+        }
+        let rec = self.file_record(id)?;
+        let path = checked_slice(
+            &self.mmap,
+            self.path_blob_offset as u64 + rec.path_offset,
+            rec.path_size,
+        )?;
+        let content = self.file_content_for_search(&rec, scratch)?;
+        Ok((path, content))
+    }
+
+    fn file_content_for_search<'a>(
+        &'a self,
+        rec: &FileRecord,
+        scratch: &'a mut Vec<u8>,
+    ) -> Result<&'a [u8]> {
+        let bytes = checked_slice(
+            &self.mmap,
+            self.content_blob_offset as u64 + rec.content_offset,
+            rec.content_size,
+        )?;
+        if self.version >= 3 {
+            let (size, compressed) = lz4_flex::block::uncompressed_size(bytes)
+                .context("failed to read indexed file content size")?;
+            scratch.resize(size, 0);
+            let written = lz4_flex::decompress_into(compressed, scratch)
+                .context("failed to decompress indexed file content")?;
+            scratch.truncate(written);
+            Ok(scratch.as_slice())
+        } else {
+            Ok(bytes)
+        }
+    }
+
+    fn file_content_for_id<'a>(&'a self, id: usize, rec: &FileRecord) -> Result<Cow<'a, [u8]>> {
+        let _ = id;
+        let bytes = checked_slice(
+            &self.mmap,
+            self.content_blob_offset as u64 + rec.content_offset,
+            rec.content_size,
+        )?;
+        if self.version >= 3 {
+            let content = lz4_flex::decompress_size_prepended(bytes)
+                .context("failed to decompress indexed file content")?;
+            Ok(Cow::Owned(content))
+        } else {
+            Ok(Cow::Borrowed(bytes))
+        }
+    }
+
+    fn file_path(&self, id: usize) -> Result<&[u8]> {
+        if id >= self.file_count {
+            bail!("file id out of bounds");
+        }
+        let rec = self.file_record(id)?;
+        checked_slice(
+            &self.mmap,
+            self.path_blob_offset as u64 + rec.path_offset,
+            rec.path_size,
+        )
     }
 
     fn file_record(&self, id: usize) -> Result<FileRecord> {
@@ -2743,20 +3440,146 @@ impl MappedIndex {
                 Ordering::Less => lo = mid + 1,
                 Ordering::Greater => hi = mid,
                 Ordering::Equal => {
-                    let start = self.postings_data_offset as u64 + rec.offset * 4;
-                    let bytes = checked_slice(&self.mmap, start, rec.count * 4)?;
-                    let data = unsafe {
-                        std::slice::from_raw_parts(bytes.as_ptr() as *const u32, rec.count as usize)
-                    };
-                    return Ok(Some(PostingView { data }));
+                    if self.version >= 4 {
+                        let start = self.postings_data_offset as u64 + rec.offset;
+                        let end = self.posting_data_end(mid)?;
+                        let bytes = checked_slice(&self.mmap, start, end - start)?;
+                        let data = read_varint_postings(bytes, rec.count as usize)?;
+                        return Ok(Some(PostingView {
+                            data: Cow::Owned(data),
+                        }));
+                    } else {
+                        let start = self.postings_data_offset as u64 + rec.offset * 4;
+                        let bytes = checked_slice(&self.mmap, start, rec.count * 4)?;
+                        let data = unsafe {
+                            std::slice::from_raw_parts(
+                                bytes.as_ptr() as *const u32,
+                                rec.count as usize,
+                            )
+                        };
+                        return Ok(Some(PostingView {
+                            data: Cow::Borrowed(data),
+                        }));
+                    }
                 }
             }
         }
         Ok(None)
     }
 
+    fn posting_data_end(&self, posting_id: usize) -> Result<u64> {
+        if posting_id + 1 < self.posting_count {
+            Ok(self.postings_data_offset as u64 + self.posting_record(posting_id + 1)?.offset)
+        } else {
+            Ok(self.path_blob_offset as u64)
+        }
+    }
+
     fn posting_record(&self, id: usize) -> Result<PostingRecord> {
         let off = self.posting_table_offset + id * 24;
+        Ok(PostingRecord {
+            gram: read_u32_at(&self.mmap, off)?,
+            offset: read_u64_at(&self.mmap, off + 8)?,
+            count: read_u64_at(&self.mmap, off + 16)?,
+        })
+    }
+
+    fn chunk_record(&self, id: usize) -> Result<ChunkRecord> {
+        let info = self.chunk_info.context("index has no chunk extension")?;
+        if id >= info.chunk_count {
+            bail!("chunk id out of bounds");
+        }
+        let off = info.chunk_table_offset + id * 24;
+        Ok(ChunkRecord {
+            file_id: read_u32_at(&self.mmap, off)?,
+            size: read_u32_at(&self.mmap, off + 4)?,
+            start: read_u64_at(&self.mmap, off + 8)?,
+            line_no: read_u32_at(&self.mmap, off + 16)?,
+        })
+    }
+
+    fn chunk_range_for_file(&self, file_id: u32) -> Result<Option<(usize, usize)>> {
+        let Some(info) = self.chunk_info else {
+            return Ok(None);
+        };
+        let mut lo = 0usize;
+        let mut hi = info.chunk_count;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.chunk_record(mid)?.file_id < file_id {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        let start = lo;
+        if start >= info.chunk_count || self.chunk_record(start)?.file_id != file_id {
+            return Ok(None);
+        }
+        let mut lo = start;
+        let mut hi = info.chunk_count;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.chunk_record(mid)?.file_id <= file_id {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(Some((start, lo)))
+    }
+
+    fn chunk_bloom(&self, id: usize) -> Result<&[u8]> {
+        let info = self.chunk_info.context("index has no chunk extension")?;
+        if id >= info.chunk_count {
+            bail!("chunk id out of bounds");
+        }
+        checked_slice(
+            &self.mmap,
+            info.chunk_blob_offset as u64 + (id * CHUNK_BLOOM_BYTES) as u64,
+            CHUNK_BLOOM_BYTES as u64,
+        )
+    }
+
+    fn chunk_posting(&self, gram: u32) -> Result<Option<PostingView<'_>>> {
+        let Some(info) = self.chunk_info else {
+            return Ok(None);
+        };
+        let mut lo = 0usize;
+        let mut hi = info.chunk_posting_count;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let rec = self.chunk_posting_record(mid)?;
+            match rec.gram.cmp(&gram) {
+                Ordering::Less => lo = mid + 1,
+                Ordering::Greater => hi = mid,
+                Ordering::Equal => {
+                    let start = info.chunk_posting_data_offset as u64 + rec.offset;
+                    let end = self.chunk_posting_data_end(mid)?;
+                    let bytes = checked_slice(&self.mmap, start, end - start)?;
+                    let data = read_varint_postings(bytes, rec.count as usize)?;
+                    return Ok(Some(PostingView {
+                        data: Cow::Owned(data),
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn chunk_posting_data_end(&self, posting_id: usize) -> Result<u64> {
+        let info = self.chunk_info.context("index has no chunk extension")?;
+        if posting_id + 1 < info.chunk_posting_count {
+            Ok(info.chunk_posting_data_offset as u64
+                + self.chunk_posting_record(posting_id + 1)?.offset)
+        } else {
+            Ok(info.chunk_blob_offset as u64)
+        }
+    }
+
+    fn chunk_posting_record(&self, id: usize) -> Result<PostingRecord> {
+        let info = self.chunk_info.context("index has no chunk extension")?;
+        let off = info.chunk_posting_table_offset + id * 24;
         Ok(PostingRecord {
             gram: read_u32_at(&self.mmap, off)?,
             offset: read_u64_at(&self.mmap, off + 8)?,
@@ -2770,10 +3593,11 @@ fn parse_header(data: &[u8]) -> Result<Header> {
         bail!("invalid index header");
     }
     let version = read_u32_at(data, 8)?;
-    if version != VERSION {
+    if !(2..=VERSION).contains(&version) {
         bail!("unsupported index version {version}");
     }
     Ok(Header {
+        version,
         config_hash: read_u64_at(data, 16)?,
         file_count: read_u64_at(data, 24)?,
         posting_count: read_u64_at(data, 32)?,
@@ -2787,67 +3611,220 @@ fn parse_header(data: &[u8]) -> Result<Header> {
     })
 }
 
-fn execute_search_segments(
+fn parse_chunk_info(data: &[u8], version: u32) -> Result<Option<ChunkInfo>> {
+    if version < 5 {
+        return Ok(None);
+    }
+    if data.len() < CHUNK_FOOTER_SIZE {
+        return Ok(None);
+    }
+    let footer = data.len() - CHUNK_FOOTER_SIZE;
+    if &data[footer..footer + 8] != CHUNK_FOOTER_MAGIC {
+        return Ok(None);
+    }
+    let chunk_count = read_u64_at(data, footer + 8)? as usize;
+    let chunk_table_offset = read_u64_at(data, footer + 16)? as usize;
+    let chunk_posting_count = read_u64_at(data, footer + 24)? as usize;
+    let chunk_posting_table_offset = read_u64_at(data, footer + 32)? as usize;
+    let chunk_posting_data_offset = read_u64_at(data, footer + 40)? as usize;
+    let chunk_blob_offset = read_u64_at(data, footer + 48)? as usize;
+    Ok(Some(ChunkInfo {
+        chunk_count,
+        chunk_table_offset,
+        chunk_posting_count,
+        chunk_posting_table_offset,
+        chunk_posting_data_offset,
+        chunk_blob_offset,
+    }))
+}
+
+fn execute_search_rendered_segments(
     base: &MappedIndex,
     deltas: &[DeltaSegment],
     options: &Options,
     searched: &mut u64,
-) -> Result<Vec<FileResult>> {
+) -> Result<Vec<RenderedFileResult>> {
     let exclusions = segment_exclusions(base, deltas)?;
-    let mut results = execute_search(base, options, searched, &exclusions[0])?;
+    let mut results = execute_search_rendered(base, options, searched, &exclusions[0])?;
     for (idx, delta) in deltas.iter().enumerate() {
         let mut segment_results =
-            execute_search(&delta.index, options, searched, &exclusions[idx + 1])?;
+            execute_search_rendered(&delta.index, options, searched, &exclusions[idx + 1])?;
         results.append(&mut segment_results);
     }
     Ok(results)
 }
 
-fn execute_search(
+fn execute_search_rendered(
     index: &MappedIndex,
     options: &Options,
     searched: &mut u64,
     excluded_paths: &HashSet<String>,
-) -> Result<Vec<FileResult>> {
-    let grams = query_trigrams(options);
-    let candidates = intersect_postings(index, &grams)?;
-    let path_matcher = build_path_matcher(options)?;
-    let filtered: Vec<u32> = candidates
-        .into_iter()
-        .filter_map(|id| {
-            let file = index.file(id as usize).ok()?;
-            let path = bytes_to_string(file.path);
-            if excluded_paths.contains(&path) {
-                return None;
+) -> Result<Vec<RenderedFileResult>> {
+    if let Some(chunk_candidates) = candidate_chunks(index, options)? {
+        return execute_search_rendered_chunks(
+            index,
+            options,
+            searched,
+            excluded_paths,
+            chunk_candidates,
+        );
+    }
+
+    let candidates = if let Some(candidates) = word_fragment_candidate_files(index, options)? {
+        candidates
+    } else if let Some(prefixes) = boundary_word_prefixes(options) {
+        if let Some(candidates) = prefix_candidate_files(index, &prefixes)? {
+            candidates
+        } else {
+            let alternatives = query_trigram_alternatives(options);
+            candidate_files(index, &alternatives)?
+        }
+    } else if let Some(spec) = qualified_call_spec(&options.pattern) {
+        if let Some(candidates) = qualified_call_candidate_files(index, &spec)? {
+            candidates
+        } else {
+            let alternatives = query_trigram_alternatives(options);
+            candidate_files(index, &alternatives)?
+        }
+    } else {
+        let alternatives = query_trigram_alternatives(options);
+        candidate_files(index, &alternatives)?
+    };
+    let candidates = chunk_bloom_filter_candidates(index, options, candidates)?;
+    let filtered =
+        if excluded_paths.is_empty() && options.paths.is_empty() && options.globs.is_empty() {
+            candidates
+        } else {
+            let path_filter = PathFilter::new(options, &index.root)?;
+            if excluded_paths.is_empty() && path_filter.is_unrestricted() {
+                candidates
+            } else {
+                candidates
+                    .into_iter()
+                    .filter_map(|id| {
+                        let path = bytes_to_string(index.file_path(id as usize).ok()?);
+                        path_filter.allows(&path, excluded_paths).then_some(id)
+                    })
+                    .collect()
             }
-            path_allowed_with_matcher(options, &index.root, &path, path_matcher.as_ref())
-                .ok()
-                .filter(|ok| *ok)
-                .map(|_| id)
-        })
-        .collect();
+        };
     *searched += filtered.len() as u64;
 
     let matcher = QueryMatcher::new(options)?;
-    let mut results: Vec<(usize, FileResult)> = filtered
+    let show_path = should_show_path(options);
+    let mut results: Vec<(usize, RenderedFileResult)> = filtered
         .par_iter()
         .enumerate()
-        .filter_map(|(ordinal, id)| {
-            let file = index.file(*id as usize).ok()?;
-            let matches = matcher.search_file(file.content, options);
-            if matches.is_empty() {
-                return None;
-            }
-            Some((
-                ordinal,
-                FileResult {
-                    path: bytes_to_string(file.path),
-                    matches,
-                },
-            ))
+        .map_init(Vec::new, |scratch, (ordinal, id)| {
+            let (path_bytes, content) = index.file_for_search(*id as usize, scratch).ok()?;
+            let path = bytes_to_string(path_bytes);
+            let rendered = matcher
+                .search_file_rendered(content, &path, options, show_path)
+                .ok()??;
+            Some((ordinal, rendered))
         })
+        .filter_map(|result| result)
         .collect();
     results.sort_by_key(|(ordinal, _)| *ordinal);
+    Ok(results.into_iter().map(|(_, result)| result).collect())
+}
+
+fn chunk_bloom_filter_candidates(
+    index: &MappedIndex,
+    options: &Options,
+    candidates: Vec<u32>,
+) -> Result<Vec<u32>> {
+    if index.chunk_info.is_none() || candidates.len() < 2 {
+        return Ok(candidates);
+    }
+    let Some(alternatives) = safe_chunk_trigram_alternatives(options) else {
+        return Ok(candidates);
+    };
+    if alternatives.is_empty() || alternatives.iter().any(|grams| grams.is_empty()) {
+        return Ok(candidates);
+    }
+
+    let mut filtered = Vec::with_capacity(candidates.len());
+    for id in candidates {
+        if file_may_match_chunk_bloom(index, id, &alternatives)? {
+            filtered.push(id);
+        }
+    }
+    Ok(filtered)
+}
+
+fn file_may_match_chunk_bloom(
+    index: &MappedIndex,
+    file_id: u32,
+    alternatives: &[Vec<u32>],
+) -> Result<bool> {
+    let Some((start, end)) = index.chunk_range_for_file(file_id)? else {
+        return Ok(true);
+    };
+    for chunk_id in start..end {
+        let bloom = index.chunk_bloom(chunk_id)?;
+        for grams in alternatives {
+            if grams.iter().all(|&gram| chunk_bloom_maybe(bloom, gram)) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn execute_search_rendered_chunks(
+    index: &MappedIndex,
+    options: &Options,
+    searched: &mut u64,
+    excluded_paths: &HashSet<String>,
+    chunk_candidates: Vec<u32>,
+) -> Result<Vec<RenderedFileResult>> {
+    let mut by_file: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for chunk_id in chunk_candidates {
+        let rec = index.chunk_record(chunk_id as usize)?;
+        by_file
+            .entry(rec.file_id)
+            .or_default()
+            .push(chunk_id as usize);
+    }
+
+    let filtered: Vec<(u32, Vec<usize>)> =
+        if excluded_paths.is_empty() && options.paths.is_empty() && options.globs.is_empty() {
+            by_file.into_iter().collect()
+        } else {
+            let path_filter = PathFilter::new(options, &index.root)?;
+            if excluded_paths.is_empty() && path_filter.is_unrestricted() {
+                by_file.into_iter().collect()
+            } else {
+                by_file
+                    .into_iter()
+                    .filter_map(|(file_id, chunks)| {
+                        let path = bytes_to_string(index.file_path(file_id as usize).ok()?);
+                        path_filter
+                            .allows(&path, excluded_paths)
+                            .then_some((file_id, chunks))
+                    })
+                    .collect()
+            }
+        };
+    *searched += filtered.len() as u64;
+
+    let matcher = QueryMatcher::new(options)?;
+    let show_path = should_show_path(options);
+    let mut results: Vec<(u32, RenderedFileResult)> = filtered
+        .par_iter()
+        .map_init(Vec::new, |scratch, (file_id, chunks)| {
+            let (path_bytes, content) = index.file_for_search(*file_id as usize, scratch).ok()?;
+            let path = bytes_to_string(path_bytes);
+            let rendered = matcher
+                .search_file_rendered(content, &path, options, show_path)
+                .ok()??;
+            let _ = chunks;
+            Some((*file_id, rendered))
+        })
+        .filter_map(|result| result)
+        .collect();
+    results.sort_by_key(|(file_id, _)| *file_id);
     Ok(results.into_iter().map(|(_, result)| result).collect())
 }
 
@@ -2859,8 +3836,26 @@ enum QueryMatcher {
         whole_word: bool,
         ignore_case: bool,
     },
+    WordPrefix {
+        ac: AhoCorasick,
+        boundary_start: bool,
+        boundary_end: bool,
+    },
+    LiteralSet {
+        ac: AhoCorasick,
+    },
+    QualifiedCall {
+        spec: QualifiedCallSpec,
+        finder: memmem::Finder<'static>,
+    },
     OrderedLiterals {
         literals: Vec<Vec<u8>>,
+        finder: Option<memmem::Finder<'static>>,
+        ignore_case: bool,
+    },
+    OrderedWordSpanLiterals {
+        literals: Vec<Vec<u8>>,
+        finder: Option<memmem::Finder<'static>>,
         ignore_case: bool,
     },
     Regex(Regex),
@@ -2889,9 +3884,34 @@ impl QueryMatcher {
                 ignore_case: options.ignore_case,
             });
         }
+        if let Some(word_prefix) = word_prefix_regex(options)? {
+            return Ok(word_prefix);
+        }
+        if let Some(literals) = exact_parenthesized_literal_alternatives(&options.pattern) {
+            let ac = AhoCorasickBuilder::new()
+                .ascii_case_insensitive(options.ignore_case)
+                .match_kind(MatchKind::LeftmostFirst)
+                .build(literals)?;
+            return Ok(Self::LiteralSet { ac });
+        }
+        if let Some(qualified_call) = qualified_call_regex(options) {
+            return Ok(qualified_call);
+        }
         if let Some(literals) = ordered_dotstar_literals(options) {
+            let finder = (!options.ignore_case && !literals.is_empty())
+                .then(|| memmem::Finder::new(&literals[0]).into_owned());
             return Ok(Self::OrderedLiterals {
                 literals,
+                finder,
+                ignore_case: options.ignore_case,
+            });
+        }
+        if let Some(literals) = ordered_wordspan_literals(options) {
+            let finder = (!options.ignore_case && !literals.is_empty())
+                .then(|| memmem::Finder::new(&literals[0]).into_owned());
+            return Ok(Self::OrderedWordSpanLiterals {
+                literals,
+                finder,
                 ignore_case: options.ignore_case,
             });
         }
@@ -2907,7 +3927,116 @@ impl QueryMatcher {
         Ok(Self::Regex(regex))
     }
 
+    fn search_file_rendered(
+        &self,
+        content: &[u8],
+        path: &str,
+        options: &Options,
+        show_path: bool,
+    ) -> Result<Option<RenderedFileResult>> {
+        if let QueryMatcher::Fixed {
+            needle,
+            finder,
+            ac,
+            whole_word,
+            ignore_case,
+        } = self
+        {
+            return search_fixed_rendered(
+                content,
+                path,
+                needle,
+                finder,
+                ac.as_ref(),
+                *whole_word,
+                *ignore_case,
+                options,
+                show_path,
+            );
+        }
+        if let QueryMatcher::WordPrefix {
+            ac,
+            boundary_start,
+            boundary_end,
+        } = self
+        {
+            return search_word_prefix_rendered(
+                content,
+                path,
+                ac,
+                *boundary_start,
+                *boundary_end,
+                options,
+                show_path,
+            );
+        }
+        if let QueryMatcher::LiteralSet { ac } = self {
+            return search_literal_set_rendered(content, path, ac, options, show_path);
+        }
+        if let QueryMatcher::QualifiedCall { spec, finder } = self {
+            return search_qualified_call_rendered(content, path, spec, finder, options, show_path);
+        }
+        if let QueryMatcher::OrderedLiterals {
+            literals,
+            finder: Some(finder),
+            ignore_case: false,
+        } = self
+        {
+            return search_ordered_literals_rendered(
+                content, path, literals, finder, options, show_path,
+            );
+        }
+        if let QueryMatcher::OrderedWordSpanLiterals {
+            literals,
+            finder: Some(finder),
+            ignore_case: false,
+        } = self
+        {
+            return search_ordered_wordspan_rendered(
+                content, path, literals, finder, options, show_path,
+            );
+        }
+
+        let matches = self.search_file(content, options);
+        if matches.is_empty() {
+            return Ok(None);
+        }
+        let output = render_file_result(path, &matches, options, show_path)?;
+        Ok(Some(RenderedFileResult {
+            output,
+            match_count: matches.len(),
+        }))
+    }
+
     fn search_file(&self, content: &[u8], options: &Options) -> Vec<MatchLine> {
+        if let QueryMatcher::Fixed {
+            needle,
+            finder,
+            whole_word: false,
+            ignore_case: false,
+            ..
+        } = self
+        {
+            return search_fixed_content(content, finder, needle.len(), options);
+        }
+        if let QueryMatcher::WordPrefix {
+            ac,
+            boundary_start,
+            boundary_end,
+        } = self
+        {
+            return search_word_prefix_content(
+                content,
+                ac,
+                *boundary_start,
+                *boundary_end,
+                options,
+            );
+        }
+        if let QueryMatcher::QualifiedCall { spec, finder } = self {
+            return search_qualified_call_content(content, spec, finder, options);
+        }
+
         let mut matches = Vec::new();
         for_each_line(content, |line_no, line| {
             match self {
@@ -2949,8 +4078,12 @@ impl QueryMatcher {
                         });
                     }
                 }
+                QueryMatcher::WordPrefix { .. } => unreachable!("handled before line scan"),
+                QueryMatcher::LiteralSet { .. } => unreachable!("handled before line scan"),
+                QueryMatcher::QualifiedCall { .. } => unreachable!("handled before line scan"),
                 QueryMatcher::OrderedLiterals {
                     literals,
+                    finder: _,
                     ignore_case,
                 } => {
                     let lowered;
@@ -2987,11 +4120,843 @@ impl QueryMatcher {
                         });
                     }
                 }
+                QueryMatcher::OrderedWordSpanLiterals {
+                    literals,
+                    finder: _,
+                    ignore_case,
+                } => {
+                    let lowered;
+                    let haystack = if *ignore_case {
+                        lowered = lower_bytes(line);
+                        lowered.as_slice()
+                    } else {
+                        line
+                    };
+                    if let Some((start, end)) = find_ordered_wordspan_match(haystack, literals) {
+                        matches.push(MatchLine {
+                            line_no,
+                            column: start + 1,
+                            line: line.to_vec(),
+                            matched: line[start..end.min(line.len())].to_vec(),
+                        });
+                    }
+                }
             }
             options.max_count.is_none_or(|max| matches.len() < max)
         });
         matches
     }
+}
+
+fn word_prefix_regex(options: &Options) -> Result<Option<QueryMatcher>> {
+    if options.fixed || options.whole_word || options.pattern.is_empty() {
+        return Ok(None);
+    }
+    let mut pattern = options.pattern.as_str();
+    let boundary_start = pattern.strip_prefix(r"\b").is_some();
+    if boundary_start {
+        pattern = &pattern[2..];
+    }
+    let boundary_end = pattern.strip_suffix(r"\b").is_some();
+    if boundary_end {
+        pattern = &pattern[..pattern.len() - 2];
+    }
+    let Some(prefix_part) = pattern.strip_suffix("[A-Za-z0-9_]*") else {
+        return Ok(None);
+    };
+    let prefixes = if prefix_part.starts_with('(') && prefix_part.ends_with(')') {
+        let body = &prefix_part[1..prefix_part.len() - 1];
+        if body.is_empty() || !body.contains('|') {
+            return Ok(None);
+        }
+        let mut out = Vec::new();
+        for part in body.split('|') {
+            if !is_ascii_word_literal(part) {
+                return Ok(None);
+            }
+            out.push(part.as_bytes().to_vec());
+        }
+        out
+    } else if is_ascii_word_literal(prefix_part) {
+        vec![prefix_part.as_bytes().to_vec()]
+    } else {
+        return Ok(None);
+    };
+    let ac = AhoCorasickBuilder::new()
+        .ascii_case_insensitive(options.ignore_case)
+        .match_kind(MatchKind::LeftmostFirst)
+        .build(prefixes)?;
+    Ok(Some(QueryMatcher::WordPrefix {
+        ac,
+        boundary_start,
+        boundary_end,
+    }))
+}
+
+fn boundary_word_prefixes(options: &Options) -> Option<Vec<Vec<u8>>> {
+    let mut pattern = options.pattern.as_str();
+    pattern = pattern.strip_prefix(r"\b")?;
+    pattern = pattern.strip_suffix(r"\b")?;
+    let prefix_part = pattern.strip_suffix("[A-Za-z0-9_]*")?;
+    let prefixes = if prefix_part.starts_with('(') && prefix_part.ends_with(')') {
+        let body = &prefix_part[1..prefix_part.len() - 1];
+        if body.is_empty() || !body.contains('|') {
+            return None;
+        }
+        let mut out = Vec::new();
+        for part in body.split('|') {
+            if !is_ascii_word_literal(part) || part.len() < PREFIX_MIN_LEN {
+                return None;
+            }
+            out.push(lower_bytes(part.as_bytes()));
+        }
+        out
+    } else if is_ascii_word_literal(prefix_part) && prefix_part.len() >= PREFIX_MIN_LEN {
+        vec![lower_bytes(prefix_part.as_bytes())]
+    } else {
+        return None;
+    };
+    Some(prefixes)
+}
+
+fn qualified_call_regex(options: &Options) -> Option<QueryMatcher> {
+    if options.ignore_case || options.fixed || options.whole_word {
+        return None;
+    }
+    let spec = qualified_call_spec(&options.pattern)?;
+    Some(QueryMatcher::QualifiedCall {
+        spec,
+        finder: memmem::Finder::new("::").into_owned(),
+    })
+}
+
+fn qualified_call_spec(pattern: &str) -> Option<QualifiedCallSpec> {
+    let (class_part, method_part) = pattern.split_once("::")?;
+    if method_part != r"[A-Za-z0-9_]+\(" && method_part != r"[A-Za-z_][A-Za-z0-9_]*\(" {
+        return None;
+    }
+    let (class_prefix, class_min_extra) = identifier_pattern_prefix(class_part)?;
+    Some(QualifiedCallSpec {
+        class_prefix,
+        class_min_extra,
+    })
+}
+
+fn identifier_pattern_prefix(pattern: &str) -> Option<(Option<Vec<u8>>, usize)> {
+    for suffix in [
+        "[A-Za-z0-9_]+",
+        "[A-Za-z_][A-Za-z0-9_]*",
+        "[A-Za-z][A-Za-z0-9_]*",
+        "[A-Z][A-Za-z0-9_]*",
+        "[a-z][A-Za-z0-9_]*",
+    ] {
+        if pattern == suffix {
+            return Some((None, 0));
+        }
+        if let Some(prefix) = pattern.strip_suffix(suffix) {
+            if is_ascii_word_literal(prefix) {
+                return Some((Some(prefix.as_bytes().to_vec()), 1));
+            }
+        }
+    }
+    None
+}
+
+fn is_ascii_word_literal(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+struct LineCursor<'a> {
+    content: &'a [u8],
+    line_no: usize,
+    line_start: usize,
+    line_end: usize,
+}
+
+impl<'a> LineCursor<'a> {
+    fn new(content: &'a [u8]) -> Self {
+        Self {
+            content,
+            line_no: 1,
+            line_start: 0,
+            line_end: next_line_end(content, 0),
+        }
+    }
+
+    fn advance_to(&mut self, pos: usize) {
+        while self.line_end < self.content.len() && pos > self.line_end {
+            self.line_no += 1;
+            self.line_start = self.line_end + 1;
+            self.line_end = next_line_end(self.content, self.line_start);
+        }
+    }
+
+    fn line(&self) -> &'a [u8] {
+        let mut line = &self.content[self.line_start..self.line_end];
+        if line.ends_with(b"\r") {
+            line = &line[..line.len() - 1];
+        }
+        line
+    }
+}
+
+fn next_line_end(content: &[u8], start: usize) -> usize {
+    memchr(b'\n', &content[start..])
+        .map(|pos| start + pos)
+        .unwrap_or(content.len())
+}
+
+fn finish_rendered_match_output(
+    mut output: Vec<u8>,
+    match_count: usize,
+    path: &str,
+    options: &Options,
+    show_path: bool,
+) -> Result<Option<RenderedFileResult>> {
+    if match_count == 0 {
+        return Ok(None);
+    }
+    if options.count {
+        if show_path {
+            write!(output, "{path}:")?;
+        }
+        writeln!(output, "{match_count}")?;
+    }
+    Ok(Some(RenderedFileResult {
+        output,
+        match_count,
+    }))
+}
+
+fn search_fixed_content(
+    content: &[u8],
+    finder: &memmem::Finder<'_>,
+    needle_len: usize,
+    options: &Options,
+) -> Vec<MatchLine> {
+    if needle_len == 0 {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    let mut last_line_start = usize::MAX;
+    let mut line_scan_pos = 0usize;
+    let mut line_no = 1usize;
+    for start in finder.find_iter(content) {
+        let line_start = memrchr(b'\n', &content[..start]).map_or(0, |pos| pos + 1);
+        if line_start == last_line_start {
+            continue;
+        }
+        while line_scan_pos < line_start {
+            if let Some(pos) = memchr(b'\n', &content[line_scan_pos..line_start]) {
+                line_no += 1;
+                line_scan_pos += pos + 1;
+            } else {
+                line_scan_pos = line_start;
+            }
+        }
+        let line_end = memchr(b'\n', &content[start..])
+            .map(|pos| start + pos)
+            .unwrap_or(content.len());
+        let mut line = &content[line_start..line_end];
+        if line.ends_with(b"\r") {
+            line = &line[..line.len() - 1];
+        }
+        let end = (start + needle_len).min(content.len());
+        matches.push(MatchLine {
+            line_no,
+            column: start.saturating_sub(line_start) + 1,
+            line: line.to_vec(),
+            matched: content[start..end].to_vec(),
+        });
+        last_line_start = line_start;
+        if options.max_count.is_some_and(|max| matches.len() >= max) {
+            break;
+        }
+    }
+    matches
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_fixed_rendered(
+    content: &[u8],
+    path: &str,
+    needle: &[u8],
+    finder: &memmem::Finder<'_>,
+    ac: Option<&AhoCorasick>,
+    whole_word: bool,
+    ignore_case: bool,
+    options: &Options,
+    show_path: bool,
+) -> Result<Option<RenderedFileResult>> {
+    if needle.is_empty() {
+        return Ok(None);
+    }
+    let mut output = Vec::new();
+    let mut match_count = 0usize;
+    let mut path_written = false;
+    let mut last_line_start = usize::MAX;
+    let mut cursor = LineCursor::new(content);
+
+    let mut handle_match = |start: usize, end: usize| -> Result<bool> {
+        cursor.advance_to(start);
+        if cursor.line_start == last_line_start {
+            return Ok(true);
+        }
+        if whole_word && !word_boundary(cursor.line(), start - cursor.line_start, end - start) {
+            return Ok(true);
+        }
+        match_count += 1;
+        if !options.count && !options.files_with_matches {
+            render_match_to(
+                &mut output,
+                path,
+                cursor.line_no,
+                start.saturating_sub(cursor.line_start) + 1,
+                cursor.line(),
+                &content[start..end],
+                options,
+                show_path,
+            )?;
+        } else if options.files_with_matches && !path_written {
+            writeln!(output, "{path}")?;
+            path_written = true;
+        }
+        last_line_start = cursor.line_start;
+        Ok(options.max_count.is_none_or(|max| match_count < max))
+    };
+
+    if ignore_case {
+        let Some(ac) = ac else {
+            return Ok(None);
+        };
+        for found in ac.find_iter(content) {
+            if !handle_match(found.start(), found.end())? {
+                break;
+            }
+        }
+    } else {
+        for start in finder.find_iter(content) {
+            if !handle_match(start, start + needle.len())? {
+                break;
+            }
+        }
+    }
+
+    finish_rendered_match_output(output, match_count, path, options, show_path)
+}
+
+fn search_word_prefix_content(
+    content: &[u8],
+    ac: &AhoCorasick,
+    boundary_start: bool,
+    boundary_end: bool,
+    options: &Options,
+) -> Vec<MatchLine> {
+    let mut matches = Vec::new();
+    let mut last_line_start = usize::MAX;
+    let mut line_scan_pos = 0usize;
+    let mut line_no = 1usize;
+    for found in ac.find_iter(content) {
+        let start = found.start();
+        if boundary_start && start > 0 && is_word_byte(content[start - 1]) {
+            continue;
+        }
+        let mut end = found.end();
+        while end < content.len() && is_word_byte(content[end]) {
+            end += 1;
+        }
+        if boundary_end && end < content.len() && is_word_byte(content[end]) {
+            continue;
+        }
+        let line_start = memrchr(b'\n', &content[..start]).map_or(0, |pos| pos + 1);
+        if line_start == last_line_start {
+            continue;
+        }
+        while line_scan_pos < line_start {
+            if let Some(pos) = memchr(b'\n', &content[line_scan_pos..line_start]) {
+                line_no += 1;
+                line_scan_pos += pos + 1;
+            } else {
+                line_scan_pos = line_start;
+            }
+        }
+        let line_end = memchr(b'\n', &content[start..])
+            .map(|pos| start + pos)
+            .unwrap_or(content.len());
+        let mut line = &content[line_start..line_end];
+        if line.ends_with(b"\r") {
+            line = &line[..line.len() - 1];
+        }
+        matches.push(MatchLine {
+            line_no,
+            column: start.saturating_sub(line_start) + 1,
+            line: line.to_vec(),
+            matched: content[start..end].to_vec(),
+        });
+        last_line_start = line_start;
+        if options.max_count.is_some_and(|max| matches.len() >= max) {
+            break;
+        }
+    }
+    matches
+}
+
+fn search_word_prefix_rendered(
+    content: &[u8],
+    path: &str,
+    ac: &AhoCorasick,
+    boundary_start: bool,
+    boundary_end: bool,
+    options: &Options,
+    show_path: bool,
+) -> Result<Option<RenderedFileResult>> {
+    let mut output = Vec::new();
+    let mut match_count = 0usize;
+    let mut path_written = false;
+    let mut last_line_start = usize::MAX;
+    let mut cursor = LineCursor::new(content);
+
+    for found in ac.find_iter(content) {
+        let start = found.start();
+        if boundary_start && start > 0 && is_word_byte(content[start - 1]) {
+            continue;
+        }
+        let mut end = found.end();
+        while end < content.len() && is_word_byte(content[end]) {
+            end += 1;
+        }
+        if boundary_end && end < content.len() && is_word_byte(content[end]) {
+            continue;
+        }
+        cursor.advance_to(start);
+        if cursor.line_start == last_line_start {
+            continue;
+        }
+        match_count += 1;
+        if !options.count && !options.files_with_matches {
+            render_match_to(
+                &mut output,
+                path,
+                cursor.line_no,
+                start.saturating_sub(cursor.line_start) + 1,
+                cursor.line(),
+                &content[start..end],
+                options,
+                show_path,
+            )?;
+        } else if options.files_with_matches && !path_written {
+            writeln!(output, "{path}")?;
+            path_written = true;
+        }
+        last_line_start = cursor.line_start;
+        if options.max_count.is_some_and(|max| match_count >= max) {
+            break;
+        }
+    }
+
+    finish_rendered_match_output(output, match_count, path, options, show_path)
+}
+
+fn search_literal_set_rendered(
+    content: &[u8],
+    path: &str,
+    ac: &AhoCorasick,
+    options: &Options,
+    show_path: bool,
+) -> Result<Option<RenderedFileResult>> {
+    let mut output = Vec::new();
+    let mut match_count = 0usize;
+    let mut path_written = false;
+    let mut last_line_start = usize::MAX;
+    let mut cursor = LineCursor::new(content);
+
+    for found in ac.find_iter(content) {
+        let start = found.start();
+        cursor.advance_to(start);
+        if cursor.line_start == last_line_start {
+            continue;
+        }
+        match_count += 1;
+        if !options.count && !options.files_with_matches {
+            render_match_to(
+                &mut output,
+                path,
+                cursor.line_no,
+                start.saturating_sub(cursor.line_start) + 1,
+                cursor.line(),
+                &content[start..found.end()],
+                options,
+                show_path,
+            )?;
+        } else if options.files_with_matches && !path_written {
+            writeln!(output, "{path}")?;
+            path_written = true;
+        }
+        last_line_start = cursor.line_start;
+        if options.max_count.is_some_and(|max| match_count >= max) {
+            break;
+        }
+    }
+
+    finish_rendered_match_output(output, match_count, path, options, show_path)
+}
+
+fn search_ordered_literals_rendered(
+    content: &[u8],
+    path: &str,
+    literals: &[Vec<u8>],
+    finder: &memmem::Finder<'_>,
+    options: &Options,
+    show_path: bool,
+) -> Result<Option<RenderedFileResult>> {
+    if literals.is_empty() {
+        return Ok(None);
+    }
+    let mut output = Vec::new();
+    let mut match_count = 0usize;
+    let mut path_written = false;
+    let mut last_line_start = usize::MAX;
+    let mut cursor = LineCursor::new(content);
+
+    for start in finder.find_iter(content) {
+        cursor.advance_to(start);
+        if cursor.line_start == last_line_start {
+            continue;
+        }
+        let line = cursor.line();
+        let first_start = start.saturating_sub(cursor.line_start);
+        if first_start >= line.len() {
+            continue;
+        }
+        let mut pos = first_start + literals[0].len();
+        let mut last_end = pos;
+        let mut ok = true;
+        for literal in literals.iter().skip(1) {
+            if let Some(found) = memmem::find(&line[pos..], literal) {
+                let literal_start = pos + found;
+                last_end = literal_start + literal.len();
+                pos = last_end;
+            } else {
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            continue;
+        }
+
+        match_count += 1;
+        if !options.count && !options.files_with_matches {
+            render_match_to(
+                &mut output,
+                path,
+                cursor.line_no,
+                first_start + 1,
+                line,
+                &line[first_start..last_end.min(line.len())],
+                options,
+                show_path,
+            )?;
+        } else if options.files_with_matches && !path_written {
+            writeln!(output, "{path}")?;
+            path_written = true;
+        }
+        last_line_start = cursor.line_start;
+        if options.max_count.is_some_and(|max| match_count >= max) {
+            break;
+        }
+    }
+
+    finish_rendered_match_output(output, match_count, path, options, show_path)
+}
+
+fn search_ordered_wordspan_rendered(
+    content: &[u8],
+    path: &str,
+    literals: &[Vec<u8>],
+    finder: &memmem::Finder<'_>,
+    options: &Options,
+    show_path: bool,
+) -> Result<Option<RenderedFileResult>> {
+    if literals.is_empty() {
+        return Ok(None);
+    }
+    let mut output = Vec::new();
+    let mut match_count = 0usize;
+    let mut path_written = false;
+    let mut last_line_start = usize::MAX;
+    let mut cursor = LineCursor::new(content);
+
+    for start in finder.find_iter(content) {
+        cursor.advance_to(start);
+        if cursor.line_start == last_line_start {
+            continue;
+        }
+        let line = cursor.line();
+        let first_start = start.saturating_sub(cursor.line_start);
+        if let Some((match_start, match_end)) =
+            find_ordered_wordspan_match_at(line, first_start, literals)
+        {
+            match_count += 1;
+            if !options.count && !options.files_with_matches {
+                render_match_to(
+                    &mut output,
+                    path,
+                    cursor.line_no,
+                    match_start + 1,
+                    line,
+                    &line[match_start..match_end.min(line.len())],
+                    options,
+                    show_path,
+                )?;
+            } else if options.files_with_matches && !path_written {
+                writeln!(output, "{path}")?;
+                path_written = true;
+            }
+            last_line_start = cursor.line_start;
+            if options.max_count.is_some_and(|max| match_count >= max) {
+                break;
+            }
+        }
+    }
+
+    finish_rendered_match_output(output, match_count, path, options, show_path)
+}
+
+fn find_ordered_wordspan_match(content: &[u8], literals: &[Vec<u8>]) -> Option<(usize, usize)> {
+    let first = literals.first()?;
+    let finder = memmem::Finder::new(first);
+    for start in finder.find_iter(content) {
+        if let Some(found) = find_ordered_wordspan_match_at(content, start, literals) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn find_ordered_wordspan_match_at(
+    line: &[u8],
+    start: usize,
+    literals: &[Vec<u8>],
+) -> Option<(usize, usize)> {
+    let first = literals.first()?;
+    if start + first.len() > line.len() || &line[start..start + first.len()] != first.as_slice() {
+        return None;
+    }
+    let mut pos = start + first.len();
+    let mut last_end = pos;
+    for literal in literals.iter().skip(1) {
+        let span_end = advance_word(line, pos);
+        let literal_start = pos + memmem::find(&line[pos..span_end], literal)?;
+        last_end = literal_start + literal.len();
+        pos = last_end;
+    }
+    Some((start, last_end))
+}
+
+fn search_qualified_call_content(
+    content: &[u8],
+    spec: &QualifiedCallSpec,
+    finder: &memmem::Finder<'_>,
+    options: &Options,
+) -> Vec<MatchLine> {
+    let mut matches = Vec::new();
+    let mut last_line_start = usize::MAX;
+    let mut line_scan_pos = 0usize;
+    let mut line_no = 1usize;
+    for found in finder.find_iter(content) {
+        if found == 0 || found + 2 >= content.len() {
+            continue;
+        }
+        let token_start = rewind_word(content, found);
+        let Some(class_start) = qualified_call_match_start(content, token_start, found, spec)
+        else {
+            continue;
+        };
+        let method_start = found + 2;
+        if method_start >= content.len() || !is_word_byte(content[method_start]) {
+            continue;
+        }
+        let method_end = advance_word(content, method_start);
+        if method_end >= content.len() || content[method_end] != b'(' {
+            continue;
+        }
+        let line_start = memrchr(b'\n', &content[..class_start]).map_or(0, |pos| pos + 1);
+        if line_start == last_line_start {
+            continue;
+        }
+        while line_scan_pos < line_start {
+            if let Some(pos) = memchr(b'\n', &content[line_scan_pos..line_start]) {
+                line_no += 1;
+                line_scan_pos += pos + 1;
+            } else {
+                line_scan_pos = line_start;
+            }
+        }
+        let line_end = memchr(b'\n', &content[class_start..])
+            .map(|pos| class_start + pos)
+            .unwrap_or(content.len());
+        let mut line = &content[line_start..line_end];
+        if line.ends_with(b"\r") {
+            line = &line[..line.len() - 1];
+        }
+        matches.push(MatchLine {
+            line_no,
+            column: class_start.saturating_sub(line_start) + 1,
+            line: line.to_vec(),
+            matched: content[class_start..=method_end].to_vec(),
+        });
+        last_line_start = line_start;
+        if options.max_count.is_some_and(|max| matches.len() >= max) {
+            break;
+        }
+    }
+    matches
+}
+
+fn search_qualified_call_rendered(
+    content: &[u8],
+    path: &str,
+    spec: &QualifiedCallSpec,
+    finder: &memmem::Finder<'_>,
+    options: &Options,
+    show_path: bool,
+) -> Result<Option<RenderedFileResult>> {
+    let mut output = Vec::new();
+    let mut match_count = 0usize;
+    let mut path_written = false;
+    let mut last_line_start = usize::MAX;
+    let mut line_scan_pos = 0usize;
+    let mut line_no = 1usize;
+    for found in finder.find_iter(content) {
+        if found == 0 || found + 2 >= content.len() {
+            continue;
+        }
+        let token_start = rewind_word(content, found);
+        let Some(class_start) = qualified_call_match_start(content, token_start, found, spec)
+        else {
+            continue;
+        };
+        let method_start = found + 2;
+        if method_start >= content.len() || !is_word_byte(content[method_start]) {
+            continue;
+        }
+        let method_end = advance_word(content, method_start);
+        if method_end >= content.len() || content[method_end] != b'(' {
+            continue;
+        }
+        let line_start = memrchr(b'\n', &content[..class_start]).map_or(0, |pos| pos + 1);
+        if line_start == last_line_start {
+            continue;
+        }
+        while line_scan_pos < line_start {
+            if let Some(pos) = memchr(b'\n', &content[line_scan_pos..line_start]) {
+                line_no += 1;
+                line_scan_pos += pos + 1;
+            } else {
+                line_scan_pos = line_start;
+            }
+        }
+        match_count += 1;
+        if !options.count && !options.files_with_matches {
+            let line_end = memchr(b'\n', &content[class_start..])
+                .map(|pos| class_start + pos)
+                .unwrap_or(content.len());
+            let mut line = &content[line_start..line_end];
+            if line.ends_with(b"\r") {
+                line = &line[..line.len() - 1];
+            }
+            render_match_to(
+                &mut output,
+                path,
+                line_no,
+                class_start.saturating_sub(line_start) + 1,
+                line,
+                &content[class_start..=method_end],
+                options,
+                show_path,
+            )?;
+        } else if options.files_with_matches && !path_written {
+            writeln!(output, "{path}")?;
+            path_written = true;
+        }
+        last_line_start = line_start;
+        if options.max_count.is_some_and(|max| match_count >= max) {
+            break;
+        }
+    }
+
+    if match_count == 0 {
+        return Ok(None);
+    }
+    if options.count {
+        if show_path {
+            write!(output, "{path}:")?;
+        }
+        writeln!(output, "{match_count}")?;
+    }
+    Ok(Some(RenderedFileResult {
+        output,
+        match_count,
+    }))
+}
+
+fn qualified_call_match_start(
+    content: &[u8],
+    token_start: usize,
+    scope_start: usize,
+    spec: &QualifiedCallSpec,
+) -> Option<usize> {
+    if token_start >= scope_start {
+        return None;
+    }
+    let class = &content[token_start..scope_start];
+    let Some(prefix) = &spec.class_prefix else {
+        return Some(token_start);
+    };
+    if prefix.is_empty() || prefix.len() + spec.class_min_extra > class.len() {
+        return None;
+    }
+    if prefix.len() == 1 {
+        for (start, _) in class
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == prefix[0])
+        {
+            if start + prefix.len() + spec.class_min_extra <= class.len() {
+                return Some(token_start + start);
+            }
+        }
+        return None;
+    }
+    let finder = memmem::Finder::new(prefix);
+    for start in finder.find_iter(class) {
+        if start + prefix.len() + spec.class_min_extra <= class.len() {
+            return Some(token_start + start);
+        }
+    }
+    None
+}
+
+fn rewind_word(content: &[u8], mut pos: usize) -> usize {
+    while pos > 0 && is_word_byte(content[pos - 1]) {
+        pos -= 1;
+    }
+    pos
+}
+
+fn advance_word(content: &[u8], mut pos: usize) -> usize {
+    while pos < content.len() && is_word_byte(content[pos]) {
+        pos += 1;
+    }
+    pos
+}
+
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 fn ordered_dotstar_literals(options: &Options) -> Option<Vec<Vec<u8>>> {
@@ -3052,19 +5017,134 @@ fn ordered_dotstar_literals(options: &Options) -> Option<Vec<Vec<u8>>> {
     (saw_dotstar && !literals.is_empty()).then_some(literals)
 }
 
-fn query_trigrams(options: &Options) -> Vec<u32> {
-    let literals = if options.fixed || regex_meta_free(&options.pattern) {
-        vec![options.pattern.clone()]
-    } else {
-        required_regex_literals(&options.pattern)
-    };
+fn ordered_wordspan_literals(options: &Options) -> Option<Vec<Vec<u8>>> {
+    if options.fixed || options.whole_word || options.pattern.is_empty() {
+        return None;
+    }
+    let separator = "[A-Za-z0-9_]*";
+    if !options.pattern.contains(separator) {
+        return None;
+    }
+    let mut literals = Vec::new();
+    for part in options.pattern.split(separator) {
+        if part.is_empty() || !is_ascii_word_literal(part) {
+            return None;
+        }
+        literals.push(if options.ignore_case {
+            lower_bytes(part.as_bytes())
+        } else {
+            part.as_bytes().to_vec()
+        });
+    }
+    (literals.len() >= 2).then_some(literals)
+}
+
+fn exact_parenthesized_literal_alternatives(pattern: &str) -> Option<Vec<&[u8]>> {
+    let body = pattern
+        .strip_prefix("(?:")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .or_else(|| {
+            pattern
+                .strip_prefix('(')
+                .and_then(|rest| rest.strip_suffix(')'))
+        })?;
+    if body.is_empty() || !body.contains('|') {
+        return None;
+    }
+    let mut out = Vec::new();
+    for part in body.split('|') {
+        if part.len() < 3 || !part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return None;
+        }
+        out.push(part.as_bytes());
+    }
+    Some(out)
+}
+
+fn query_trigram_alternatives(options: &Options) -> Vec<Vec<u32>> {
+    if options.fixed || regex_meta_free(&options.pattern) {
+        return vec![literal_trigrams(options.pattern.as_bytes())];
+    }
+    if let Some(literals) = simple_parenthesized_literal_alternatives(&options.pattern) {
+        return literals
+            .into_iter()
+            .map(|literal| literal_trigrams(literal.as_bytes()))
+            .filter(|grams| !grams.is_empty())
+            .collect();
+    }
+    if let Some(alternatives) = double_colon_word_trigram_alternatives(&options.pattern) {
+        return alternatives;
+    }
+    let literals = required_regex_literals(&options.pattern);
     let mut grams = Vec::new();
     for literal in literals {
         grams.extend(literal_trigrams(literal.as_bytes()));
     }
     grams.sort_unstable();
     grams.dedup();
-    grams
+    vec![grams]
+}
+
+fn simple_parenthesized_literal_alternatives(pattern: &str) -> Option<Vec<String>> {
+    let bytes = pattern.as_bytes();
+    let mut escaped = false;
+    let mut in_class = false;
+    let mut start = None;
+    let mut end = None;
+    for (idx, &byte) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+            continue;
+        }
+        if in_class {
+            if byte == b']' {
+                in_class = false;
+            }
+            continue;
+        }
+        match byte {
+            b'[' => in_class = true,
+            b'(' if start.is_none() => start = Some(idx + 1),
+            b')' if start.is_some() => {
+                end = Some(idx);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let start = start?;
+    let end = end?;
+    if matches!(bytes.get(end + 1), Some(b'?' | b'*')) {
+        return None;
+    }
+    let body = &pattern[start..end];
+    if !body.contains('|') {
+        return None;
+    }
+    let mut out = Vec::new();
+    for part in body.split('|') {
+        if part.len() < 3 || !part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            return None;
+        }
+        out.push(part.to_string());
+    }
+    Some(out)
+}
+
+fn double_colon_word_trigram_alternatives(pattern: &str) -> Option<Vec<Vec<u32>>> {
+    if !pattern.contains("[A-Za-z0-9_]+::") && !pattern.contains("[A-Za-z_][A-Za-z0-9_]*::") {
+        return None;
+    }
+    Some(
+        ascii_word_bytes()
+            .into_iter()
+            .map(|byte| vec![trigram(byte, b':', b':')])
+            .collect(),
+    )
 }
 
 fn required_regex_literals(pattern: &str) -> Vec<String> {
@@ -3160,8 +5240,9 @@ fn intersect_postings(index: &MappedIndex, grams: &[u32]) -> Result<Vec<u32>> {
         postings.push(posting.data);
     }
     postings.sort_by_key(|p| p.len());
-    let mut result = postings[0].to_vec();
+    let mut result = postings[0].as_ref().to_vec();
     for posting in postings.into_iter().skip(1) {
+        let posting = posting.as_ref();
         let mut out = Vec::with_capacity(result.len().min(posting.len()));
         let mut i = 0;
         let mut j = 0;
@@ -3184,59 +5265,387 @@ fn intersect_postings(index: &MappedIndex, grams: &[u32]) -> Result<Vec<u32>> {
     Ok(result)
 }
 
-fn print_results(results: &[FileResult], options: &Options) {
-    let show_path = should_show_path(options);
-    for result in results {
-        if options.files_with_matches {
-            println!("{}", result.path);
-            continue;
-        }
-        if options.count {
-            if show_path {
-                print!("{}:", result.path);
-            }
-            println!("{}", result.matches.len());
-            continue;
-        }
-        for m in &result.matches {
-            if options.json {
-                println!(
-                    "{{\"type\":\"match\",\"data\":{{\"path\":{{\"text\":\"{}\"}},\"lines\":{{\"text\":\"{}\"}},\"line_number\":{},\"absolute_offset\":0,\"submatches\":[{{\"match\":{{\"text\":\"{}\"}},\"start\":{},\"end\":{}}}]}}}}",
-                    json_escape(&result.path),
-                    json_escape_bytes(&m.line),
-                    m.line_no,
-                    json_escape_bytes(&m.matched),
-                    m.column - 1,
-                    m.column - 1 + m.matched.len()
-                );
-                continue;
-            }
-            if options.vimgrep {
-                println!(
-                    "{}:{}:{}:{}",
-                    result.path,
-                    m.line_no,
-                    m.column,
-                    bytes_to_string(&m.line)
-                );
-                continue;
-            }
-            if show_path {
-                print!("{}:", result.path);
-            }
-            if options.line_number {
-                print!("{}:", m.line_no);
-            }
-            if options.column {
-                print!("{}:", m.column);
-            }
-            if options.only_matching {
-                println!("{}", bytes_to_string(&m.matched));
-            } else {
-                println!("{}", bytes_to_string(&m.line));
+fn candidate_files(index: &MappedIndex, alternatives: &[Vec<u32>]) -> Result<Vec<u32>> {
+    if alternatives.is_empty() {
+        return Ok((0..index.file_count as u32).collect());
+    }
+    if alternatives.len() == 1 {
+        return intersect_postings(index, &alternatives[0]);
+    }
+    if alternatives.iter().any(|grams| grams.is_empty()) {
+        return Ok((0..index.file_count as u32).collect());
+    }
+    let mut seen = vec![false; index.file_count];
+    let mut result = Vec::new();
+    for grams in alternatives {
+        for id in intersect_postings(index, grams)? {
+            let slot = id as usize;
+            if !seen[slot] {
+                seen[slot] = true;
+                result.push(id);
             }
         }
     }
+    result.sort_unstable();
+    Ok(result)
+}
+
+fn candidate_chunks(index: &MappedIndex, options: &Options) -> Result<Option<Vec<u32>>> {
+    if index.chunk_info.is_none() {
+        return Ok(None);
+    }
+    if let Some(prefixes) = boundary_word_prefixes(options) {
+        let alternatives: Vec<Vec<u32>> = prefixes
+            .iter()
+            .map(|prefix| literal_trigrams(prefix))
+            .filter(|grams| !grams.is_empty())
+            .collect();
+        if let Some(chunks) = candidate_chunks_from_alternatives(index, &alternatives)? {
+            return Ok(usable_chunk_candidates(index, chunks));
+        }
+    }
+    let Some(alternatives) = safe_chunk_trigram_alternatives(options) else {
+        return Ok(None);
+    };
+    if alternatives.is_empty() || alternatives.iter().any(|grams| grams.is_empty()) {
+        return Ok(None);
+    }
+    let Some(chunks) = candidate_chunks_from_alternatives(index, &alternatives)? else {
+        return Ok(None);
+    };
+    Ok(usable_chunk_candidates(index, chunks))
+}
+
+fn usable_chunk_candidates(index: &MappedIndex, chunks: Vec<u32>) -> Option<Vec<u32>> {
+    if chunks.is_empty() {
+        return Some(chunks);
+    }
+    let max_useful = index.file_count.max(1) / 2;
+    (chunks.len() <= max_useful).then_some(chunks)
+}
+
+fn safe_chunk_trigram_alternatives(options: &Options) -> Option<Vec<Vec<u32>>> {
+    if options.fixed || regex_meta_free(&options.pattern) {
+        let grams = safe_chunk_literal_trigrams(&options.pattern)?;
+        return Some(vec![grams]);
+    }
+    if let Some(literals) = simple_parenthesized_literal_alternatives(&options.pattern) {
+        let alternatives: Vec<Vec<u32>> = literals
+            .into_iter()
+            .filter_map(|literal| safe_chunk_literal_trigrams(&literal))
+            .collect();
+        return (!alternatives.is_empty()).then_some(alternatives);
+    }
+    let literals = required_regex_literals(&options.pattern);
+    if literals.len() == 1 {
+        let grams = safe_chunk_literal_trigrams(&literals[0])?;
+        return Some(vec![grams]);
+    }
+    None
+}
+
+fn safe_chunk_literal_trigrams(literal: &str) -> Option<Vec<u32>> {
+    if literal.len() > CHUNK_OVERLAP || literal.len() < 3 {
+        return None;
+    }
+    let grams = literal_trigrams(literal.as_bytes());
+    (!grams.is_empty()).then_some(grams)
+}
+
+fn candidate_chunks_from_alternatives(
+    index: &MappedIndex,
+    alternatives: &[Vec<u32>],
+) -> Result<Option<Vec<u32>>> {
+    if alternatives.len() == 1 {
+        return intersect_chunk_postings(index, &alternatives[0]);
+    }
+    let Some(info) = index.chunk_info else {
+        return Ok(None);
+    };
+    let mut seen = vec![false; info.chunk_count];
+    let mut result = Vec::new();
+    for grams in alternatives {
+        let Some(ids) = intersect_chunk_postings(index, grams)? else {
+            return Ok(None);
+        };
+        for id in ids {
+            let slot = id as usize;
+            if !seen[slot] {
+                seen[slot] = true;
+                result.push(id);
+            }
+        }
+    }
+    result.sort_unstable();
+    Ok(Some(result))
+}
+
+fn intersect_chunk_postings(index: &MappedIndex, grams: &[u32]) -> Result<Option<Vec<u32>>> {
+    if grams.is_empty() {
+        return Ok(None);
+    }
+    let mut postings = Vec::new();
+    for &gram in grams {
+        if let Some(posting) = index.chunk_posting(gram)? {
+            postings.push(posting.data);
+        }
+    }
+    if postings.is_empty() {
+        return Ok(None);
+    }
+    postings.sort_by_key(|p| p.len());
+    let mut result = postings[0].as_ref().to_vec();
+    for posting in postings.into_iter().skip(1) {
+        result = intersect_sorted_u32(&result, posting.as_ref());
+        if result.is_empty() {
+            break;
+        }
+    }
+    Ok(Some(result))
+}
+
+fn qualified_call_candidate_files(
+    index: &MappedIndex,
+    spec: &QualifiedCallSpec,
+) -> Result<Option<Vec<u32>>> {
+    let Some(posting) = index.posting(SPECIAL_QUALIFIED_CALL)? else {
+        return Ok(None);
+    };
+    let mut candidates = posting.data.as_ref().to_vec();
+    if let Some(prefix) = &spec.class_prefix {
+        let key_len = prefix.len().min(QUALIFIED_CLASS_FRAGMENT_MAX_LEN);
+        if let Some(fragment) = index.posting(qualified_class_fragment_key(&prefix[..key_len]))? {
+            candidates = intersect_sorted_u32(&candidates, fragment.data.as_ref());
+        }
+    }
+    Ok(Some(candidates))
+}
+
+fn intersect_sorted_u32(left: &[u32], right: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(left.len().min(right.len()));
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < left.len() && j < right.len() {
+        match left[i].cmp(&right[j]) {
+            Ordering::Less => i += 1,
+            Ordering::Greater => j += 1,
+            Ordering::Equal => {
+                out.push(left[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
+fn prefix_candidate_files(index: &MappedIndex, prefixes: &[Vec<u8>]) -> Result<Option<Vec<u32>>> {
+    let mut seen = vec![false; index.file_count];
+    let mut found_any_posting = false;
+    for prefix in prefixes {
+        if prefix.len() < PREFIX_MIN_LEN {
+            return Ok(None);
+        }
+        let key_len = prefix.len().min(PREFIX_MAX_LEN);
+        if let Some(posting) = index.posting(prefix_posting_key(&prefix[..key_len]))? {
+            found_any_posting = true;
+            for &id in posting.data.as_ref() {
+                if let Some(slot) = seen.get_mut(id as usize) {
+                    *slot = true;
+                }
+            }
+        }
+    }
+    if !found_any_posting {
+        return Ok(None);
+    }
+    Ok(Some(
+        seen.into_iter()
+            .enumerate()
+            .filter_map(|(id, matched)| matched.then_some(id as u32))
+            .collect(),
+    ))
+}
+
+fn word_fragment_candidate_files(
+    index: &MappedIndex,
+    options: &Options,
+) -> Result<Option<Vec<u32>>> {
+    let Some(keys) = query_word_fragment_keys(options) else {
+        return Ok(None);
+    };
+    let mut postings = Vec::new();
+    for key in keys {
+        if let Some(posting) = index.posting(key)? {
+            postings.push(posting.data);
+        }
+    }
+    if postings.is_empty() {
+        return Ok(None);
+    }
+    postings.sort_by_key(|posting| posting.len());
+    let mut result = postings[0].as_ref().to_vec();
+    for posting in postings.into_iter().skip(1) {
+        result = intersect_sorted_u32(&result, posting.as_ref());
+        if result.is_empty() {
+            break;
+        }
+    }
+    Ok(Some(result))
+}
+
+fn query_word_fragment_keys(options: &Options) -> Option<Vec<u32>> {
+    if options.ignore_case && !options.pattern.is_ascii() {
+        return None;
+    }
+    if options.fixed || regex_meta_free(&options.pattern) {
+        return word_fragment_keys_for_literal(&options.pattern);
+    }
+    if let Some(prefixes) = word_prefix_literals(&options.pattern) {
+        let mut keys = Vec::new();
+        for prefix in prefixes {
+            let text = bytes_to_string(&prefix);
+            keys.extend(word_fragment_keys_for_literal(&text)?);
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        return (!keys.is_empty()).then_some(keys);
+    }
+    let literals = required_regex_literals(&options.pattern);
+    if literals.len() == 1 {
+        return word_fragment_keys_for_literal(&literals[0]);
+    }
+    None
+}
+
+fn word_fragment_keys_for_literal(literal: &str) -> Option<Vec<u32>> {
+    if !is_ascii_word_literal(literal) || literal.len() < WORD_FRAGMENT_MIN_LEN {
+        return None;
+    }
+    let bytes = literal.as_bytes();
+    let len = bytes.len().min(WORD_FRAGMENT_MAX_LEN);
+    let mut keys = Vec::new();
+    for start in 0..=bytes.len() - len {
+        keys.push(word_fragment_key(&bytes[start..start + len]));
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    Some(keys)
+}
+
+fn word_prefix_literals(pattern: &str) -> Option<Vec<Vec<u8>>> {
+    let mut pattern = pattern;
+    if let Some(stripped) = pattern.strip_prefix(r"\b") {
+        pattern = stripped;
+    }
+    if let Some(stripped) = pattern.strip_suffix(r"\b") {
+        pattern = stripped;
+    }
+    let prefix_part = pattern.strip_suffix("[A-Za-z0-9_]*")?;
+    if prefix_part.starts_with('(') && prefix_part.ends_with(')') {
+        let body = &prefix_part[1..prefix_part.len() - 1];
+        if body.is_empty() || !body.contains('|') {
+            return None;
+        }
+        let mut out = Vec::new();
+        for part in body.split('|') {
+            if !is_ascii_word_literal(part) {
+                return None;
+            }
+            out.push(part.as_bytes().to_vec());
+        }
+        return Some(out);
+    }
+    is_ascii_word_literal(prefix_part).then(|| vec![prefix_part.as_bytes().to_vec()])
+}
+
+fn ascii_word_bytes() -> Vec<u8> {
+    let mut out = Vec::with_capacity(63);
+    out.extend(b'a'..=b'z');
+    out.extend(b'A'..=b'Z');
+    out.extend(b'0'..=b'9');
+    out.push(b'_');
+    out
+}
+
+fn render_file_result(
+    path: &str,
+    matches: &[MatchLine],
+    options: &Options,
+    show_path: bool,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    if options.files_with_matches {
+        writeln!(out, "{path}")?;
+        return Ok(out);
+    }
+    if options.count {
+        if show_path {
+            write!(out, "{path}:")?;
+        }
+        writeln!(out, "{}", matches.len())?;
+        return Ok(out);
+    }
+    for m in matches {
+        render_match_to(
+            &mut out, path, m.line_no, m.column, &m.line, &m.matched, options, show_path,
+        )?;
+    }
+    Ok(out)
+}
+
+fn render_match_to<W: Write>(
+    out: &mut W,
+    path: &str,
+    line_no: usize,
+    column: usize,
+    line: &[u8],
+    matched: &[u8],
+    options: &Options,
+    show_path: bool,
+) -> Result<()> {
+    if options.json {
+        writeln!(
+            out,
+            "{{\"type\":\"match\",\"data\":{{\"path\":{{\"text\":\"{}\"}},\"lines\":{{\"text\":\"{}\"}},\"line_number\":{},\"absolute_offset\":0,\"submatches\":[{{\"match\":{{\"text\":\"{}\"}},\"start\":{},\"end\":{}}}]}}}}",
+            json_escape(path),
+            json_escape_bytes(line),
+            line_no,
+            json_escape_bytes(matched),
+            column - 1,
+            column - 1 + matched.len()
+        )?;
+        return Ok(());
+    }
+    if options.vimgrep {
+        write!(out, "{}:{}:{}:", path, line_no, column)?;
+        out.write_all(line)?;
+        writeln!(out)?;
+        return Ok(());
+    }
+    if show_path {
+        write!(out, "{path}:")?;
+    }
+    if options.line_number {
+        write!(out, "{}:", line_no)?;
+    }
+    if options.column {
+        write!(out, "{}:", column)?;
+    }
+    if options.only_matching {
+        out.write_all(matched)?;
+    } else {
+        out.write_all(line)?;
+    }
+    writeln!(out)?;
+    Ok(())
+}
+
+fn write_rendered_results<W: Write>(out: &mut W, results: &[RenderedFileResult]) -> Result<()> {
+    for result in results {
+        out.write_all(&result.output)?;
+    }
+    Ok(())
 }
 
 fn build_path_matcher(options: &Options) -> Result<Option<(MatcherSet, MatcherSet)>> {
@@ -3300,6 +5709,59 @@ fn path_allowed_with_matcher(
     Ok(true)
 }
 
+impl PathFilter {
+    fn new(options: &Options, root: &Path) -> Result<Self> {
+        let matcher = build_path_matcher(options)?;
+        let mut prefixes = Vec::with_capacity(options.paths.len());
+        for raw in &options.paths {
+            let p = PathBuf::from(raw);
+            let abs = if p.is_absolute() { p } else { root.join(p) };
+            let abs = fs::canonicalize(&abs).unwrap_or(abs);
+            let prefix = abs
+                .strip_prefix(root)
+                .ok()
+                .map(|candidate| candidate.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|| raw.replace('\\', "/"));
+            if prefix.is_empty() {
+                prefixes.clear();
+                break;
+            }
+            prefixes.push(prefix);
+        }
+        Ok(Self { prefixes, matcher })
+    }
+
+    fn is_unrestricted(&self) -> bool {
+        self.prefixes.is_empty() && self.matcher.is_none()
+    }
+
+    fn allows(&self, rel: &str, excluded_paths: &HashSet<String>) -> bool {
+        if excluded_paths.contains(rel) {
+            return false;
+        }
+        if !self.prefixes.is_empty()
+            && !self.prefixes.iter().any(|prefix| {
+                prefix.is_empty()
+                    || rel == prefix
+                    || rel
+                        .strip_prefix(prefix)
+                        .is_some_and(|tail| tail.starts_with('/'))
+            })
+        {
+            return false;
+        }
+        if let Some((positive, negative)) = &self.matcher {
+            if positive.set.is_some() && !positive.is_match(rel) {
+                return false;
+            }
+            if negative.is_match(rel) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 fn should_show_path(options: &Options) -> bool {
     if let Some(value) = options.with_filename {
         return value;
@@ -3310,25 +5772,203 @@ fn should_show_path(options: &Options) -> bool {
     true
 }
 
-fn file_trigrams(bytes: &[u8]) -> Vec<u32> {
+fn file_trigrams(bytes: &[u8], scratch: &mut TrigramScratch) -> Vec<u32> {
     if bytes.len() < 3 {
         return Vec::new();
     }
-    let mut grams = Vec::with_capacity(bytes.len() - 2);
+    let mut grams = Vec::with_capacity((bytes.len() - 2).min(4096));
     for window in bytes.windows(3) {
-        grams.push(
-            ((window[0].to_ascii_lowercase() as u32) << 16)
-                | ((window[1].to_ascii_lowercase() as u32) << 8)
-                | (window[2].to_ascii_lowercase() as u32),
-        );
+        let gram = trigram(window[0], window[1], window[2]);
+        let idx = gram as usize;
+        let word = idx / TRIGRAM_WORD_BITS;
+        let mask = 1u64 << (idx % TRIGRAM_WORD_BITS);
+        let current = scratch.bits[word];
+        if current & mask == 0 {
+            if current == 0 {
+                scratch.touched_words.push(word);
+            }
+            scratch.bits[word] = current | mask;
+            grams.push(gram);
+        }
     }
-    grams.sort_unstable();
-    grams.dedup();
+    for word in scratch.touched_words.drain(..) {
+        scratch.bits[word] = 0;
+    }
     grams
 }
 
+fn index_grams(bytes: &[u8], scratch: &mut TrigramScratch) -> Vec<u32> {
+    let mut grams = file_trigrams(bytes, scratch);
+    let mut extras = Vec::new();
+    add_qualified_call_postings(bytes, &mut extras);
+    add_identifier_prefix_postings(bytes, &mut extras);
+    extras.sort_unstable();
+    extras.dedup();
+    grams.extend(extras);
+    grams
+}
+
+fn index_grams_and_word_fragments(
+    bytes: &[u8],
+    scratch: &mut TrigramScratch,
+) -> (Vec<u32>, Vec<u32>) {
+    let mut grams = file_trigrams(bytes, scratch);
+    let mut extras = Vec::new();
+    add_qualified_call_postings(bytes, &mut extras);
+    let mut fragments = Vec::new();
+    let mut start = None;
+    for (idx, &byte) in bytes.iter().enumerate() {
+        if is_word_byte(byte) {
+            if start.is_none() {
+                start = Some(idx);
+            }
+            continue;
+        }
+        if let Some(s) = start.take() {
+            let word = &bytes[s..idx];
+            add_word_prefix_postings(word, &mut extras);
+            add_word_fragment_keys(word, &mut fragments);
+        }
+    }
+    if let Some(s) = start {
+        let word = &bytes[s..];
+        add_word_prefix_postings(word, &mut extras);
+        add_word_fragment_keys(word, &mut fragments);
+    }
+    extras.sort_unstable();
+    extras.dedup();
+    grams.extend(extras);
+    fragments.sort_unstable();
+    fragments.dedup();
+    (grams, fragments)
+}
+
+fn add_word_fragment_keys(word: &[u8], keys: &mut Vec<u32>) {
+    if word.len() < WORD_FRAGMENT_MIN_LEN {
+        return;
+    }
+    let max_len = word.len().min(WORD_FRAGMENT_MAX_LEN);
+    for len in WORD_FRAGMENT_MIN_LEN..=max_len {
+        for start in 0..=word.len() - len {
+            keys.push(word_fragment_key(&word[start..start + len]));
+        }
+    }
+}
+
+fn selected_word_fragments<'a>(fragments: impl Iterator<Item = &'a [u32]>) -> HashSet<u32> {
+    let mut counts: HashMap<u32, u32> = HashMap::default();
+    for file_fragments in fragments {
+        for &fragment in file_fragments {
+            let count = counts.entry(fragment).or_insert(0);
+            if *count <= WORD_FRAGMENT_MAX_FILES {
+                *count += 1;
+            }
+        }
+    }
+    counts
+        .into_iter()
+        .filter_map(|(fragment, count)| {
+            (count >= WORD_FRAGMENT_MIN_FILES && count <= WORD_FRAGMENT_MAX_FILES)
+                .then_some(fragment)
+        })
+        .collect()
+}
+
+fn add_identifier_prefix_postings(bytes: &[u8], grams: &mut Vec<u32>) {
+    let mut start = None;
+    for (idx, &byte) in bytes.iter().enumerate() {
+        if is_word_byte(byte) {
+            if start.is_none() {
+                start = Some(idx);
+            }
+            continue;
+        }
+        if let Some(s) = start.take() {
+            add_word_prefix_postings(&bytes[s..idx], grams);
+        }
+    }
+    if let Some(s) = start {
+        add_word_prefix_postings(&bytes[s..], grams);
+    }
+}
+
+fn add_word_prefix_postings(word: &[u8], grams: &mut Vec<u32>) {
+    if word.len() < PREFIX_MIN_LEN {
+        return;
+    }
+    let max = word.len().min(PREFIX_MAX_LEN);
+    for len in PREFIX_MIN_LEN..=max {
+        grams.push(prefix_posting_key(&word[..len]));
+    }
+}
+
+fn word_fragment_key(fragment: &[u8]) -> u32 {
+    let mut hash = 0x811c_9dc5_u32;
+    for &byte in fragment {
+        hash ^= byte.to_ascii_lowercase() as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    WORD_FRAGMENT_TAG | (hash & 0x1fff_ffff)
+}
+
+fn prefix_posting_key(prefix: &[u8]) -> u32 {
+    let mut hash = 0x811c_9dc5_u32;
+    for &byte in prefix {
+        hash ^= byte.to_ascii_lowercase() as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    PREFIX_POSTING_TAG | (hash & 0x3fff_ffff)
+}
+
+fn add_qualified_call_postings(content: &[u8], grams: &mut Vec<u32>) {
+    let finder = memmem::Finder::new("::");
+    for found in finder.find_iter(content) {
+        if found == 0 || found + 2 >= content.len() {
+            continue;
+        }
+        let token_start = rewind_word(content, found);
+        if token_start >= found {
+            continue;
+        }
+        let method_start = found + 2;
+        if method_start >= content.len() || !is_word_byte(content[method_start]) {
+            continue;
+        }
+        let method_end = advance_word(content, method_start);
+        if method_end < content.len() && content[method_end] == b'(' {
+            grams.push(SPECIAL_QUALIFIED_CALL);
+            add_qualified_class_fragments(&content[token_start..found], grams);
+        }
+    }
+}
+
+fn add_qualified_class_fragments(class: &[u8], grams: &mut Vec<u32>) {
+    for start in 0..class.len() {
+        let max_end = (start + QUALIFIED_CLASS_FRAGMENT_MAX_LEN).min(class.len());
+        for end in start + 1..=max_end {
+            grams.push(qualified_class_fragment_key(&class[start..end]));
+        }
+    }
+}
+
+fn qualified_class_fragment_key(fragment: &[u8]) -> u32 {
+    let mut hash = 0x811c_9dc5_u32;
+    for &byte in fragment {
+        hash ^= byte.to_ascii_lowercase() as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    QUALIFIED_CLASS_FRAGMENT_TAG | (hash & 0x3fff_ffff)
+}
+
+fn trigram(a: u8, b: u8, c: u8) -> u32 {
+    ((a.to_ascii_lowercase() as u32) << 16)
+        | ((b.to_ascii_lowercase() as u32) << 8)
+        | (c.to_ascii_lowercase() as u32)
+}
+
 fn literal_trigrams(bytes: &[u8]) -> Vec<u32> {
-    file_trigrams(bytes)
+    let mut scratch = TrigramScratch::new();
+    file_trigrams(bytes, &mut scratch)
 }
 
 fn for_each_line(mut content: &[u8], mut f: impl FnMut(usize, &[u8]) -> bool) {
@@ -3456,6 +6096,10 @@ fn state_path(root: &Path) -> PathBuf {
     root.join(INDEX_DIR).join(STATE_FILE)
 }
 
+fn search_daemon_record_path(root: &Path) -> PathBuf {
+    root.join(INDEX_DIR).join(SEARCH_DAEMON_FILE)
+}
+
 fn watch_registry_dir() -> PathBuf {
     env::var_os("HOME")
         .map(PathBuf::from)
@@ -3542,6 +6186,112 @@ fn watch_log_path(root: &Path) -> PathBuf {
 fn watch_id(root: &Path) -> String {
     let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     format!("{:016x}", fnv1a(canonical.to_string_lossy().as_bytes()))
+}
+
+fn search_daemon_token(root: &Path) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{:016x}{:08x}{:016x}",
+        fnv1a(root.to_string_lossy().as_bytes()),
+        std::process::id(),
+        (nanos as u64) ^ ((nanos >> 64) as u64)
+    )
+}
+
+fn write_search_daemon_record(record: &SearchDaemonRecord) -> Result<()> {
+    fs::create_dir_all(record.root.join(INDEX_DIR))?;
+    let text = format!(
+        "version=1\npid={}\nport={}\ntoken={}\nroot={}\nexe_path={}\nexe_size={}\nexe_mtime={}\nindex_size={}\nindex_mtime={}\n",
+        record.pid,
+        record.port,
+        record.token,
+        record.root.display(),
+        record.exe_path.display(),
+        record.exe_size,
+        record.exe_mtime,
+        record.index_size,
+        record.index_mtime
+    );
+    fs::write(search_daemon_record_path(&record.root), text)?;
+    Ok(())
+}
+
+fn read_valid_search_daemon_record(root: &Path) -> Result<Option<SearchDaemonRecord>> {
+    let path = search_daemon_record_path(root);
+    let Ok(record) = read_search_daemon_record(&path) else {
+        let _ = fs::remove_file(path);
+        return Ok(None);
+    };
+    if !search_daemon_fingerprint_matches(&record) {
+        stop_process(record.pid);
+        let _ = fs::remove_file(path);
+        return Ok(None);
+    }
+    Ok(Some(record))
+}
+
+fn search_daemon_fingerprint_matches(record: &SearchDaemonRecord) -> bool {
+    let Ok(exe) = env::current_exe() else {
+        return false;
+    };
+    let Ok(exe_meta) = fs::metadata(&exe) else {
+        return false;
+    };
+    let Ok(index_meta) = fs::metadata(index_path(&record.root)) else {
+        return false;
+    };
+    exe == record.exe_path
+        && exe_meta.len() == record.exe_size
+        && mtime_ns(&exe_meta) == record.exe_mtime
+        && index_meta.len() == record.index_size
+        && mtime_ns(&index_meta) == record.index_mtime
+}
+
+fn read_search_daemon_record(path: &Path) -> Result<SearchDaemonRecord> {
+    let text = fs::read_to_string(path)?;
+    let mut pid = 0;
+    let mut port = 0;
+    let mut token = String::new();
+    let mut root = PathBuf::new();
+    let mut exe_path = PathBuf::new();
+    let mut exe_size = 0;
+    let mut exe_mtime = 0;
+    let mut index_size = 0;
+    let mut index_mtime = 0;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "pid" => pid = value.parse().unwrap_or(0),
+            "port" => port = value.parse().unwrap_or(0),
+            "token" => token = value.to_string(),
+            "root" => root = PathBuf::from(value),
+            "exe_path" => exe_path = PathBuf::from(value),
+            "exe_size" => exe_size = value.parse().unwrap_or(0),
+            "exe_mtime" => exe_mtime = value.parse().unwrap_or(0),
+            "index_size" => index_size = value.parse().unwrap_or(0),
+            "index_mtime" => index_mtime = value.parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    if pid == 0 || port == 0 || token.is_empty() || root.as_os_str().is_empty() {
+        bail!("invalid search daemon record {}", path.display());
+    }
+    Ok(SearchDaemonRecord {
+        pid,
+        port,
+        token,
+        root,
+        exe_path,
+        exe_size,
+        exe_mtime,
+        index_size,
+        index_mtime,
+    })
 }
 
 fn path_is_ancestor(parent: &Path, child: &Path) -> bool {
@@ -3655,6 +6405,65 @@ fn stop_process(pid: u32) {
     }
 }
 
+fn detach_background_command(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+}
+
+fn daemonize_current_process() -> Result<()> {
+    #[cfg(unix)]
+    {
+        unsafe {
+            let pid = libc::fork();
+            if pid < 0 {
+                return Err(std::io::Error::last_os_error()).context("fork search daemon");
+            }
+            if pid > 0 {
+                libc::_exit(0);
+            }
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error()).context("setsid search daemon");
+            }
+            let pid = libc::fork();
+            if pid < 0 {
+                return Err(std::io::Error::last_os_error()).context("fork search daemon");
+            }
+            if pid > 0 {
+                libc::_exit(0);
+            }
+            let dev_null = std::ffi::CString::new("/dev/null")?;
+            let fd = libc::open(dev_null.as_ptr(), libc::O_RDWR);
+            if fd >= 0 {
+                libc::dup2(fd, libc::STDIN_FILENO);
+                libc::dup2(fd, libc::STDOUT_FILENO);
+                libc::dup2(fd, libc::STDERR_FILENO);
+                if fd > libc::STDERR_FILENO {
+                    libc::close(fd);
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    {}
+    Ok(())
+}
+
 fn print_timings(timings: &Timings) {
     println!(
         "timing: git={:.3}s scan={:.3}s process={:.3}s write={:.3}s",
@@ -3693,6 +6502,55 @@ fn checked_slice(data: &[u8], offset: u64, size: u64) -> Result<&[u8]> {
         .ok_or_else(|| anyhow!("index offset out of range"))
 }
 
+fn write_varint_postings(ids: &[u32], out: &mut Vec<u8>) {
+    let mut previous = 0u32;
+    for &id in ids {
+        let delta = id.wrapping_sub(previous);
+        write_varint_u32(delta, out);
+        previous = id;
+    }
+}
+
+fn write_varint_u32(mut value: u32, out: &mut Vec<u8>) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn read_varint_postings(data: &[u8], count: usize) -> Result<Vec<u32>> {
+    let mut out = Vec::with_capacity(count);
+    let mut offset = 0usize;
+    let mut previous = 0u32;
+    while out.len() < count {
+        let delta = read_varint_u32(data, &mut offset)?;
+        let id = previous.wrapping_add(delta);
+        out.push(id);
+        previous = id;
+    }
+    Ok(out)
+}
+
+fn read_varint_u32(data: &[u8], offset: &mut usize) -> Result<u32> {
+    let mut value = 0u32;
+    let mut shift = 0u32;
+    loop {
+        let byte = *data
+            .get(*offset)
+            .ok_or_else(|| anyhow!("truncated posting list"))?;
+        *offset += 1;
+        value |= ((byte & 0x7f) as u32) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+        if shift >= 32 {
+            bail!("invalid posting varint");
+        }
+    }
+}
+
 fn read_u32_at(data: &[u8], offset: usize) -> Result<u32> {
     let bytes: [u8; 4] = data
         .get(offset..offset + 4)
@@ -3701,11 +6559,43 @@ fn read_u32_at(data: &[u8], offset: usize) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes))
 }
 
+fn read_u32_from_reader(reader: &mut impl Read) -> Result<u32> {
+    let mut bytes = [0u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn write_bytes_frame(writer: &mut impl Write, bytes: &[u8]) -> Result<()> {
+    write_u64(writer, bytes.len() as u64)?;
+    writer.write_all(bytes)?;
+    Ok(())
+}
+
+fn read_bytes_frame(reader: &mut impl Read) -> Result<Vec<u8>> {
+    let len = read_u64_from_reader(reader)?;
+    if len > usize::MAX as u64 {
+        bail!("frame too large");
+    }
+    let mut bytes = vec![0u8; len as usize];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_string_frame(reader: &mut impl Read) -> Result<String> {
+    Ok(String::from_utf8(read_bytes_frame(reader)?)?)
+}
+
 fn read_u64_at(data: &[u8], offset: usize) -> Result<u64> {
     let bytes: [u8; 8] = data
         .get(offset..offset + 8)
         .ok_or_else(|| anyhow!("index offset out of range"))?
         .try_into()?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn read_u64_from_reader(reader: &mut impl Read) -> Result<u64> {
+    let mut bytes = [0u8; 8];
+    reader.read_exact(&mut bytes)?;
     Ok(u64::from_le_bytes(bytes))
 }
 

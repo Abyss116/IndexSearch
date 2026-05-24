@@ -37,7 +37,7 @@ out/
 CFG
 
 mkdir -p "$tmp/src" "$tmp/out"
-printf 'hello_world = 1\nneedle here\n' > "$tmp/src/a.cc"
+printf 'hello_world = 1\nneedle here\nFExample::Call()\nQExample::Call()\nRenderThing\nSkeletalMeshComponent\n' > "$tmp/src/a.cc"
 printf 'Needle there\n' > "$tmp/src/b.txt"
 printf 'needle ignored\n' > "$tmp/src/c.bin"
 printf 'needle ignored\n' > "$tmp/out/d.cc"
@@ -54,6 +54,14 @@ single="$(./indexsearch -I -n -F 'hello_world' "$tmp/src/a.cc")"
 
 regex="$(./indexsearch -n 'hello.*1' "$tmp")"
 grep -q 'src/a.cc:1:hello_world = 1' <<<"$regex"
+qualified_regex="$(./indexsearch -n 'F[A-Za-z0-9_]+::[A-Za-z0-9_]+\(' "$tmp")"
+grep -q 'src/a.cc:3:FExample::Call()' <<<"$qualified_regex"
+generic_qualified_regex="$(./indexsearch -n '[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(' "$tmp")"
+grep -q 'src/a.cc:4:QExample::Call()' <<<"$generic_qualified_regex"
+alternation_regex="$(./indexsearch -n '\b(Render|Shader|Nanite|Lumen)[A-Za-z0-9_]*\b' "$tmp")"
+grep -q 'src/a.cc:5:RenderThing' <<<"$alternation_regex"
+wordspan_regex="$(./indexsearch -n 'Skeletal[A-Za-z0-9_]*Component' "$tmp")"
+grep -q 'src/a.cc:6:SkeletalMeshComponent' <<<"$wordspan_regex"
 
 files="$(./indexsearch --files "$tmp")"
 grep -q 'src/a.cc' <<<"$files"

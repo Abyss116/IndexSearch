@@ -1,8 +1,54 @@
 # IndexSearch
 
-IndexSearch is a Rust command line search tool for large source trees. It uses a
-prebuilt binary trigram index plus stored text snapshots, so searches can avoid
-walking the filesystem. Its project file is `index-search-project.txt`:
+IndexSearch is a Rust command line search tool for very large source trees. It
+keeps a persistent binary trigram index plus stored text snapshots, so repeated
+searches avoid walking the filesystem. The CLI intentionally follows common
+`rg` output conventions closely enough to stand in for `rg` on large indexed
+codebases.
+
+The short command is `is`; the full command is `indexsearch`.
+
+## Install
+
+Prebuilt binaries are attached to the
+[latest GitHub Release](https://github.com/Abyss116/IndexSearch/releases/latest).
+
+Direct downloads:
+
+- [Linux x86_64](https://github.com/Abyss116/IndexSearch/releases/latest/download/indexsearch-linux-x86_64.tar.gz)
+- [macOS arm64](https://github.com/Abyss116/IndexSearch/releases/latest/download/indexsearch-macos-aarch64.tar.gz)
+- [macOS x86_64](https://github.com/Abyss116/IndexSearch/releases/latest/download/indexsearch-macos-x86_64.tar.gz)
+- [Windows x86_64](https://github.com/Abyss116/IndexSearch/releases/latest/download/indexsearch-windows-x86_64.zip)
+
+Continuous builds are available from the
+[GitHub Actions build workflow](https://github.com/Abyss116/IndexSearch/actions/workflows/build.yml).
+
+After extracting an archive:
+
+```bash
+./indexsearch install
+```
+
+This installs `indexsearch` and the short `is` alias into `~/.local/bin` on
+macOS/Linux or `%USERPROFILE%\.local\bin` on Windows. Use
+`indexsearch install --dir PATH` to override the install directory.
+
+## Quick Start
+
+```bash
+cd /path/to/large/repo
+is index .
+is -n "SomeSymbol" .
+is -i -w -g "*.cpp" "render pass" .
+is --files .
+```
+
+If `index-search-project.txt` does not exist, `index`, `update`, `watch`, and
+search-time auto-indexing create a default config before building the index.
+Edit that file and rerun `is index .` or `is update .` to rebuild with new
+rules.
+
+Minimal project file:
 
 ```ini
 [IndexSearch.paths.ignore]
@@ -17,91 +63,27 @@ out/
 *
 ```
 
-The search command intentionally follows common `rg` output conventions so it
-can stand in for `rg` in workflows where a pre-indexed tree is faster.
+## Search Freshness
 
-## Quick Start
+`is index .` rebuilds the base index from scratch.
 
-Prebuilt binaries are attached to the
-[latest GitHub Release](https://github.com/Abyss116/IndexSearch/releases/latest).
-Continuous builds are also available from the
-[latest GitHub Actions run on `main`](https://github.com/Abyss116/IndexSearch/actions/workflows/build.yml?query=branch%3Amain).
+`is update .` refreshes an existing index. It compares stored path, `mtime`, and
+size metadata, reuses unchanged snapshots, reads only changed or new files, and
+drops deleted or newly ignored files.
 
-Direct release downloads:
-
-- [Linux x86_64](https://github.com/Abyss116/IndexSearch/releases/latest/download/indexsearch-linux-x86_64.tar.gz)
-- [macOS arm64](https://github.com/Abyss116/IndexSearch/releases/latest/download/indexsearch-macos-aarch64.tar.gz)
-- [macOS x86_64](https://github.com/Abyss116/IndexSearch/releases/latest/download/indexsearch-macos-x86_64.tar.gz)
-- [Windows x86_64](https://github.com/Abyss116/IndexSearch/releases/latest/download/indexsearch-windows-x86_64.zip)
-
-After extracting the archive, install the binary and short `is` alias:
-
-```bash
-./indexsearch install
-```
-
-Each release archive also includes the Unreal Engine template, agent skill, and
-cross-platform agent-instruction installer.
-
-Or build from source:
-
-```bash
-cargo build --release
-./target/release/indexsearch install
-```
-
-Then use it from any shell:
-
-```bash
-is index .
-is update .
-is -n "SomeSymbol" .
-is -i -w -g "*.cpp" "render pass" .
-```
-
-The index is written to `.indexsearch/index.bin`.
-If `index-search-project.txt` does not exist, `index`, `update`, `watch`, and
-search-time auto-indexing create a default one before building the index. Edit
-that file and rerun `is index .` or `is update .` to rebuild with new rules.
-
-`index` always rebuilds from scratch. `update` scans the current tree, compares
-each indexed path against the previous index using stored `mtime` and `size`,
-reuses unchanged file snapshots from the old index, reads changed or new files,
-and drops deleted or newly ignored files from the next index. The compact index
-file is then replaced in one step after the old mmap is released.
-
-For Git worktrees, `update --git` avoids the full tree scan by asking Git for
-changed tracked paths and writing only a small delta segment:
+For Git worktrees:
 
 ```bash
 is update --git .
+is update --git-untracked .
 ```
 
-Use `--git-untracked` when new untracked files should be included too. Delta
-segments live under `.indexsearch/deltas/`; searches read the base index plus
-all deltas, with newer deltas overriding older file contents and tombstones
-hiding deleted files. If the tree is not a Git repository, or the config
-changed, the command falls back to the regular full update/rebuild path.
+`update --git` records the last indexed `HEAD` and can catch clean committed
+changes from `git pull`, `checkout`, and `rebase`. It writes small delta
+segments under `.indexsearch/deltas/` when possible. Use `is compact .` to fold
+deltas back into the base index.
 
-Successful index writes store the current Git `HEAD` in `.indexsearch/state.txt`.
-That lets `update --git` catch clean committed changes from `git pull`,
-`checkout`, or `rebase` by diffing the last indexed commit against the current
-commit, then layering any working-tree changes on top.
-
-Use `compact` when you want to fold accumulated deltas back into the base index:
-
-```bash
-is compact .
-```
-
-Compaction is explicit for now, so update latency stays predictable. A watcher
-service can use the same knobs: write deltas on file events, then compact during
-idle periods or after delta count/size thresholds.
-
-## Watcher Direction
-
-A persistent watcher should be implemented as a separate foreground/service
-command using the same delta writer as `update --git`:
+For active large repositories:
 
 ```bash
 is watch .
@@ -110,26 +92,9 @@ is watch-log .
 is unwatch .
 ```
 
-Each watched root runs as its own background process and is tracked under
-`~/.indexsearch/watches/`, so multiple projects can be watched at once.
-Overlapping watches are normalized: if a parent directory is already watched,
-watching a child directory is treated as already covered; if a new parent watch
-is started, existing child watches are stopped.
-Per-project watcher activity is appended to `.indexsearch/watch.log`; use
-`is watch-log .` to inspect initial indexing, automatic delta updates,
-and idle compaction timings.
-
-The policy is:
-
-- collect filesystem events for the configured root and debounce them briefly;
-- write one delta segment for each settled batch;
-- coordinate search/update/compact with `.indexsearch/index.lock`, where search
-  takes a shared lock and writers take an exclusive lock;
-- compact only during idle windows or when configured delta count/size thresholds
-  are exceeded.
-
-This keeps updates automatic without making every edit pay the cost of rewriting
-the base index.
+The watcher writes batched delta updates on file events and can compact during
+idle periods. If no base index exists, `is watch .` builds it first. Overlapping
+watches are normalized so a parent watch covers child directories.
 
 Useful watcher knobs:
 
@@ -137,36 +102,31 @@ Useful watcher knobs:
 is watch . --idle-seconds 5 --compact-delta-count 16 --compact-delta-bytes 256mb
 ```
 
-With a watcher running, Git is no longer required for ordinary file edits inside
-the watched root. Git update remains useful for catching changes that happened
-while the watcher was not running, such as a pull before starting the service.
-If the root has never been indexed, `indexsearch watch .` builds the first base
-index before starting the background watcher.
+## Search Daemon
 
-Watcher compaction defaults are `--idle-seconds 5`,
-`--compact-delta-count 16`, and `--compact-delta-bytes 256mb`. Compaction is
-checked only after the watcher has been idle for the configured idle interval,
-and it runs when either the delta count or total delta bytes reaches the
-configured threshold.
+Hot searches automatically try a per-project search daemon when an existing
+index is present. The daemon keeps the mmap-backed index open and serves
+requests over localhost. This trims repeated index-open work, but every shell
+command still starts a small client process, parses arguments, reads the daemon
+record, checks the binary/index fingerprint, and performs local IPC. That fixed
+client-side cost is why daemon speedups are useful but not dramatic for already
+sub-10ms searches.
 
-## Install
-
-Install the current executable into the user bin directory and create the short
-`is` alias:
+Use either form to bypass the daemon:
 
 ```bash
-./indexsearch install
+is --no-daemon -F "SomeSymbol" .
+INDEXSEARCH_NO_DAEMON=1 is -F "SomeSymbol" .
 ```
 
-By default this installs to `~/.local/bin` on macOS/Linux and
-`%USERPROFILE%\.local\bin` on Windows. On Unix, `is` is a symlink to
-`indexsearch`; on Windows it is a small `is.cmd` shim. Use `--dir PATH` to
-override.
+Daemon records live in `.indexsearch/search-daemon.txt`. If `indexsearch
+install` replaces the executable, or if the base index is rebuilt/compacted, the
+next search detects the fingerprint mismatch, stops the old daemon, and starts a
+fresh one.
 
-## Unreal Engine Template
+## Unreal Engine
 
-Use the bundled UE-oriented project template when indexing Unreal Engine source
-trees or UE game projects:
+This repository includes a UE-oriented template:
 
 ```bash
 cp templates/unreal-engine/index-search-project.txt /path/to/UnrealEngine/index-search-project.txt
@@ -174,16 +134,15 @@ cd /path/to/UnrealEngine
 is watch .
 ```
 
-The template keeps source, shader, config, plugin, project, script, and build
-rule files searchable while skipping common UE generated folders, binary assets,
-archives, object files, and debug artifacts.
-
-The same template is also bundled inside the agent skill at
+The template keeps source, shader, config, plugin, project, script, and
+build-rule files searchable while skipping generated folders, binary assets,
+archives, object files, and debug artifacts. The same template is bundled inside
+the agent skill at
 `skills/indexsearch/assets/unreal-engine-index-search-project.txt`.
 
 ## Agent Skill
 
-This repository includes an IndexSearch agent skill package:
+The repository includes reusable agent instructions:
 
 - `skills/indexsearch/SKILL.md` for Codex and Claude Code style skill loaders.
 - `agent-rules/AGENTS.md` for tools that read `AGENTS.md`, including OpenCode
@@ -191,7 +150,7 @@ This repository includes an IndexSearch agent skill package:
 - `agent-rules/CLAUDE.md` for Claude Code project instructions.
 - `agent-rules/cursor/indexsearch.mdc` for Cursor Project Rules.
 
-Install the skill or rules with the cross-platform helper:
+Install them with:
 
 ```bash
 python3 scripts/install-agent-instructions.py --target codex --scope user
@@ -200,9 +159,48 @@ python3 scripts/install-agent-instructions.py --target opencode --scope user
 python3 scripts/install-agent-instructions.py --target all --scope project --project /path/to/project --ue-template
 ```
 
-For project installs, the helper can also copy the UE template as
-`index-search-project.txt` with `--ue-template`. Existing generated instruction
-blocks are replaced in place; unrelated content is preserved.
+## Performance
+
+Benchmarks below were run on a local Unreal Engine checkout at
+`/Users/abyss/Projects/UnrealEngine` on macOS, with hot filesystem cache and
+stdout redirected to `/dev/null`.
+
+- Repository size: 289 GB.
+- IndexSearch indexed files: 196,919.
+- qgrep indexed files: 196,900 using near-identical UE-oriented include/exclude
+  rules translated from `index-search-project.txt`.
+- Search timings are median wall-clock time: 5 runs for IndexSearch/qgrep and 3
+  runs for `rg`.
+- Match counts differ slightly where the tools' glob and output semantics are
+  not perfectly identical; the `*.cpp` constrained row matches exactly.
+
+### Index And Update
+
+| Operation | IndexSearch | qgrep | Notes |
+| --- | ---: | ---: | --- |
+| Fresh index | 12.62s | 21.50s | IndexSearch timing: scan 3.38s, process 6.16s, write 3.08s |
+| No-change update | 0.34s | 4.19s | IndexSearch reused the existing index with no file scan work |
+| No-change `update --git` | 0.50s | n/a | Git changed-path check only |
+
+### Search
+
+| Workload | Pattern | Matches `is/qgrep/rg` | `is` | qgrep | `rg` | `is` vs qgrep |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Literal: common token | `Nanite` | 14664 / 14672 / 13013 | 8.05ms | 21.91ms | 3058.55ms | 2.7x |
+| Literal: long symbol | `SkeletalMeshComponent` | 7593 / 7593 / 7592 | 6.16ms | 18.60ms | 3011.87ms | 3.0x |
+| Literal: missing | `DefinitelyMissingIndexSearchNeedle` | 0 / 0 / 0 | 3.60ms | 10.65ms | 2999.15ms | 3.0x |
+| Case-insensitive literal | `skeletalmeshcomponent` | 7603 / 7603 / 7602 | 7.51ms | 20.83ms | 3049.63ms | 2.8x |
+| Word regex | `\bActor\b` | 23674 / 23677 / 23664 | 33.06ms | 55.77ms | 2971.59ms | 1.7x |
+| Regex: alternation | `(Nanite\|Lumen\|SkeletalMeshComponent)` | 34487 / 34498 / 31426 | 25.59ms | 118.20ms | 2974.07ms | 4.6x |
+| Regex: prefix/suffix | `Skeletal[A-Za-z0-9_]*Component` | 7917 / 7917 / 7916 | 12.21ms | 23.20ms | 3010.84ms | 1.9x |
+| Regex: qualified call | `[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(` | 1487173 / 1487316 / 1481426 | 128.78ms | 366.19ms | 3099.02ms | 2.8x |
+| Glob: `*.cpp` literal | `Nanite` in `*.cpp` | 10061 / 10061 / 10061 | 5.89ms | 20.77ms | 1286.60ms | 3.5x |
+
+To reproduce the search benchmark:
+
+```bash
+python3 scripts/benchmark-ue.py /path/to/UnrealEngine --prepare-qgrep
+```
 
 ## Build From Source
 
@@ -211,52 +209,18 @@ Requirements:
 - Rust stable toolchain with Cargo.
 - A C toolchain that can link Rust binaries for your platform.
 
-Build, test, and run locally:
-
 ```bash
 cargo build --release
 cargo test --locked
 ./target/release/indexsearch --version
+./target/release/indexsearch install
 ```
 
 On macOS/Linux, `./tests/smoke.sh` runs an end-to-end CLI smoke test.
 
-The release binary is written to `target/release/indexsearch` on macOS/Linux and
-`target\release\indexsearch.exe` on Windows.
-
-To install from a source checkout:
-
-```bash
-cargo run --release -- install
-```
-
-## Release Builds
-
-GitHub Actions builds downloadable binaries for Linux x86_64, macOS arm64,
-macOS x86_64, and Windows x86_64 on every push to `main` and every pull request.
-Those builds are available as
-[workflow artifacts](https://github.com/Abyss116/IndexSearch/actions/workflows/build.yml).
-
-Tagged versions create a GitHub Release and upload the platform archives:
-
-```bash
-git tag v0.2.3
-git push origin v0.2.3
-```
-
-## Design Notes
-
-- `index-search-project.txt` is the primary project file name.
-- The index stores searchable file contents plus a trigram inverted table in a
-  compact binary layout. Query-time index loading uses `mmap`, so paths,
-  postings, and file contents are read as views instead of copied into new
-  strings.
-- Query execution extracts literal fragments from simple regexes, intersects
-  trigram postings first, then verifies matches against the stored text. Literal
-  searches use `memchr`/`aho-corasick`; regex searches use Rust's `regex`
-  crate, which is built on the same `regex-automata` family used by ripgrep.
-- Results are collected in file order, with candidate-file verification spread
-  across hardware threads via `rayon`.
+GitHub Actions builds Linux x86_64, macOS arm64, macOS x86_64, and Windows
+x86_64 binaries on every push to `main` and every pull request. Tagged versions
+also create a GitHub Release with platform archives.
 
 ## Supported rg-like Flags
 
@@ -283,28 +247,32 @@ git push origin v0.2.3
 - `--max-filesize SIZE`
 - `--hidden`
 - `--follow`
+- `--no-auto-index`
+- `--auto-update`
+- `--auto-update-untracked`
 - `--stats`
+- `--no-daemon`
 
-Unsupported flags are rejected instead of silently changing semantics.
+Unsupported flags are rejected instead of silently changing semantics. Use `rg`
+for context output (`-A`, `-B`, `-C`), PCRE-specific behavior, or unsupported
+flags.
 
 ## Commands
 
 ```bash
-./indexsearch index [PATH]
-./indexsearch update [PATH]
-./indexsearch compact [PATH]
-./indexsearch watch [PATH]
-./indexsearch list-watches
-./indexsearch watch-log [PATH]
-./indexsearch unwatch <ID|PATH>
-./indexsearch install [--dir PATH]
-./indexsearch status [PATH]
-./indexsearch search [OPTIONS] PATTERN [PATH ...]
+is index [PATH]
+is update [--git] [--git-untracked] [PATH]
+is compact [PATH]
+is watch [PATH]
+is list-watches
+is watch-log [PATH]
+is unwatch <ID|PATH>
+is install [--dir PATH]
+is status [PATH]
+is search [OPTIONS] PATTERN [PATH ...]
 ```
 
-The explicit `search` subcommand is optional. `./indexsearch PATTERN` searches
-directly, like `rg PATTERN`.
-
-Use `is --help` for the top-level command summary and
-`is <command> --help` for command-specific options, such as `is install --help`
-or `is watch --help`.
+The explicit `search` subcommand is optional. `is PATTERN` searches directly,
+like `rg PATTERN`. If the pattern is also an IndexSearch command name such as
+`index`, `status`, or `watch`, use `is -- PATTERN [PATH ...]` or
+`is search PATTERN [PATH ...]`.

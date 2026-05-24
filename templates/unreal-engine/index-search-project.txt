@@ -31,6 +31,7 @@ Engine/Programs/AutomationTool/Saved/
 Engine/Programs/UnrealBuildTool/obj/
 
 [IndexSearch.files.ignore]
+index-search-project.txt
 *.7z
 *.a
 *.app
