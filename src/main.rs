@@ -117,6 +117,7 @@ struct Options {
     auto_index: bool,
     auto_update: bool,
     daemon: bool,
+    profile: bool,
     git_update: bool,
     git_untracked: bool,
     hidden: bool,
@@ -337,6 +338,17 @@ struct SearchOutput {
     code: i32,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+}
+
+#[derive(Default)]
+struct SearchProfile {
+    events: Vec<(&'static str, f64)>,
+}
+
+impl SearchProfile {
+    fn record(&mut self, name: &'static str, elapsed: Duration) {
+        self.events.push((name, elapsed.as_secs_f64() * 1000.0));
+    }
 }
 
 #[derive(Clone)]
@@ -1708,34 +1720,85 @@ fn command_status(args: &[String]) -> Result<i32> {
 }
 
 fn command_search(args: &[String]) -> Result<i32> {
+    let total_timer = Instant::now();
+    let parse_timer = Instant::now();
     let options = parse_search_args(args)?;
+    let mut profile = SearchProfile::default();
+    if options.profile {
+        profile.record("client_parse_args", parse_timer.elapsed());
+    }
+    let start_timer = Instant::now();
     let start = options
         .paths
         .first()
         .map(PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
-    if !options.auto_update && options.daemon {
+    if options.profile {
+        profile.record("client_resolve_start_path", start_timer.elapsed());
+    }
+    if !options.auto_update {
+        let find_timer = Instant::now();
         if let Some(root) = find_existing_index_root(&start) {
-            if let Some(code) = try_search_daemon(&root, args)? {
-                return Ok(code);
+            if options.profile {
+                profile.record("client_find_index_root", find_timer.elapsed());
             }
+            if options.daemon {
+                if let Some(code) = try_search_daemon(
+                    &root,
+                    args,
+                    if options.profile {
+                        Some(&mut profile)
+                    } else {
+                        None
+                    },
+                    total_timer,
+                )? {
+                    return Ok(code);
+                }
+            }
+            let lock_timer = Instant::now();
             let _lock = acquire_shared_lock(&root)?;
-            if let Ok(index) = MappedIndex::open(&index_path(&root)) {
-                return run_search_with_index(index, &options);
+            if options.profile {
+                profile.record("client_acquire_shared_lock", lock_timer.elapsed());
             }
+            let open_timer = Instant::now();
+            if let Ok(index) = MappedIndex::open(&index_path(&root)) {
+                if options.profile {
+                    profile.record("client_open_index_mmap", open_timer.elapsed());
+                }
+                return run_search_with_index(index, &options, Some(profile), total_timer);
+            }
+        } else if options.profile {
+            profile.record("client_find_index_root", find_timer.elapsed());
         }
     }
+    let config_timer = Instant::now();
     let cfg = if options.auto_index {
         load_or_create_config(&start)?
     } else {
         load_config(&start)?
     };
-    if options.auto_update {
-        refresh_index_for_search(&cfg, &options)?;
+    if options.profile {
+        profile.record("client_load_config", config_timer.elapsed());
     }
+    if options.auto_update {
+        let update_timer = Instant::now();
+        refresh_index_for_search(&cfg, &options)?;
+        if options.profile {
+            profile.record("client_auto_update", update_timer.elapsed());
+        }
+    }
+    let lock_timer = Instant::now();
     let _lock = acquire_shared_lock(&cfg.root)?;
+    if options.profile {
+        profile.record("client_acquire_shared_lock", lock_timer.elapsed());
+    }
     let path = index_path(&cfg.root);
+    let open_timer = Instant::now();
     let mut index = MappedIndex::open(&path);
+    if options.profile {
+        profile.record("client_open_index_mmap", open_timer.elapsed());
+    }
     if index
         .as_ref()
         .map(|i| i.config_hash != cfg.hash)
@@ -1755,11 +1818,17 @@ fn command_search(args: &[String]) -> Result<i32> {
         index = MappedIndex::open(&path);
     }
     let index = index?;
-    run_search_with_index(index, &options)
+    run_search_with_index(index, &options, Some(profile), total_timer)
 }
 
-fn run_search_with_index(index: MappedIndex, options: &Options) -> Result<i32> {
+fn run_search_with_index(
+    index: MappedIndex,
+    options: &Options,
+    profile: Option<SearchProfile>,
+    total_timer: Instant,
+) -> Result<i32> {
     let output = search_with_index_output(&index, options)?;
+    let write_timer = Instant::now();
     let stdout = std::io::stdout();
     let mut out = BufWriter::new(stdout.lock());
     out.write_all(&output.stdout)?;
@@ -1768,29 +1837,74 @@ fn run_search_with_index(index: MappedIndex, options: &Options) -> Result<i32> {
     let mut err = BufWriter::new(stderr.lock());
     err.write_all(&output.stderr)?;
     err.flush()?;
+    if let Some(mut profile) = profile {
+        if options.profile {
+            profile.record("client_write_output", write_timer.elapsed());
+            profile.record("client_search_command_total", total_timer.elapsed());
+            write_profile_events(&profile)?;
+        }
+    }
     Ok(output.code)
 }
 
 fn search_with_index_output(index: &MappedIndex, options: &Options) -> Result<SearchOutput> {
+    let mut profile = SearchProfile::default();
+    let delta_timer = if options.profile {
+        Some(Instant::now())
+    } else {
+        None
+    };
     let deltas = load_deltas(&index.root)?;
+    if let Some(delta_timer) = delta_timer {
+        profile.record("search_load_deltas", delta_timer.elapsed());
+    }
     if options.files {
+        let render_timer = if options.profile {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let stdout = if options.quiet {
             Vec::new()
         } else {
             render_visible_files(index, &deltas, options)?
         };
+        let mut stderr = Vec::new();
+        if let Some(render_timer) = render_timer {
+            profile.record("search_render_files", render_timer.elapsed());
+            append_profile_events(&mut stderr, &profile)?;
+        }
         return Ok(SearchOutput {
             code: 0,
             stdout,
-            stderr: Vec::new(),
+            stderr,
         });
     }
     let timer = Instant::now();
     let mut searched = 0;
+    let execute_timer = if options.profile {
+        Some(Instant::now())
+    } else {
+        None
+    };
     let results = execute_search_rendered_segments(index, &deltas, options, &mut searched)?;
+    if let Some(execute_timer) = execute_timer {
+        profile.record(
+            "search_execute_and_render_segments",
+            execute_timer.elapsed(),
+        );
+    }
+    let output_timer = if options.profile {
+        Some(Instant::now())
+    } else {
+        None
+    };
     let mut stdout = Vec::new();
     if !options.quiet {
         write_rendered_results(&mut stdout, &results)?;
+    }
+    if let Some(output_timer) = output_timer {
+        profile.record("search_collect_stdout", output_timer.elapsed());
     }
     let mut stderr = Vec::new();
     if options.stats {
@@ -1799,6 +1913,9 @@ fn search_with_index_output(index: &MappedIndex, options: &Options) -> Result<Se
         writeln!(stderr, "{} matched files", results.len())?;
         writeln!(stderr, "{searched} candidate files")?;
         writeln!(stderr, "{:.6} seconds", timer.elapsed().as_secs_f64())?;
+    }
+    if options.profile {
+        append_profile_events(&mut stderr, &profile)?;
     }
     Ok(SearchOutput {
         code: if results.is_empty() { 1 } else { 0 },
@@ -1818,23 +1935,44 @@ fn find_existing_index_root(start: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn try_search_daemon(root: &Path, args: &[String]) -> Result<Option<i32>> {
+fn try_search_daemon(
+    root: &Path,
+    args: &[String],
+    mut profile: Option<&mut SearchProfile>,
+    total_timer: Instant,
+) -> Result<Option<i32>> {
     if env::var_os("INDEXSEARCH_NO_DAEMON").is_some() {
         return Ok(None);
     }
-    if let Some(record) = read_valid_search_daemon_record(root)? {
-        if let Ok(output) = request_search_daemon(&record, args) {
+    if let Some(record) = read_valid_search_daemon_record(root, profile.as_deref_mut())? {
+        if let Ok(output) = request_search_daemon(&record, args, profile.as_deref_mut()) {
+            let write_timer = Instant::now();
             write_search_output(&output)?;
+            if let Some(profile) = profile.as_deref_mut() {
+                profile.record("client_write_output", write_timer.elapsed());
+                profile.record("client_search_command_total", total_timer.elapsed());
+                write_profile_events(profile)?;
+            }
             return Ok(Some(output.code));
         }
         let _ = fs::remove_file(search_daemon_record_path(root));
     }
+    let start_timer = Instant::now();
     start_search_daemon(root)?;
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.record("client_start_daemon", start_timer.elapsed());
+    }
     let start = Instant::now();
     while start.elapsed() < SEARCH_DAEMON_START_TIMEOUT {
-        if let Some(record) = read_valid_search_daemon_record(root)? {
-            if let Ok(output) = request_search_daemon(&record, args) {
+        if let Some(record) = read_valid_search_daemon_record(root, profile.as_deref_mut())? {
+            if let Ok(output) = request_search_daemon(&record, args, profile.as_deref_mut()) {
+                let write_timer = Instant::now();
                 write_search_output(&output)?;
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.record("client_write_output", write_timer.elapsed());
+                    profile.record("client_search_command_total", total_timer.elapsed());
+                    write_profile_events(profile)?;
+                }
                 return Ok(Some(output.code));
             }
         }
@@ -1852,6 +1990,21 @@ fn write_search_output(output: &SearchOutput) -> Result<()> {
     let mut err = BufWriter::new(stderr.lock());
     err.write_all(&output.stderr)?;
     err.flush()?;
+    Ok(())
+}
+
+fn write_profile_events(profile: &SearchProfile) -> Result<()> {
+    let stderr = std::io::stderr();
+    let mut err = BufWriter::new(stderr.lock());
+    append_profile_events(&mut err, profile)?;
+    err.flush()?;
+    Ok(())
+}
+
+fn append_profile_events<W: Write>(out: &mut W, profile: &SearchProfile) -> Result<()> {
+    for (name, ms) in &profile.events {
+        writeln!(out, "profile: {name}={ms:.3}ms")?;
+    }
     Ok(())
 }
 
@@ -1921,16 +2074,40 @@ fn handle_search_daemon_client(
     record: &SearchDaemonRecord,
     index: &MappedIndex,
 ) -> Result<()> {
+    let mut profile = SearchProfile::default();
+    let read_timer = Instant::now();
     let cwd = read_search_daemon_request(stream, &record.token)?;
+    let wants_profile = cwd.args.iter().any(|arg| arg == "--profile-search");
+    if wants_profile {
+        profile.record("daemon_read_request", read_timer.elapsed());
+    }
     let current_dir = env::current_dir().ok();
+    let cwd_timer = if wants_profile {
+        Some(Instant::now())
+    } else {
+        None
+    };
     if let Some(cwd) = cwd.cwd.as_ref() {
         let _ = env::set_current_dir(cwd);
     }
+    if let Some(cwd_timer) = cwd_timer {
+        profile.record("daemon_set_cwd", cwd_timer.elapsed());
+    }
+    let parse_timer = Instant::now();
     let output = match parse_search_args(&cwd.args).and_then(|options| {
         if options.auto_update {
             bail!("daemon does not run auto-update searches");
         }
-        search_with_index_output(index, &options)
+        if options.profile {
+            profile.record("daemon_parse_args", parse_timer.elapsed());
+        }
+        let search_timer = Instant::now();
+        let mut output = search_with_index_output(index, &options)?;
+        if options.profile {
+            profile.record("daemon_search_with_index_output", search_timer.elapsed());
+            append_profile_events(&mut output.stderr, &profile)?;
+        }
+        Ok(output)
     }) {
         Ok(output) => output,
         Err(err) => SearchOutput {
@@ -1950,12 +2127,29 @@ struct SearchDaemonRequest {
     args: Vec<String>,
 }
 
-fn request_search_daemon(record: &SearchDaemonRecord, args: &[String]) -> Result<SearchOutput> {
+fn request_search_daemon(
+    record: &SearchDaemonRecord,
+    args: &[String],
+    mut profile: Option<&mut SearchProfile>,
+) -> Result<SearchOutput> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], record.port));
+    let connect_timer = Instant::now();
     let mut stream = TcpStream::connect_timeout(&addr, SEARCH_DAEMON_CONNECT_TIMEOUT)?;
     stream.set_nodelay(true)?;
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.record("client_daemon_connect", connect_timer.elapsed());
+    }
+    let write_timer = Instant::now();
     write_search_daemon_request(&mut stream, record, args)?;
-    read_search_daemon_response(&mut stream)
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.record("client_daemon_write_request", write_timer.elapsed());
+    }
+    let read_timer = Instant::now();
+    let output = read_search_daemon_response(&mut stream)?;
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.record("client_daemon_read_response", read_timer.elapsed());
+    }
+    Ok(output)
 }
 
 fn write_search_daemon_request(
@@ -2117,6 +2311,7 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
             "--json" => options.json = true,
             "--vimgrep" => options.vimgrep = true,
             "--stats" => options.stats = true,
+            "--profile-search" => options.profile = true,
             "--hidden" => options.hidden = true,
             "-L" | "--follow" => options.follow = true,
             "--no-auto-index" => options.auto_index = false,
@@ -6219,16 +6414,33 @@ fn write_search_daemon_record(record: &SearchDaemonRecord) -> Result<()> {
     Ok(())
 }
 
-fn read_valid_search_daemon_record(root: &Path) -> Result<Option<SearchDaemonRecord>> {
+fn read_valid_search_daemon_record(
+    root: &Path,
+    mut profile: Option<&mut SearchProfile>,
+) -> Result<Option<SearchDaemonRecord>> {
     let path = search_daemon_record_path(root);
+    let read_timer = Instant::now();
     let Ok(record) = read_search_daemon_record(&path) else {
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.record("client_read_daemon_record", read_timer.elapsed());
+        }
         let _ = fs::remove_file(path);
         return Ok(None);
     };
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.record("client_read_daemon_record", read_timer.elapsed());
+    }
+    let fingerprint_timer = Instant::now();
     if !search_daemon_fingerprint_matches(&record) {
+        if let Some(profile) = profile.as_deref_mut() {
+            profile.record("client_daemon_fingerprint", fingerprint_timer.elapsed());
+        }
         stop_process(record.pid);
         let _ = fs::remove_file(path);
         return Ok(None);
+    }
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.record("client_daemon_fingerprint", fingerprint_timer.elapsed());
     }
     Ok(Some(record))
 }
