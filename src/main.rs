@@ -48,6 +48,14 @@ const CHUNK_OVERLAP: usize = 64;
 const CHUNK_BLOOM_BYTES: usize = 256;
 const CHUNK_FOOTER_MAGIC: &[u8; 8] = b"ISCHNK01";
 const CHUNK_FOOTER_SIZE: usize = 56;
+const AGENT_BLOCK_START: &str = "<!-- indexsearch-agent:start -->";
+const AGENT_BLOCK_END: &str = "<!-- indexsearch-agent:end -->";
+const EMBEDDED_CODEX_SKILL: &str = include_str!("../skills/indexsearch/SKILL.md");
+const EMBEDDED_UE_SKILL_CONFIG: &str =
+    include_str!("../skills/indexsearch/assets/unreal-engine-index-search-project.txt");
+const EMBEDDED_AGENTS_RULE: &str = include_str!("../agent-rules/AGENTS.md");
+const EMBEDDED_CLAUDE_RULE: &str = include_str!("../agent-rules/CLAUDE.md");
+const EMBEDDED_CURSOR_RULE: &str = include_str!("../agent-rules/cursor/indexsearch.mdc");
 const WORD_FRAGMENT_TAG: u32 = 0x2000_0000;
 const WORD_FRAGMENT_MIN_LEN: usize = 6;
 const WORD_FRAGMENT_MAX_LEN: usize = 6;
@@ -474,6 +482,13 @@ fn run() -> Result<()> {
             }
             std::process::exit(command_install(&args)?);
         }
+        "install-skills" | "install-agents" => {
+            let command = args.remove(0);
+            if maybe_print_command_help(&command, &args) {
+                std::process::exit(0);
+            }
+            std::process::exit(command_install_skills(&args)?);
+        }
         "status" => {
             args.remove(0);
             if maybe_print_command_help("status", &args) {
@@ -549,6 +564,11 @@ fn print_help() {
         &style,
         "install [--dir PATH]",
         "install indexsearch and the is alias",
+    );
+    help_command(
+        &style,
+        "install-skills [OPTIONS]",
+        "install bundled agent skills and rules",
     );
     help_command(&style, "status [PATH]", "print index status");
     help_command(
@@ -672,6 +692,7 @@ fn print_command_help(command: &str) {
         "unwatch" => print_unwatch_help(),
         "watch-log" => print_watch_log_help(),
         "install" => print_install_help(),
+        "install-skills" | "install-agents" => print_install_skills_help(),
         "status" => print_status_help(),
         "search" => print_search_help(),
         _ => print_help(),
@@ -794,6 +815,35 @@ fn print_install_help() {
         "--dir PATH",
         "install into PATH instead of the user bin directory",
     );
+}
+
+fn print_install_skills_help() {
+    let style = HelpStyle::new();
+    command_usage(
+        &style,
+        "install-skills",
+        "[OPTIONS]",
+        "install bundled agent skills and rules",
+    );
+    help_section(&style, "Options");
+    help_option(
+        &style,
+        "--target TARGET",
+        "auto, all, codex, claude, opencode, cursor, agents",
+    );
+    help_option(&style, "--scope SCOPE", "user or project (default: user)");
+    help_option(
+        &style,
+        "--project PATH",
+        "project root for project installs",
+    );
+    help_option(
+        &style,
+        "--ue-template",
+        "copy the Unreal Engine index-search-project.txt template",
+    );
+    help_option(&style, "--force", "replace an existing UE template");
+    help_option(&style, "--dry-run", "show what would be installed");
 }
 
 fn print_status_help() {
@@ -1480,6 +1530,384 @@ fn command_install(args: &[String]) -> Result<i32> {
         );
     }
     Ok(0)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SkillTarget {
+    Auto,
+    All,
+    Codex,
+    Claude,
+    OpenCode,
+    Cursor,
+    Agents,
+}
+
+struct InstallSkillsOptions {
+    targets: Vec<SkillTarget>,
+    scope: String,
+    project: Option<PathBuf>,
+    ue_template: bool,
+    force: bool,
+    dry_run: bool,
+}
+
+fn command_install_skills(args: &[String]) -> Result<i32> {
+    let options = parse_install_skills_args(args)?;
+    let project = options
+        .project
+        .as_ref()
+        .map(|path| fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+    let targets = resolve_skill_targets(&options, project.as_deref());
+    if targets.is_empty() && !options.ue_template {
+        println!("no matching local agent environment found");
+        return Ok(0);
+    }
+    for target in targets {
+        match target {
+            SkillTarget::Codex => install_codex_skill(&options, project.as_deref())?,
+            SkillTarget::Claude => install_claude_skill(&options, project.as_deref())?,
+            SkillTarget::OpenCode => install_opencode_rule(&options, project.as_deref())?,
+            SkillTarget::Cursor => install_cursor_rule(&options, project.as_deref())?,
+            SkillTarget::Agents => install_agents_rule(&options, project.as_deref())?,
+            SkillTarget::Auto | SkillTarget::All => {}
+        }
+    }
+    if options.ue_template {
+        let project = project
+            .as_deref()
+            .context("--project is required with --ue-template")?;
+        install_ue_template(project, options.force, options.dry_run)?;
+    }
+    Ok(0)
+}
+
+fn parse_install_skills_args(args: &[String]) -> Result<InstallSkillsOptions> {
+    let mut options = InstallSkillsOptions {
+        targets: vec![SkillTarget::Auto],
+        scope: "user".to_string(),
+        project: None,
+        ue_template: false,
+        force: false,
+        dry_run: false,
+    };
+    let mut saw_target = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--target" => {
+                i += 1;
+                let value = args.get(i).context("missing --target value")?;
+                options.targets = parse_skill_targets(value)?;
+                saw_target = true;
+            }
+            "--scope" => {
+                i += 1;
+                options.scope = args.get(i).context("missing --scope value")?.clone();
+                if options.scope != "user" && options.scope != "project" {
+                    bail!("unsupported scope: {}", options.scope);
+                }
+            }
+            "--project" => {
+                i += 1;
+                options.project = Some(PathBuf::from(
+                    args.get(i).context("missing --project value")?,
+                ));
+            }
+            "--ue-template" => options.ue_template = true,
+            "--force" => options.force = true,
+            "--dry-run" => options.dry_run = true,
+            value if value.starts_with("--target=") => {
+                options.targets =
+                    parse_skill_targets(value.split_once('=').map(|(_, v)| v).unwrap_or(""))?;
+                saw_target = true;
+            }
+            value if value.starts_with("--scope=") => {
+                options.scope = value
+                    .split_once('=')
+                    .map(|(_, v)| v)
+                    .unwrap_or("")
+                    .to_string();
+                if options.scope != "user" && options.scope != "project" {
+                    bail!("unsupported scope: {}", options.scope);
+                }
+            }
+            value if value.starts_with("--project=") => {
+                options.project = Some(PathBuf::from(
+                    value.split_once('=').map(|(_, v)| v).unwrap_or(""),
+                ));
+            }
+            value => bail!("unsupported install-skills option: {value}"),
+        }
+        i += 1;
+    }
+    if !saw_target && options.scope == "project" {
+        options.targets = vec![SkillTarget::All];
+    }
+    Ok(options)
+}
+
+fn parse_skill_targets(value: &str) -> Result<Vec<SkillTarget>> {
+    let mut targets = Vec::new();
+    for raw in value.split(',') {
+        let target = match raw.trim() {
+            "auto" => SkillTarget::Auto,
+            "all" => SkillTarget::All,
+            "codex" => SkillTarget::Codex,
+            "claude" | "claudecode" | "claude-code" => SkillTarget::Claude,
+            "opencode" => SkillTarget::OpenCode,
+            "cursor" => SkillTarget::Cursor,
+            "agents" | "agents.md" => SkillTarget::Agents,
+            "" => continue,
+            other => bail!("unsupported skill target: {other}"),
+        };
+        targets.push(target);
+    }
+    if targets.is_empty() {
+        bail!("no skill targets specified");
+    }
+    Ok(targets)
+}
+
+fn resolve_skill_targets(
+    options: &InstallSkillsOptions,
+    project: Option<&Path>,
+) -> Vec<SkillTarget> {
+    let mut out = Vec::new();
+    let requested = options.targets.clone();
+    for target in requested {
+        match target {
+            SkillTarget::Auto => {
+                if options.scope == "project" {
+                    out.push(SkillTarget::Agents);
+                    if project.is_some_and(|root| root.join(".cursor").exists()) {
+                        out.push(SkillTarget::Cursor);
+                    }
+                    if project.is_some_and(|root| {
+                        root.join("CLAUDE.md").exists() || root.join(".claude").exists()
+                    }) {
+                        out.push(SkillTarget::Claude);
+                    }
+                } else {
+                    if home_dir().join(".codex").exists() {
+                        out.push(SkillTarget::Codex);
+                    }
+                    if home_dir().join(".claude").exists() {
+                        out.push(SkillTarget::Claude);
+                    }
+                    if home_dir().join(".config").join("opencode").exists() {
+                        out.push(SkillTarget::OpenCode);
+                    }
+                }
+            }
+            SkillTarget::All => {
+                if options.scope == "project" {
+                    out.extend([
+                        SkillTarget::Agents,
+                        SkillTarget::Claude,
+                        SkillTarget::Cursor,
+                    ]);
+                } else {
+                    out.extend([
+                        SkillTarget::Codex,
+                        SkillTarget::Claude,
+                        SkillTarget::OpenCode,
+                    ]);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    dedupe_skill_targets(out)
+}
+
+fn dedupe_skill_targets(targets: Vec<SkillTarget>) -> Vec<SkillTarget> {
+    let mut out = Vec::new();
+    for target in targets {
+        if !out.contains(&target) {
+            out.push(target);
+        }
+    }
+    out
+}
+
+fn install_codex_skill(options: &InstallSkillsOptions, project: Option<&Path>) -> Result<()> {
+    if options.scope == "project" {
+        install_agents_rule(options, project)?;
+        return Ok(());
+    }
+    let root = home_dir().join(".codex").join("skills").join("indexsearch");
+    write_text_file(
+        &root.join("SKILL.md"),
+        EMBEDDED_CODEX_SKILL,
+        options.dry_run,
+    )?;
+    write_text_file(
+        &root
+            .join("assets")
+            .join("unreal-engine-index-search-project.txt"),
+        EMBEDDED_UE_SKILL_CONFIG,
+        options.dry_run,
+    )
+}
+
+fn install_claude_skill(options: &InstallSkillsOptions, project: Option<&Path>) -> Result<()> {
+    if options.scope == "project" {
+        let project = project.context("--project is required for project scope")?;
+        let root = project.join(".claude").join("skills").join("indexsearch");
+        write_text_file(
+            &root.join("SKILL.md"),
+            EMBEDDED_CODEX_SKILL,
+            options.dry_run,
+        )?;
+        write_text_file(
+            &root
+                .join("assets")
+                .join("unreal-engine-index-search-project.txt"),
+            EMBEDDED_UE_SKILL_CONFIG,
+            options.dry_run,
+        )?;
+        write_marked_block(
+            &project.join("CLAUDE.md"),
+            EMBEDDED_CLAUDE_RULE,
+            options.dry_run,
+        )
+    } else {
+        let root = home_dir()
+            .join(".claude")
+            .join("skills")
+            .join("indexsearch");
+        write_text_file(
+            &root.join("SKILL.md"),
+            EMBEDDED_CODEX_SKILL,
+            options.dry_run,
+        )?;
+        write_text_file(
+            &root
+                .join("assets")
+                .join("unreal-engine-index-search-project.txt"),
+            EMBEDDED_UE_SKILL_CONFIG,
+            options.dry_run,
+        )
+    }
+}
+
+fn install_opencode_rule(options: &InstallSkillsOptions, project: Option<&Path>) -> Result<()> {
+    if options.scope == "project" {
+        install_agents_rule(options, project)
+    } else {
+        write_marked_block(
+            &home_dir()
+                .join(".config")
+                .join("opencode")
+                .join("AGENTS.md"),
+            EMBEDDED_AGENTS_RULE,
+            options.dry_run,
+        )
+    }
+}
+
+fn install_cursor_rule(options: &InstallSkillsOptions, project: Option<&Path>) -> Result<()> {
+    let project = project.context("--project is required for Cursor rule installs")?;
+    write_text_file(
+        &project
+            .join(".cursor")
+            .join("rules")
+            .join("indexsearch.mdc"),
+        EMBEDDED_CURSOR_RULE,
+        options.dry_run,
+    )?;
+    if options.scope == "project" {
+        install_agents_rule(options, Some(project))?;
+    }
+    Ok(())
+}
+
+fn install_agents_rule(options: &InstallSkillsOptions, project: Option<&Path>) -> Result<()> {
+    let project = project.context("--project is required for AGENTS.md installs")?;
+    write_marked_block(
+        &project.join("AGENTS.md"),
+        EMBEDDED_AGENTS_RULE,
+        options.dry_run,
+    )
+}
+
+fn install_ue_template(project: &Path, force: bool, dry_run: bool) -> Result<()> {
+    let dst = project.join(PROJECT_FILE);
+    if dst.exists() && !force {
+        println!(
+            "kept existing {}; pass --force to replace it",
+            dst.display()
+        );
+        return Ok(());
+    }
+    write_text_file(&dst, EMBEDDED_UE_SKILL_CONFIG, dry_run)
+}
+
+fn write_text_file(path: &Path, text: &str, dry_run: bool) -> Result<()> {
+    if dry_run {
+        println!("would install {}", path.display());
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, text)?;
+    println!("installed {}", path.display());
+    Ok(())
+}
+
+fn write_marked_block(path: &Path, block: &str, dry_run: bool) -> Result<()> {
+    let wrapped = format!(
+        "{AGENT_BLOCK_START}\n{}\n{AGENT_BLOCK_END}\n",
+        block.trim_end()
+    );
+    let updated = if path.exists() {
+        let existing = fs::read_to_string(path)?;
+        if let (Some(start), Some(end)) = (
+            existing.find(AGENT_BLOCK_START),
+            existing.find(AGENT_BLOCK_END),
+        ) {
+            if end > start {
+                let end = end + AGENT_BLOCK_END.len();
+                let mut text = format!(
+                    "{}{}{}",
+                    &existing[..start],
+                    wrapped.trim_end(),
+                    &existing[end..]
+                );
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text
+            } else {
+                append_marked_block(existing, &wrapped)
+            }
+        } else {
+            append_marked_block(existing, &wrapped)
+        }
+    } else {
+        wrapped
+    };
+    if dry_run {
+        println!("would update {}", path.display());
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, updated)?;
+    println!("updated {}", path.display());
+    Ok(())
+}
+
+fn append_marked_block(existing: String, wrapped: &str) -> String {
+    let sep = if existing.is_empty() || existing.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    format!("{existing}{sep}\n{wrapped}")
 }
 
 fn parse_watch_args(args: &[String]) -> Result<(WatchOptions, PathBuf)> {
@@ -7125,17 +7553,19 @@ fn watch_registry_dir() -> PathBuf {
         .join(WATCH_DIR)
 }
 
+fn home_dir() -> PathBuf {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn watch_record_path(id: &str) -> PathBuf {
     watch_registry_dir().join(format!("{id}.watch"))
 }
 
 fn default_install_dir() -> PathBuf {
-    env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".local")
-        .join("bin")
+    home_dir().join(".local").join("bin")
 }
 
 fn executable_name(stem: &str) -> String {

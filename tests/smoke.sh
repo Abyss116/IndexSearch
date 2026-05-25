@@ -184,10 +184,22 @@ grep -q 'auto-update' <<<"$watch_log"
 ./indexsearch unwatch "$watch_tmp" >/dev/null
 
 install_tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp" "$git_tmp" "$watch_tmp" "$install_tmp"' EXIT
+skills_home="$(mktemp -d)"
+skills_project="$(mktemp -d)"
+trap 'rm -rf "$tmp" "$git_tmp" "$watch_tmp" "$install_tmp" "$skills_home" "$skills_project"' EXIT
 ./indexsearch install --dir "$install_tmp" >/dev/null
 "$install_tmp/indexsearch" --version >/dev/null
 "$install_tmp/is" --version >/dev/null
 if [[ "$(uname -s)" != MINGW* && "$(uname -s)" != MSYS* ]]; then
   [[ -L "$install_tmp/is" ]]
 fi
+HOME="$skills_home" ./indexsearch install-skills --target all --scope user >/dev/null
+[[ -f "$skills_home/.codex/skills/indexsearch/SKILL.md" ]]
+[[ -f "$skills_home/.claude/skills/indexsearch/SKILL.md" ]]
+grep -q 'IndexSearch Agent Instructions' "$skills_home/.config/opencode/AGENTS.md"
+./indexsearch install-skills --target all --scope project --project "$skills_project" --ue-template >/dev/null
+[[ -f "$skills_project/AGENTS.md" ]]
+[[ -f "$skills_project/CLAUDE.md" ]]
+[[ -f "$skills_project/.claude/skills/indexsearch/SKILL.md" ]]
+[[ -f "$skills_project/.cursor/rules/indexsearch.mdc" ]]
+[[ -f "$skills_project/index-search-project.txt" ]]

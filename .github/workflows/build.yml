@@ -77,6 +77,7 @@ jobs:
           mkdir -p "dist/${{ matrix.artifact }}"
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "target/${{ matrix.target }}/release/indexsearch.exe" "dist/${{ matrix.artifact }}/"
+            cp "target/${{ matrix.target }}/release/indexsearch.exe" "dist/${{ matrix.artifact }}/is.exe"
           else
             cp "target/${{ matrix.target }}/release/indexsearch" "dist/${{ matrix.artifact }}/"
             chmod +x "dist/${{ matrix.artifact }}/indexsearch"
@@ -86,8 +87,6 @@ jobs:
           cp -R templates "dist/${{ matrix.artifact }}/"
           cp -R skills "dist/${{ matrix.artifact }}/"
           cp -R agent-rules "dist/${{ matrix.artifact }}/"
-          mkdir -p "dist/${{ matrix.artifact }}/scripts"
-          cp scripts/install-agent-instructions.py "dist/${{ matrix.artifact }}/scripts/"
 
       - name: Create tar archive
         if: runner.os != 'Windows'
@@ -127,3 +126,168 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes
+
+  update-homebrew:
+    name: Update Homebrew tap
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_REPO: Abyss116/homebrew-indexsearch
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_TOKEN}" ]; then
+            echo "skipping Homebrew tap update; HOMEBREW_TAP_TOKEN is not configured"
+            exit 0
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p assets
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'indexsearch-linux-x86_64.tar.gz' \
+            --pattern 'indexsearch-macos-aarch64.tar.gz' \
+            --pattern 'indexsearch-macos-x86_64.tar.gz' \
+            --dir assets
+          linux_sha="$(sha256sum assets/indexsearch-linux-x86_64.tar.gz | awk '{print $1}')"
+          macos_arm_sha="$(sha256sum assets/indexsearch-macos-aarch64.tar.gz | awk '{print $1}')"
+          macos_intel_sha="$(sha256sum assets/indexsearch-macos-x86_64.tar.gz | awk '{print $1}')"
+          git -c http.https://github.com/.extraheader="AUTHORIZATION: bearer ${TAP_TOKEN}" \
+            clone "https://github.com/${TAP_REPO}.git" tap
+          mkdir -p tap/Formula
+          cat > tap/Formula/indexsearch.rb <<EOF
+          class Indexsearch < Formula
+            desc "Persistent-index rg-like search for large source trees"
+            homepage "https://github.com/Abyss116/IndexSearch"
+            version "${version}"
+            license "NOASSERTION"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/Abyss116/IndexSearch/releases/download/${GITHUB_REF_NAME}/indexsearch-macos-aarch64.tar.gz"
+                sha256 "${macos_arm_sha}"
+              else
+                url "https://github.com/Abyss116/IndexSearch/releases/download/${GITHUB_REF_NAME}/indexsearch-macos-x86_64.tar.gz"
+                sha256 "${macos_intel_sha}"
+              end
+            end
+
+            on_linux do
+              url "https://github.com/Abyss116/IndexSearch/releases/download/${GITHUB_REF_NAME}/indexsearch-linux-x86_64.tar.gz"
+              sha256 "${linux_sha}"
+            end
+
+            def install
+              artifact = Dir["indexsearch-*"].find { |entry| File.directory?(entry) }
+              odie "IndexSearch archive layout changed" if artifact.nil?
+              cd artifact do
+                bin.install "indexsearch"
+                bin.install_symlink "indexsearch" => "is"
+                pkgshare.install "skills" if Dir.exist?("skills")
+                pkgshare.install "agent-rules" if Dir.exist?("agent-rules")
+                pkgshare.install "templates" if Dir.exist?("templates")
+              end
+            end
+
+            def caveats
+              <<~EOS
+                Agent integrations are bundled into the binary:
+                  is install-skills
+                  is install-skills --scope project --project /path/to/project --ue-template
+              EOS
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/indexsearch --version")
+              assert_match version.to_s, shell_output("#{bin}/is --version")
+            end
+          end
+          EOF
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/indexsearch.rb
+          if git diff --cached --quiet; then
+            echo "Homebrew formula already up to date"
+            exit 0
+          fi
+          git commit -m "indexsearch ${GITHUB_REF_NAME}"
+          git -c http.https://github.com/.extraheader="AUTHORIZATION: bearer ${TAP_TOKEN}" push
+
+  update-winget:
+    name: Submit WinGet manifest
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release
+    runs-on: windows-latest
+    steps:
+      - name: Submit manifest update
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINGET_TOKEN)) {
+            Write-Host "skipping WinGet submission; WINGET_TOKEN is not configured"
+            exit 0
+          }
+          $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          $installerUrl = "https://github.com/Abyss116/IndexSearch/releases/download/$env:GITHUB_REF_NAME/indexsearch-windows-x86_64.zip"
+          $url = "$installerUrl|x64"
+          Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+          .\wingetcreate.exe update Abyss116.IndexSearch -u $url -v $version -t $env:WINGET_TOKEN --submit
+          if ($LASTEXITCODE -eq 0) {
+            exit 0
+          }
+
+          Write-Host "wingetcreate update failed; generating initial manifest submission"
+          Invoke-WebRequest $installerUrl -OutFile indexsearch-windows-x86_64.zip
+          $sha = (Get-FileHash indexsearch-windows-x86_64.zip -Algorithm SHA256).Hash
+          New-Item -ItemType Directory -Force -Path winget | Out-Null
+          @"
+          PackageIdentifier: Abyss116.IndexSearch
+          PackageVersion: $version
+          DefaultLocale: en-US
+          ManifestType: version
+          ManifestVersion: 1.10.0
+          "@ | Set-Content -Encoding utf8 winget/Abyss116.IndexSearch.yaml
+          @"
+          PackageIdentifier: Abyss116.IndexSearch
+          PackageVersion: $version
+          PackageLocale: en-US
+          Publisher: Abyss116
+          PublisherUrl: https://github.com/Abyss116
+          PublisherSupportUrl: https://github.com/Abyss116/IndexSearch/issues
+          PackageName: IndexSearch
+          PackageUrl: https://github.com/Abyss116/IndexSearch
+          License: NOASSERTION
+          ShortDescription: Persistent-index rg-like search for large source trees.
+          Moniker: indexsearch
+          Tags:
+          - search
+          - cli
+          - ripgrep
+          - code-search
+          ReleaseNotesUrl: https://github.com/Abyss116/IndexSearch/releases/tag/$env:GITHUB_REF_NAME
+          ManifestType: defaultLocale
+          ManifestVersion: 1.10.0
+          "@ | Set-Content -Encoding utf8 winget/Abyss116.IndexSearch.locale.en-US.yaml
+          @"
+          PackageIdentifier: Abyss116.IndexSearch
+          PackageVersion: $version
+          InstallerType: zip
+          NestedInstallerType: portable
+          NestedInstallerFiles:
+          - RelativeFilePath: indexsearch-windows-x86_64\indexsearch.exe
+            PortableCommandAlias: indexsearch
+          - RelativeFilePath: indexsearch-windows-x86_64\is.exe
+            PortableCommandAlias: is
+          Installers:
+          - Architecture: x64
+            InstallerUrl: $installerUrl
+            InstallerSha256: $sha
+          ManifestType: installer
+          ManifestVersion: 1.10.0
+          "@ | Set-Content -Encoding utf8 winget/Abyss116.IndexSearch.installer.yaml
+          .\wingetcreate.exe submit winget -t $env:WINGET_TOKEN -p "Abyss116.IndexSearch $version" --no-open

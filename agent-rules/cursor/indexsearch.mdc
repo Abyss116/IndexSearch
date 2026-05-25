@@ -11,6 +11,7 @@ Fall back to `rg` for small trees or unsupported flags.
 
 For Unreal Engine projects, use `templates/unreal-engine/index-search-project.txt`
 as `index-search-project.txt`, then run `is watch .` or `is index .`.
+Refresh this rule with `is install-skills --target cursor --scope project --project .`.
 
 Useful commands:
 

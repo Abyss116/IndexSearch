@@ -13,6 +13,20 @@ The short command is `is`; the full command is `indexsearch`.
 Prebuilt binaries are attached to the
 [latest GitHub Release](https://github.com/Abyss116/IndexSearch/releases/latest).
 
+Homebrew:
+
+```bash
+brew tap Abyss116/indexsearch
+brew install indexsearch
+```
+
+WinGet, after the manifest is accepted by the Windows Package Manager community
+repository:
+
+```powershell
+winget install --id Abyss116.IndexSearch -e
+```
+
 Direct downloads:
 
 - [Linux x86_64](https://github.com/Abyss116/IndexSearch/releases/latest/download/indexsearch-linux-x86_64.tar.gz)
@@ -31,7 +45,9 @@ After extracting an archive:
 
 This installs `indexsearch` and the short `is` alias into `~/.local/bin` on
 macOS/Linux or `%USERPROFILE%\.local\bin` on Windows. Use
-`indexsearch install --dir PATH` to override the install directory.
+`indexsearch install --dir PATH` to override the install directory. Package
+manager installs already put `indexsearch` and `is` on PATH and do not need
+this step.
 
 ## Quick Start
 
@@ -153,10 +169,11 @@ The repository includes reusable agent instructions:
 Install them with:
 
 ```bash
-python3 scripts/install-agent-instructions.py --target codex --scope user
-python3 scripts/install-agent-instructions.py --target claude --scope user
-python3 scripts/install-agent-instructions.py --target opencode --scope user
-python3 scripts/install-agent-instructions.py --target all --scope project --project /path/to/project --ue-template
+is install-skills
+is install-skills --target codex --scope user
+is install-skills --target claude --scope user
+is install-skills --target opencode --scope user
+is install-skills --target all --scope project --project /path/to/project --ue-template
 ```
 
 ## Performance
@@ -225,6 +242,7 @@ cargo build --release
 cargo test --locked
 ./target/release/indexsearch --version
 ./target/release/indexsearch install
+./target/release/indexsearch install-skills --help
 ```
 
 On macOS/Linux, `./tests/smoke.sh` runs an end-to-end CLI smoke test.
@@ -278,8 +296,7 @@ can be controlled with `--color auto|always|never`.
 - `--no-daemon`
 
 Unsupported flags are rejected instead of silently changing semantics. Use `rg`
-for context output (`-A`, `-B`, `-C`), PCRE-specific behavior, or unsupported
-flags.
+for PCRE-specific behavior or unsupported flags.
 
 ## Commands
 
@@ -292,6 +309,7 @@ is list-watches
 is watch-log [PATH]
 is unwatch <ID|PATH>
 is install [--dir PATH]
+is install-skills [OPTIONS]
 is status [PATH]
 is search [OPTIONS] PATTERN [PATH ...]
 ```

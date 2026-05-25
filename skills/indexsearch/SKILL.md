@@ -24,6 +24,13 @@ Quick check:
 command -v is || command -v indexsearch || command -v rg
 ```
 
+Install or refresh this skill from a packaged IndexSearch binary with:
+
+```bash
+is install-skills
+is install-skills --target all --scope project --project /path/to/project --ue-template
+```
+
 ## Large Repo Workflow
 
 1. If `.indexsearch/index.bin` exists, search with `is`.
@@ -61,7 +68,7 @@ Avoid these flags for maximum hot search speed when a watcher or manual update
 already keeps the index fresh.
 
 If the pattern is also an IndexSearch command name (`index`, `update`,
-`status`, `watch`, `install`, etc.), use `is -- PATTERN ...` or
+`status`, `watch`, `install`, `install-skills`, etc.), use `is -- PATTERN ...` or
 `is search PATTERN ...` so the word is treated as the query, not a subcommand.
 
 ## Unreal Engine Defaults
