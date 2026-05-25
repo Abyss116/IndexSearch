@@ -263,6 +263,14 @@ Tagged releases also contain optional package-manager publication jobs:
 If either secret is absent, that publication job is skipped and the release
 artifacts are still produced.
 
+## License
+
+IndexSearch is distributed under the terms of both the MIT license and the
+Apache License 2.0. You may choose either license.
+
+The references to ripgrep and qgrep in this repository are compatibility and
+benchmark references only; their source code is not vendored into IndexSearch.
+
 ## Supported rg-like Flags
 
 Normal search output follows `rg`'s auto decoration behavior. When stdout is a

@@ -83,6 +83,7 @@ jobs:
             chmod +x "dist/${{ matrix.artifact }}/indexsearch"
           fi
           cp README.md "dist/${{ matrix.artifact }}/"
+          cp LICENSE LICENSE-MIT LICENSE-APACHE "dist/${{ matrix.artifact }}/"
           cp index-search-project.txt "dist/${{ matrix.artifact }}/"
           cp -R templates "dist/${{ matrix.artifact }}/"
           cp -R skills "dist/${{ matrix.artifact }}/"
@@ -163,21 +164,17 @@ jobs:
             desc "Persistent-index rg-like search for large source trees"
             homepage "https://github.com/Abyss116/IndexSearch"
             version "${version}"
-            license "NOASSERTION"
+            license any_of: ["MIT", "Apache-2.0"]
 
-            on_macos do
-              if Hardware::CPU.arm?
-                url "https://github.com/Abyss116/IndexSearch/releases/download/${GITHUB_REF_NAME}/indexsearch-macos-aarch64.tar.gz"
-                sha256 "${macos_arm_sha}"
-              else
-                url "https://github.com/Abyss116/IndexSearch/releases/download/${GITHUB_REF_NAME}/indexsearch-macos-x86_64.tar.gz"
-                sha256 "${macos_intel_sha}"
-              end
-            end
-
-            on_linux do
+            if OS.linux?
               url "https://github.com/Abyss116/IndexSearch/releases/download/${GITHUB_REF_NAME}/indexsearch-linux-x86_64.tar.gz"
               sha256 "${linux_sha}"
+            elsif Hardware::CPU.arm?
+              url "https://github.com/Abyss116/IndexSearch/releases/download/${GITHUB_REF_NAME}/indexsearch-macos-aarch64.tar.gz"
+              sha256 "${macos_arm_sha}"
+            else
+              url "https://github.com/Abyss116/IndexSearch/releases/download/${GITHUB_REF_NAME}/indexsearch-macos-x86_64.tar.gz"
+              sha256 "${macos_intel_sha}"
             end
 
             def install
@@ -250,6 +247,7 @@ jobs:
           $sha = (Get-FileHash indexsearch-windows-x86_64.zip -Algorithm SHA256).Hash
           New-Item -ItemType Directory -Force -Path winget | Out-Null
           @"
+          # yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.1.10.0.schema.json
           PackageIdentifier: Abyss116.IndexSearch
           PackageVersion: $version
           DefaultLocale: en-US
@@ -257,6 +255,7 @@ jobs:
           ManifestVersion: 1.10.0
           "@ | Set-Content -Encoding utf8 winget/Abyss116.IndexSearch.yaml
           @"
+          # yaml-language-server: `$schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
           PackageIdentifier: Abyss116.IndexSearch
           PackageVersion: $version
           PackageLocale: en-US
@@ -265,7 +264,7 @@ jobs:
           PublisherSupportUrl: https://github.com/Abyss116/IndexSearch/issues
           PackageName: IndexSearch
           PackageUrl: https://github.com/Abyss116/IndexSearch
-          License: NOASSERTION
+          License: MIT OR Apache-2.0
           ShortDescription: Persistent-index rg-like search for large source trees.
           Moniker: indexsearch
           Tags:
@@ -278,14 +277,15 @@ jobs:
           ManifestVersion: 1.10.0
           "@ | Set-Content -Encoding utf8 winget/Abyss116.IndexSearch.locale.en-US.yaml
           @"
+          # yaml-language-server: `$schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
           PackageIdentifier: Abyss116.IndexSearch
           PackageVersion: $version
           InstallerType: zip
           NestedInstallerType: portable
           NestedInstallerFiles:
-          - RelativeFilePath: indexsearch-windows-x86_64\indexsearch.exe
+          - RelativeFilePath: indexsearch.exe
             PortableCommandAlias: indexsearch
-          - RelativeFilePath: indexsearch-windows-x86_64\is.exe
+          - RelativeFilePath: is.exe
             PortableCommandAlias: is
           Installers:
           - Architecture: x64

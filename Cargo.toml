@@ -2,6 +2,10 @@
 name = "indexsearch"
 version = "0.2.8"
 edition = "2024"
+description = "Persistent-index rg-like search for large source trees"
+repository = "https://github.com/Abyss116/IndexSearch"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
 
 [profile.release]
 lto = "thin"
