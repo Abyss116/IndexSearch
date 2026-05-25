@@ -251,6 +251,16 @@ GitHub Actions builds Linux x86_64, macOS arm64, macOS x86_64, and Windows
 x86_64 binaries on every push to `main` and every pull request. Tagged versions
 also create a GitHub Release with platform archives.
 
+Tagged releases also contain optional package-manager publication jobs:
+
+- `HOMEBREW_TAP_TOKEN` updates
+  [`Abyss116/homebrew-indexsearch`](https://github.com/Abyss116/homebrew-indexsearch).
+- `WINGET_TOKEN` submits the WinGet manifest PR to
+  [`microsoft/winget-pkgs`](https://github.com/microsoft/winget-pkgs).
+
+If either secret is absent, that publication job is skipped and the release
+artifacts are still produced.
+
 ## Supported rg-like Flags
 
 Normal search output follows `rg`'s auto decoration behavior. When stdout is a
