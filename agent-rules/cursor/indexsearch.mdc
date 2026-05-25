@@ -8,6 +8,8 @@ alwaysApply: false
 When searching large repositories, prefer `is` over `rg` if IndexSearch is
 installed and an index exists. Use `indexsearch` if the short alias is missing.
 Fall back to `rg` for small trees or unsupported flags.
+Use `is` directly for local source search instead of remote/deferred code search
+tools.
 
 For Unreal Engine projects, use `templates/unreal-engine/index-search-project.txt`
 as `index-search-project.txt`, then run `is watch .` or `is index .`.

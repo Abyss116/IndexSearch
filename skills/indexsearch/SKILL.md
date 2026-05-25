@@ -1,99 +1,53 @@
 ---
 name: indexsearch
-description: Use IndexSearch for fast source-code search in large codebases, especially Unreal Engine repositories and projects. Prefer the short `is` command over `rg` when a persistent IndexSearch index is available or when indexing a large tree will pay off.
+description: Prefer the local `is` command over `rg` for source search in large indexed codebases, especially Unreal Engine trees.
 ---
 
 # IndexSearch
 
-Use this skill when searching large source trees, especially Unreal Engine.
-IndexSearch keeps a persistent trigram index and presents an rg-like CLI.
+Use this skill for local source-code search in large repositories.
 
-## Tool Choice
+## Default Behavior
 
-- Prefer `is` when available.
-- Use `indexsearch` if `is` is not installed.
-- Fall back to `rg` when neither command exists, when a needed `rg` flag is not
-  supported by IndexSearch, or when the target tree is small enough that indexing
-  overhead is not useful.
-- Treat `is` as rg-like, not a full `rg` clone. Use it for the supported common
-  flags below; use `rg` for PCRE-specific behavior or any unsupported flag.
+- Use `is` directly for local code search. Do not call `tool_search` just to
+  discover a search tool; `is` is a shell command, not a deferred tool.
+- Do not read extra base instruction files only to decide between `is` and
+  `rg`; this skill is enough.
+- In Unreal Engine or any repository with `.indexsearch/index.bin`, prefer `is`
+  over `rg`.
+- If `is` fails because it is missing, try `indexsearch`. If both are missing,
+  fall back to `rg`.
+- If an `is` flag is unsupported or PCRE-specific behavior is required, fall
+  back to `rg`.
+- Do not preflight with `command -v` unless the search command fails or the
+  task is explicitly about installation.
 
-Quick check:
-
-```bash
-command -v is || command -v indexsearch || command -v rg
-```
-
-Install or refresh this skill from a packaged IndexSearch binary with:
-
-```bash
-is install-skills
-is install-skills --target all --scope project --project /path/to/project --ue-template
-```
-
-## Large Repo Workflow
-
-1. If `.indexsearch/index.bin` exists, search with `is`.
-2. If the project has `index-search-project.txt` but no index, run `is watch .`
-   for ongoing work or `is index .` for a one-shot index.
-3. If a watcher is already running, assume normal file edits are reflected by
-   delta updates; use `is watch-log .` when freshness is unclear.
-4. Use `is update --git .` after a pull, checkout, or rebase if no watcher was
-   running during the change.
-
-Examples:
+## Common Commands
 
 ```bash
 is -n "SomeSymbol" .
 is -i -w -g "*.cpp" "render pass" .
 is --files -g "*.Build.cs" .
-is --color=always "SomeSymbol" .
 is -n -C 3 "SomeSymbol" .
-is --auto-update -n "SomeSymbol" .
-is -- "status" .
+is --color=always "SomeSymbol" .
 ```
 
-Default search is optimized for hot queries: when an existing `.indexsearch`
-index can be found, it uses a per-project search daemon when available. The
-daemon keeps the mmap-backed index open, so repeated hot searches avoid most of
-the process startup and index-open cost. Use `is --no-daemon ...` only when
-debugging or benchmarking the one-shot path.
-
-The search path does not read the project config or scan the worktree for
-freshness. Use `is status .` or `is index .` after editing
-`index-search-project.txt`. Use `is --auto-update ...` when you want a
-stateless rg-like command that first performs a fast Git changed-path refresh;
-use `is --auto-update-untracked ...` when untracked files should be included.
-Avoid these flags for maximum hot search speed when a watcher or manual update
-already keeps the index fresh.
-
-If the pattern is also an IndexSearch command name (`index`, `update`,
-`status`, `watch`, `install`, `install-skills`, etc.), use `is -- PATTERN ...` or
-`is search PATTERN ...` so the word is treated as the query, not a subcommand.
-
-## Unreal Engine Defaults
-
-For an Unreal Engine tree without an IndexSearch config, copy the bundled asset
-to the repository root as `index-search-project.txt`:
+For a pattern that is also an IndexSearch command name, use `--` or explicit
+`search`:
 
 ```bash
-cp assets/unreal-engine-index-search-project.txt index-search-project.txt
-is watch .
+is -- "status" .
+is search "watch" .
 ```
 
-The UE template indexes source, shader, config, plugin, project, script, and
-build-rule files while skipping generated folders, binary assets, archives,
-object files, and debug artifacts.
+## Freshness
 
-## Output Expectations
+- If a watcher is running, assume normal edits are indexed.
+- After pull, checkout, or rebase without a watcher, use `is update --git .`.
+- If a project has `index-search-project.txt` but no index yet, use
+  `is watch .` for ongoing work or `is index .` for one-shot indexing.
 
-- Preserve rg-like flags and output shape whenever possible.
-- Normal text output follows rg-like auto decoration: terminal output uses file
-  headings and line numbers, while captured output uses `path:match` or
-  `path:line:match` with `-n`.
-- Context output supports `-A`, `-B`, and `-C` with rg-like `:`/`-` separators.
-- Color mode supports `--color=auto`, `--color=always`, and `--color=never`.
-- Prefer `is` only for the supported subset of rg-like flags; fall back to `rg`
-  for unsupported flags.
-- Use `is` in examples and command suggestions unless explaining installation.
-- Mention `rg` fallback only when IndexSearch cannot satisfy the query.
+## UE Template
+
+For a UE tree without config, copy the bundled template as
+`index-search-project.txt`, then run `is watch .`.

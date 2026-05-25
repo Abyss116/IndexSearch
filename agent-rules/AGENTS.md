@@ -2,6 +2,8 @@
 
 Use IndexSearch for fast source-code search in large codebases.
 
+- Use `is` directly for local source search; do not call external/deferred code
+  search tools just to find files in the local checkout.
 - Prefer `is` over `rg` when `is` is installed and the repository is large,
   already indexed, or clearly an Unreal Engine tree.
 - Use `indexsearch` if `is` is unavailable.
