@@ -350,6 +350,7 @@ struct MatchLine {
 }
 
 struct RenderedFileResult {
+    path: String,
     output: Vec<u8>,
     match_count: usize,
 }
@@ -945,6 +946,10 @@ fn stdout_supports_color() -> bool {
     force_color
         || (std::io::stdout().is_terminal()
             && env::var("TERM").map(|term| term != "dumb").unwrap_or(true))
+}
+
+fn stdout_supports_search_decoration() -> bool {
+    std::io::stdout().is_terminal() && env::var("TERM").map(|term| term != "dumb").unwrap_or(true)
 }
 
 fn command_index(args: &[String]) -> Result<i32> {
@@ -1875,8 +1880,11 @@ fn daemon_search_args(args: &[String]) -> Vec<String> {
     } else {
         "never"
     };
-    let mut out = Vec::with_capacity(args.len() + 1);
+    let decorated_output = stdout_supports_search_decoration();
+    let mut out = Vec::with_capacity(args.len() + 3);
     let mut saw_color = false;
+    let mut saw_heading = false;
+    let mut saw_line_number = false;
     let mut i = 0usize;
     while i < args.len() {
         let arg = &args[i];
@@ -1901,12 +1909,39 @@ fn daemon_search_args(args: &[String]) -> Vec<String> {
             });
             i += 1;
             continue;
+        } else if arg == "--heading" || arg == "--no-heading" {
+            saw_heading = true;
+        } else if matches!(
+            arg.as_str(),
+            "-n" | "--line-number" | "-N" | "--no-line-number"
+        ) {
+            saw_line_number = true;
         }
         out.push(arg.clone());
         i += 1;
     }
     if !saw_color {
         out.push(format!("--color={resolved_color}"));
+    }
+    if !saw_heading {
+        out.push(
+            if decorated_output {
+                "--heading"
+            } else {
+                "--no-heading"
+            }
+            .to_string(),
+        );
+    }
+    if !saw_line_number {
+        out.push(
+            if decorated_output {
+                "--line-number"
+            } else {
+                "--no-line-number"
+            }
+            .to_string(),
+        );
     }
     out
 }
@@ -2395,7 +2430,7 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
     let mut options = Options {
         auto_index: true,
         daemon: true,
-        line_number: true,
+        line_number: stdout_supports_search_decoration(),
         max_filesize: DEFAULT_MAX_FILE_SIZE,
         ..Options::default()
     };
@@ -4007,6 +4042,7 @@ fn execute_search_rendered_segments(
             execute_search_rendered(&delta.index, options, searched, &exclusions[idx + 1])?;
         results.append(&mut segment_results);
     }
+    results.sort_unstable_by(|a, b| a.path.cmp(&b.path));
     Ok(results)
 }
 
@@ -4157,7 +4193,8 @@ fn execute_search_rendered(
         .enumerate()
         .map_init(Vec::new, |scratch, (ordinal, id)| {
             let (path_bytes, content) = index.file_for_search(*id as usize, scratch).ok()?;
-            let path = bytes_to_string(path_bytes);
+            let rel_path = bytes_to_string(path_bytes);
+            let path = display_path_for_result(&index.root, &rel_path, options);
             let rendered = matcher
                 .search_file_rendered(content, &path, options, show_path)
                 .ok()??;
@@ -4255,7 +4292,8 @@ fn execute_search_rendered_chunks(
         .par_iter()
         .map_init(Vec::new, |scratch, (file_id, chunks)| {
             let (path_bytes, content) = index.file_for_search(*file_id as usize, scratch).ok()?;
-            let path = bytes_to_string(path_bytes);
+            let rel_path = bytes_to_string(path_bytes);
+            let path = display_path_for_result(&index.root, &rel_path, options);
             let rendered = matcher
                 .search_file_rendered(content, &path, options, show_path)
                 .ok()??;
@@ -4443,6 +4481,7 @@ impl QueryMatcher {
         }
         let output = render_file_result(path, &matches, options, show_path)?;
         Ok(Some(RenderedFileResult {
+            path: path.to_string(),
             output,
             match_count: matches.len(),
         }))
@@ -4833,6 +4872,7 @@ fn finish_rendered_match_output(
         writeln!(output, "{match_count}")?;
     }
     Ok(Some(RenderedFileResult {
+        path: path.to_string(),
         output,
         match_count,
     }))
@@ -5475,6 +5515,7 @@ fn search_qualified_call_rendered(
         writeln!(output, "{match_count}")?;
     }
     Ok(Some(RenderedFileResult {
+        path: path.to_string(),
         output,
         match_count,
     }))
@@ -6210,7 +6251,9 @@ fn render_file_result(
 
 fn grouped_heading_output(options: &Options, show_path: bool) -> bool {
     show_path
-        && options.heading.unwrap_or(true)
+        && options
+            .heading
+            .unwrap_or_else(stdout_supports_search_decoration)
         && !options.json
         && !options.vimgrep
         && !options.count
@@ -6469,6 +6512,52 @@ fn should_show_path(options: &Options) -> bool {
         return false;
     }
     true
+}
+
+fn display_path_for_result(root: &Path, rel: &str, options: &Options) -> String {
+    if options.paths.len() != 1 {
+        return rel.to_string();
+    }
+    let raw = &options.paths[0];
+    let path = Path::new(raw);
+    if path.is_file() {
+        return rel.to_string();
+    }
+    if path.is_absolute() {
+        let display_base = path.to_path_buf();
+        let comparable_base = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        if let Some(prefix) = rel_path(root, &comparable_base) {
+            if prefix.is_empty() {
+                return slash_path(display_base.join(rel));
+            }
+            if rel == prefix {
+                return slash_path(display_base);
+            }
+            if let Some(rest) = rel.strip_prefix(&(prefix + "/")) {
+                return slash_path(display_base.join(rest));
+            }
+        }
+        return slash_path(root.join(rel));
+    }
+
+    let normalized = raw.replace('\\', "/");
+    let trimmed = normalized.trim_end_matches('/');
+    if trimmed == "." {
+        return format!("./{rel}");
+    }
+    if let Some(prefix) = trimmed.strip_prefix("./") {
+        if rel == prefix {
+            return trimmed.to_string();
+        }
+        if let Some(rest) = rel.strip_prefix(&format!("{prefix}/")) {
+            return format!("{trimmed}/{rest}");
+        }
+    }
+    rel.to_string()
+}
+
+fn slash_path(path: PathBuf) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn file_trigrams(bytes: &[u8], scratch: &mut TrigramScratch) -> Vec<u32> {

@@ -81,8 +81,9 @@ object files, and debug artifacts.
 ## Output Expectations
 
 - Preserve rg-like flags and output shape whenever possible.
-- Normal text output uses rg-like file headings with default line numbers;
-  `--no-heading` restores `path:line:match`, and `-N` suppresses line numbers.
+- Normal text output follows rg-like auto decoration: terminal output uses file
+  headings and line numbers, while captured output uses `path:match` or
+  `path:line:match` with `-n`.
 - Color mode supports `--color=auto`, `--color=always`, and `--color=never`.
 - Prefer `is` only for the supported subset of rg-like flags; fall back to `rg`
   for unsupported flags or context output.

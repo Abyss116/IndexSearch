@@ -44,17 +44,20 @@ printf 'needle ignored\n' > "$tmp/out/d.cc"
 
 ./indexsearch index "$tmp" >/dev/null
 result="$(./indexsearch -n -i needle "$tmp")"
-[[ "$result" == *$'src/a.cc\n2:needle here'* ]]
-[[ "$result" == *$'src/b.txt\n1:Needle there'* ]]
+grep -q "$tmp/src/a.cc:2:needle here" <<<"$result"
+grep -q "$tmp/src/b.txt:1:Needle there" <<<"$result"
 ! grep -q 'c.bin' <<<"$result"
 ! grep -q 'out/d.cc' <<<"$result"
-default_lines="$(./indexsearch -F needle "$tmp")"
-[[ "$default_lines" == *$'src/a.cc\n2:needle here'* ]]
-no_heading_search="$(./indexsearch --no-heading -F needle "$tmp")"
-grep -q 'src/a.cc:2:needle here' <<<"$no_heading_search"
+default_plain="$(./indexsearch -F needle "$tmp")"
+grep -q "$tmp/src/a.cc:needle here" <<<"$default_plain"
+! grep -q "$tmp/src/a.cc:2:needle here" <<<"$default_plain"
+heading_search="$(./indexsearch --heading -n -F needle "$tmp")"
+[[ "$heading_search" == *"$tmp/src/a.cc"$'\n2:needle here'* ]]
+no_heading_search="$(./indexsearch --no-heading -n -F needle "$tmp")"
+grep -q "$tmp/src/a.cc:2:needle here" <<<"$no_heading_search"
 plain_search="$(./indexsearch --color=auto -F needle "$tmp")"
 ! grep -q $'\033\\[' <<<"$plain_search"
-colored_search="$(env -u NO_COLOR CLICOLOR_FORCE=1 ./indexsearch --color=auto -F needle "$tmp")"
+colored_search="$(env -u NO_COLOR CLICOLOR_FORCE=1 ./indexsearch --color=auto -n -F needle "$tmp")"
 grep -q $'\033\\[35m' <<<"$colored_search"
 grep -q $'\033\\[32m2\033\\[0m' <<<"$colored_search"
 grep -q $'\033\\[1;31mneedle\033\\[0m' <<<"$colored_search"
@@ -69,15 +72,15 @@ single="$(./indexsearch -I -n -F 'hello_world' "$tmp/src/a.cc")"
 [[ "$single" == '1:hello_world = 1' ]]
 
 regex="$(./indexsearch -n 'hello.*1' "$tmp")"
-[[ "$regex" == *$'src/a.cc\n1:hello_world = 1'* ]]
+grep -q "$tmp/src/a.cc:1:hello_world = 1" <<<"$regex"
 qualified_regex="$(./indexsearch -n 'F[A-Za-z0-9_]+::[A-Za-z0-9_]+\(' "$tmp")"
-[[ "$qualified_regex" == *$'src/a.cc\n3:FExample::Call()'* ]]
+grep -q "$tmp/src/a.cc:3:FExample::Call()" <<<"$qualified_regex"
 generic_qualified_regex="$(./indexsearch -n '[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(' "$tmp")"
-[[ "$generic_qualified_regex" == *$'src/a.cc\n4:QExample::Call()'* ]]
+grep -q "$tmp/src/a.cc:4:QExample::Call()" <<<"$generic_qualified_regex"
 alternation_regex="$(./indexsearch -n '\b(Render|Shader|Nanite|Lumen)[A-Za-z0-9_]*\b' "$tmp")"
-[[ "$alternation_regex" == *$'src/a.cc\n5:RenderThing'* ]]
+grep -q "$tmp/src/a.cc:5:RenderThing" <<<"$alternation_regex"
 wordspan_regex="$(./indexsearch -n 'Skeletal[A-Za-z0-9_]*Component' "$tmp")"
-[[ "$wordspan_regex" == *$'src/a.cc\n6:SkeletalMeshComponent'* ]]
+grep -q "$tmp/src/a.cc:6:SkeletalMeshComponent" <<<"$wordspan_regex"
 
 files="$(./indexsearch --files "$tmp")"
 grep -q 'src/a.cc' <<<"$files"
@@ -90,8 +93,8 @@ update_out="$(./indexsearch update "$tmp")"
 grep -q 'reused' <<<"$update_out"
 
 fresh="$(./indexsearch -n fresh_symbol "$tmp")"
-[[ "$fresh" == *$'src/a.cc\n2:fresh_symbol'* ]]
-[[ "$fresh" == *$'src/new.cc\n1:fresh_symbol added'* ]]
+grep -q "$tmp/src/a.cc:2:fresh_symbol" <<<"$fresh"
+grep -q "$tmp/src/new.cc:1:fresh_symbol added" <<<"$fresh"
 ! ./indexsearch -q -F 'Needle there' "$tmp"
 
 status="$(./indexsearch status "$tmp")"
@@ -130,7 +133,7 @@ grep -q 'modified' <<<"$git_update"
 find "$git_tmp/.indexsearch/deltas" -name '*.bin' | grep -q .
 
 git_result="$(./indexsearch -n git_symbol "$git_tmp")"
-[[ "$git_result" == *$'src/a.cc\n1:git_symbol new'* ]]
+grep -q "$git_tmp/src/a.cc:1:git_symbol new" <<<"$git_result"
 ! ./indexsearch -q -F 'remove_me' "$git_tmp"
 
 printf 'untracked_symbol\n' > "$git_tmp/src/untracked.cc"

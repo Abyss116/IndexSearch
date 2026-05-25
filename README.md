@@ -235,11 +235,12 @@ also create a GitHub Release with platform archives.
 
 ## Supported rg-like Flags
 
-Normal search output defaults to rg-style headings: each matching file is printed
-once, followed by `line:match` rows, with a blank line between files. Use
-`--no-heading` to print `path:line:match` on every matching line. Use
-`-N`/`--no-line-number` to suppress line numbers. ANSI colors are enabled
-automatically for terminals and can be controlled with `--color auto|always|never`.
+Normal search output follows `rg`'s auto decoration behavior. When stdout is a
+terminal, each matching file is printed once, followed by `line:match` rows,
+with a blank line between files. When stdout is captured or piped, output uses
+`path:match`, or `path:line:match` with `-n`. Use `--heading`/`--no-heading` and
+`-n`/`-N` to override. ANSI colors are enabled automatically for terminals and
+can be controlled with `--color auto|always|never`.
 
 - `-i`, `--ignore-case`
 - `-s`, `--case-sensitive`
