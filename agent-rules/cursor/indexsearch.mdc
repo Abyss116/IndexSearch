@@ -17,6 +17,7 @@ Useful commands:
 ```bash
 is -n "SomeSymbol" .
 is -i -w -g "*.cpp" "render pass" .
+is --color=always "SomeSymbol" .
 is update --git .
 is watch-log .
 ```

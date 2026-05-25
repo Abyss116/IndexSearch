@@ -235,6 +235,11 @@ also create a GitHub Release with platform archives.
 
 ## Supported rg-like Flags
 
+Normal search output defaults to `path:line:match`, matching `rg`'s line-number
+behavior. Use `-N`/`--no-line-number` to suppress line numbers. ANSI colors are
+enabled automatically for terminals and can be controlled with
+`--color auto|always|never`.
+
 - `-i`, `--ignore-case`
 - `-s`, `--case-sensitive`
 - `-S`, `--smart-case`
@@ -254,6 +259,7 @@ also create a GitHub Release with platform archives.
 - `--files`
 - `--json`
 - `--vimgrep`
+- `--color auto|always|never`
 - `-m NUM`, `--max-count NUM`
 - `--max-filesize SIZE`
 - `--hidden`

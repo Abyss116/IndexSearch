@@ -41,6 +41,7 @@ Examples:
 is -n "SomeSymbol" .
 is -i -w -g "*.cpp" "render pass" .
 is --files -g "*.Build.cs" .
+is --color=always "SomeSymbol" .
 is --auto-update -n "SomeSymbol" .
 is -- "status" .
 ```
@@ -80,6 +81,8 @@ object files, and debug artifacts.
 ## Output Expectations
 
 - Preserve rg-like flags and output shape whenever possible.
+- Normal text output uses rg-like default line numbers; `-N` suppresses them.
+- Color mode supports `--color=auto`, `--color=always`, and `--color=never`.
 - Prefer `is` only for the supported subset of rg-like flags; fall back to `rg`
   for unsupported flags or context output.
 - Use `is` in examples and command suggestions unless explaining installation.

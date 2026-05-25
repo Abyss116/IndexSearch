@@ -114,6 +114,7 @@ struct Options {
     quiet: bool,
     only_matching: bool,
     json: bool,
+    color: ColorChoice,
     auto_index: bool,
     auto_update: bool,
     daemon: bool,
@@ -127,6 +128,24 @@ struct Options {
     pattern: String,
     globs: Vec<String>,
     paths: Vec<String>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum ColorChoice {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl ColorChoice {
+    fn enabled(self) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Never => false,
+            Self::Auto => stdout_supports_color(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -559,6 +578,11 @@ fn print_help() {
     help_option(&style, "--files", "print indexed searchable files");
     help_option(&style, "--json", "print JSON Lines matches");
     help_option(&style, "--vimgrep", "print path:line:column:line");
+    help_option(
+        &style,
+        "--color WHEN",
+        "colorize matches: auto, always, never",
+    );
     help_option(&style, "-m, --max-count NUM", "max matching lines per file");
     help_option(&style, "--stats", "print search stats");
     help_option(&style, "--no-daemon", "do not use the search daemon");
@@ -789,6 +813,11 @@ fn print_search_help() {
     help_option(&style, "--files", "print indexed searchable files");
     help_option(&style, "--json", "print JSON Lines matches");
     help_option(&style, "--vimgrep", "print path:line:column:line");
+    help_option(
+        &style,
+        "--color WHEN",
+        "colorize matches: auto, always, never",
+    );
     help_option(&style, "-m, --max-count NUM", "max matching lines per file");
     help_option(
         &style,
@@ -865,12 +894,8 @@ struct HelpStyle {
 
 impl HelpStyle {
     fn new() -> Self {
-        let force_color = env::var("CLICOLOR_FORCE").is_ok_and(|value| value != "0");
         Self {
-            color: env::var_os("NO_COLOR").is_none()
-                && (force_color
-                    || (std::io::stdout().is_terminal()
-                        && env::var("TERM").map(|term| term != "dumb").unwrap_or(true))),
+            color: stdout_supports_color(),
         }
     }
 
@@ -897,6 +922,16 @@ impl HelpStyle {
             text.to_string()
         }
     }
+}
+
+fn stdout_supports_color() -> bool {
+    if env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    let force_color = env::var("CLICOLOR_FORCE").is_ok_and(|value| value != "0");
+    force_color
+        || (std::io::stdout().is_terminal()
+            && env::var("TERM").map(|term| term != "dumb").unwrap_or(true))
 }
 
 fn command_index(args: &[String]) -> Result<i32> {
@@ -1745,7 +1780,7 @@ fn command_search(args: &[String]) -> Result<i32> {
             if options.daemon {
                 if let Some(code) = try_search_daemon(
                     &root,
-                    args,
+                    &daemon_search_args(args),
                     if options.profile {
                         Some(&mut profile)
                     } else {
@@ -1819,6 +1854,48 @@ fn command_search(args: &[String]) -> Result<i32> {
     }
     let index = index?;
     run_search_with_index(index, &options, Some(profile), total_timer)
+}
+
+fn daemon_search_args(args: &[String]) -> Vec<String> {
+    let resolved_color = if stdout_supports_color() {
+        "always"
+    } else {
+        "never"
+    };
+    let mut out = Vec::with_capacity(args.len() + 1);
+    let mut saw_color = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--color" {
+            saw_color = true;
+            out.push(arg.clone());
+            if let Some(value) = args.get(i + 1) {
+                out.push(if value == "auto" {
+                    resolved_color.to_string()
+                } else {
+                    value.clone()
+                });
+                i += 2;
+                continue;
+            }
+        } else if let Some(value) = arg.strip_prefix("--color=") {
+            saw_color = true;
+            out.push(if value == "auto" {
+                format!("--color={resolved_color}")
+            } else {
+                arg.clone()
+            });
+            i += 1;
+            continue;
+        }
+        out.push(arg.clone());
+        i += 1;
+    }
+    if !saw_color {
+        out.push(format!("--color={resolved_color}"));
+    }
+    out
 }
 
 fn run_search_with_index(
@@ -2305,6 +2382,7 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
     let mut options = Options {
         auto_index: true,
         daemon: true,
+        line_number: true,
         max_filesize: DEFAULT_MAX_FILE_SIZE,
         ..Options::default()
     };
@@ -2354,6 +2432,7 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
             "--vimgrep" => options.vimgrep = true,
             "--stats" => options.stats = true,
             "--profile-search" => options.profile = true,
+            "--color" => options.color = parse_color_choice(&need_value(arg)?)?,
             "--hidden" => options.hidden = true,
             "-L" | "--follow" => options.follow = true,
             "--no-auto-index" => options.auto_index = false,
@@ -2365,14 +2444,19 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
             }
             "--" => positional_only = true,
             "--no-heading" | "--no-messages" | "--no-ignore" | "--no-ignore-vcs" => {}
-            "--color" | "--colors" | "--sort" | "--sortr" | "-j" | "--threads" => {
+            "--colors" | "--sort" | "--sortr" | "-j" | "--threads" => {
                 let _ = need_value(arg)?;
             }
             "-m" | "--max-count" => options.max_count = Some(need_value(arg)?.parse()?),
             "--max-filesize" => options.max_filesize = parse_size(&need_value(arg)?)?,
-            _ if arg.starts_with("--color=")
-                || arg.starts_with("--sort=")
-                || arg.starts_with("--sortr=") => {}
+            _ if arg.starts_with("--color=") => {
+                options.color = parse_color_choice(
+                    arg.split_once('=')
+                        .map(|(_, value)| value)
+                        .unwrap_or_default(),
+                )?
+            }
+            _ if arg.starts_with("--sort=") || arg.starts_with("--sortr=") => {}
             _ if arg.starts_with('-') => bail!("unsupported option: {arg}"),
             _ if options.pattern.is_empty() && regexps.is_empty() && !options.files => {
                 options.pattern = arg.clone();
@@ -2401,7 +2485,27 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
         options.line_number = true;
         options.column = true;
     }
+    if options.color == ColorChoice::Auto {
+        options.color = if stdout_supports_color() {
+            ColorChoice::Always
+        } else {
+            ColorChoice::Never
+        };
+    }
     Ok(options)
+}
+
+fn parse_color_choice(value: &str) -> Result<ColorChoice> {
+    match value {
+        "auto" => Ok(if stdout_supports_color() {
+            ColorChoice::Always
+        } else {
+            ColorChoice::Never
+        }),
+        "always" | "ansi" => Ok(ColorChoice::Always),
+        "never" => Ok(ColorChoice::Never),
+        _ => bail!("unsupported color mode: {value}"),
+    }
 }
 
 fn load_config(start: &Path) -> Result<ProjectConfig> {
@@ -6095,21 +6199,68 @@ fn render_match_to<W: Write>(
         writeln!(out)?;
         return Ok(());
     }
+    let color = options.color.enabled();
     if show_path {
-        write!(out, "{path}:")?;
+        write_styled(out, path.as_bytes(), color, "35")?;
+        write!(out, ":")?;
     }
     if options.line_number {
-        write!(out, "{}:", line_no)?;
+        write_styled_display(out, line_no, color, "32")?;
+        write!(out, ":")?;
     }
     if options.column {
-        write!(out, "{}:", column)?;
+        write_styled_display(out, column, color, "32")?;
+        write!(out, ":")?;
     }
     if options.only_matching {
-        out.write_all(matched)?;
+        write_styled(out, matched, color, "1;31")?;
     } else {
-        out.write_all(line)?;
+        write_line_with_match(out, line, column.saturating_sub(1), matched.len(), color)?;
     }
     writeln!(out)?;
+    Ok(())
+}
+
+fn write_line_with_match<W: Write>(
+    out: &mut W,
+    line: &[u8],
+    start: usize,
+    len: usize,
+    color: bool,
+) -> Result<()> {
+    if !color || len == 0 || start >= line.len() {
+        out.write_all(line)?;
+        return Ok(());
+    }
+    let end = (start + len).min(line.len());
+    out.write_all(&line[..start])?;
+    write_styled(out, &line[start..end], true, "1;31")?;
+    out.write_all(&line[end..])?;
+    Ok(())
+}
+
+fn write_styled<W: Write>(out: &mut W, bytes: &[u8], color: bool, code: &str) -> Result<()> {
+    if color {
+        write!(out, "\x1b[{code}m")?;
+        out.write_all(bytes)?;
+        write!(out, "\x1b[0m")?;
+    } else {
+        out.write_all(bytes)?;
+    }
+    Ok(())
+}
+
+fn write_styled_display<W: Write, T: std::fmt::Display>(
+    out: &mut W,
+    value: T,
+    color: bool,
+    code: &str,
+) -> Result<()> {
+    if color {
+        write!(out, "\x1b[{code}m{value}\x1b[0m")?;
+    } else {
+        write!(out, "{value}")?;
+    }
     Ok(())
 }
 
