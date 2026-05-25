@@ -48,6 +48,15 @@ grep -q "$tmp/src/a.cc:2:needle here" <<<"$result"
 grep -q "$tmp/src/b.txt:1:Needle there" <<<"$result"
 ! grep -q 'c.bin' <<<"$result"
 ! grep -q 'out/d.cc' <<<"$result"
+mkdir -p "$tmp/src/sub"
+printf 'needle nested\n' > "$tmp/src/sub/nested.txt"
+./indexsearch update "$tmp" >/dev/null
+subdir_result="$(cd "$tmp/src/sub" && "$OLDPWD/indexsearch" --no-daemon -n -F needle)"
+[[ "$subdir_result" == 'nested.txt:1:needle nested' ]]
+subdir_dot_result="$(cd "$tmp/src/sub" && "$OLDPWD/indexsearch" --no-daemon -n -F needle .)"
+[[ "$subdir_dot_result" == './nested.txt:1:needle nested' ]]
+subdir_files="$(cd "$tmp/src/sub" && "$OLDPWD/indexsearch" --no-daemon --files)"
+[[ "$subdir_files" == 'nested.txt' ]]
 default_plain="$(./indexsearch -F needle "$tmp")"
 grep -q "$tmp/src/a.cc:needle here" <<<"$default_plain"
 ! grep -q "$tmp/src/a.cc:2:needle here" <<<"$default_plain"

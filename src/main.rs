@@ -139,6 +139,7 @@ struct Options {
     pattern: String,
     globs: Vec<String>,
     paths: Vec<String>,
+    cwd: PathBuf,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -2892,6 +2893,7 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
         daemon: true,
         line_number: stdout_supports_search_decoration(),
         max_filesize: DEFAULT_MAX_FILE_SIZE,
+        cwd: env::current_dir().unwrap_or_default(),
         ..Options::default()
     };
     let mut regexps = Vec::new();
@@ -3521,13 +3523,15 @@ fn write_segment_files<W: Write>(
     excluded_paths: &HashSet<String>,
     options: &Options,
 ) -> Result<()> {
+    let path_filter = PathFilter::new(options, &index.root)?;
     for id in 0..index.file_count {
         let path = bytes_to_string(index.file_path(id)?);
-        if excluded_paths.contains(&path) {
-            continue;
-        }
-        if path_allowed(options, &index.root, &path)? {
-            writeln!(out, "{path}")?;
+        if path_filter.allows(&path, excluded_paths) {
+            writeln!(
+                out,
+                "{}",
+                display_path_for_result(&index.root, &path, options)
+            )?;
         }
     }
     Ok(())
@@ -4604,7 +4608,7 @@ fn search_candidate_files(
         candidate_files(index, &alternatives)?
     };
     let candidates = chunk_bloom_filter_candidates(index, options, candidates)?;
-    if excluded_paths.is_empty() && options.paths.is_empty() && options.globs.is_empty() {
+    if excluded_paths.is_empty() && !has_path_restriction(options, &index.root) {
         return Ok(candidates);
     }
     let path_filter = PathFilter::new(options, &index.root)?;
@@ -4678,23 +4682,22 @@ fn execute_search_rendered(
         candidate_files(index, &alternatives)?
     };
     let candidates = chunk_bloom_filter_candidates(index, options, candidates)?;
-    let filtered =
-        if excluded_paths.is_empty() && options.paths.is_empty() && options.globs.is_empty() {
+    let filtered = if excluded_paths.is_empty() && !has_path_restriction(options, &index.root) {
+        candidates
+    } else {
+        let path_filter = PathFilter::new(options, &index.root)?;
+        if excluded_paths.is_empty() && path_filter.is_unrestricted() {
             candidates
         } else {
-            let path_filter = PathFilter::new(options, &index.root)?;
-            if excluded_paths.is_empty() && path_filter.is_unrestricted() {
-                candidates
-            } else {
-                candidates
-                    .into_iter()
-                    .filter_map(|id| {
-                        let path = bytes_to_string(index.file_path(id as usize).ok()?);
-                        path_filter.allows(&path, excluded_paths).then_some(id)
-                    })
-                    .collect()
-            }
-        };
+            candidates
+                .into_iter()
+                .filter_map(|id| {
+                    let path = bytes_to_string(index.file_path(id as usize).ok()?);
+                    path_filter.allows(&path, excluded_paths).then_some(id)
+                })
+                .collect()
+        }
+    };
     *searched += filtered.len() as u64;
 
     let matcher = QueryMatcher::new(options)?;
@@ -4777,7 +4780,7 @@ fn execute_search_rendered_chunks(
     }
 
     let filtered: Vec<(u32, Vec<usize>)> =
-        if excluded_paths.is_empty() && options.paths.is_empty() && options.globs.is_empty() {
+        if excluded_paths.is_empty() && !has_path_restriction(options, &index.root) {
             by_file.into_iter().collect()
         } else {
             let path_filter = PathFilter::new(options, &index.root)?;
@@ -7062,65 +7065,10 @@ fn build_path_matcher(options: &Options) -> Result<Option<(MatcherSet, MatcherSe
     )))
 }
 
-fn path_allowed(options: &Options, root: &Path, rel: &str) -> Result<bool> {
-    let matcher = build_path_matcher(options)?;
-    path_allowed_with_matcher(options, root, rel, matcher.as_ref())
-}
-
-fn path_allowed_with_matcher(
-    options: &Options,
-    root: &Path,
-    rel: &str,
-    matcher: Option<&(MatcherSet, MatcherSet)>,
-) -> Result<bool> {
-    if !options.paths.is_empty() {
-        let mut ok = false;
-        for raw in &options.paths {
-            let p = PathBuf::from(raw);
-            let abs = if p.is_absolute() { p } else { root.join(p) };
-            let abs = fs::canonicalize(&abs).unwrap_or(abs);
-            if let Ok(candidate) = abs.strip_prefix(root) {
-                let r = candidate.to_string_lossy().replace('\\', "/");
-                if r.is_empty() || rel == r || rel.starts_with(&(r + "/")) {
-                    ok = true;
-                    break;
-                }
-            }
-        }
-        if !ok {
-            return Ok(false);
-        }
-    }
-    if let Some((positive, negative)) = matcher {
-        if positive.set.is_some() && !positive.is_match(rel) {
-            return Ok(false);
-        }
-        if negative.is_match(rel) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
 impl PathFilter {
     fn new(options: &Options, root: &Path) -> Result<Self> {
         let matcher = build_path_matcher(options)?;
-        let mut prefixes = Vec::with_capacity(options.paths.len());
-        for raw in &options.paths {
-            let p = PathBuf::from(raw);
-            let abs = if p.is_absolute() { p } else { root.join(p) };
-            let abs = fs::canonicalize(&abs).unwrap_or(abs);
-            let prefix = abs
-                .strip_prefix(root)
-                .ok()
-                .map(|candidate| candidate.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_else(|| raw.replace('\\', "/"));
-            if prefix.is_empty() {
-                prefixes.clear();
-                break;
-            }
-            prefixes.push(prefix);
-        }
+        let prefixes = search_path_prefixes(options, root)?;
         Ok(Self { prefixes, matcher })
     }
 
@@ -7155,6 +7103,50 @@ impl PathFilter {
     }
 }
 
+fn has_path_restriction(options: &Options, root: &Path) -> bool {
+    !options.globs.is_empty()
+        || !options.paths.is_empty()
+        || implicit_cwd_prefix(options, root).is_some()
+}
+
+fn search_path_prefixes(options: &Options, root: &Path) -> Result<Vec<String>> {
+    if options.paths.is_empty() {
+        return Ok(implicit_cwd_prefix(options, root).into_iter().collect());
+    }
+    let mut prefixes = Vec::with_capacity(options.paths.len());
+    for raw in &options.paths {
+        let abs = resolve_search_path(options, raw);
+        let abs = fs::canonicalize(&abs).unwrap_or(abs);
+        let prefix = abs
+            .strip_prefix(root)
+            .ok()
+            .map(|candidate| candidate.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| raw.replace('\\', "/"));
+        if prefix.is_empty() {
+            return Ok(Vec::new());
+        }
+        prefixes.push(prefix);
+    }
+    Ok(prefixes)
+}
+
+fn implicit_cwd_prefix(options: &Options, root: &Path) -> Option<String> {
+    if options.cwd.as_os_str().is_empty() || options.cwd == root {
+        return None;
+    }
+    let rel = rel_path(root, &options.cwd)?;
+    (!rel.is_empty()).then_some(rel)
+}
+
+fn resolve_search_path(options: &Options, raw: &str) -> PathBuf {
+    let path = PathBuf::from(raw);
+    if path.is_absolute() || options.cwd.as_os_str().is_empty() {
+        path
+    } else {
+        options.cwd.join(path)
+    }
+}
+
 fn should_show_path(options: &Options) -> bool {
     if let Some(value) = options.with_filename {
         return value;
@@ -7166,10 +7158,22 @@ fn should_show_path(options: &Options) -> bool {
 }
 
 fn display_path_for_result(root: &Path, rel: &str, options: &Options) -> String {
+    if options.paths.is_empty() {
+        if let Some(prefix) = implicit_cwd_prefix(options, root) {
+            if rel == prefix {
+                return ".".to_string();
+            }
+            if let Some(rest) = rel.strip_prefix(&format!("{prefix}/")) {
+                return rest.to_string();
+            }
+        }
+        return rel.to_string();
+    }
     if options.paths.len() != 1 {
         return rel.to_string();
     }
     let raw = &options.paths[0];
+    let resolved = resolve_search_path(options, raw);
     let path = Path::new(raw);
     if path.is_file() {
         return rel.to_string();
@@ -7193,6 +7197,26 @@ fn display_path_for_result(root: &Path, rel: &str, options: &Options) -> String 
 
     let normalized = raw.replace('\\', "/");
     let trimmed = normalized.trim_end_matches('/');
+    let comparable_base = fs::canonicalize(&resolved).unwrap_or(resolved);
+    if let Some(prefix) = rel_path(root, &comparable_base) {
+        if prefix.is_empty() {
+            return if trimmed == "." {
+                format!("./{rel}")
+            } else {
+                format!("{trimmed}/{rel}")
+            };
+        }
+        if rel == prefix {
+            return trimmed.to_string();
+        }
+        if let Some(rest) = rel.strip_prefix(&format!("{prefix}/")) {
+            return if trimmed == "." {
+                format!("./{rest}")
+            } else {
+                format!("{trimmed}/{rest}")
+            };
+        }
+    }
     if trimmed == "." {
         return format!("./{rel}");
     }
