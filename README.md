@@ -269,7 +269,8 @@ artifacts are still produced.
 ## License
 
 IndexSearch is distributed under the terms of both the MIT license and the
-Apache License 2.0. You may choose either license.
+Apache License 2.0. You may choose either license; see `LICENSE-MIT` and
+`LICENSE-APACHE`.
 
 The references to ripgrep and qgrep in this repository are compatibility and
 benchmark references only; their source code is not vendored into IndexSearch.
