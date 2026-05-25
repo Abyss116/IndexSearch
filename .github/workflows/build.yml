@@ -181,9 +181,13 @@ jobs:
             end
 
             def install
-              artifact = Dir["indexsearch-*"].find { |entry| File.directory?(entry) }
-              odie "IndexSearch archive layout changed" if artifact.nil?
-              cd artifact do
+              payload = if File.exist?("indexsearch")
+                "."
+              else
+                Dir["indexsearch-*"].find { |entry| File.directory?(entry) }
+              end
+              odie "IndexSearch archive layout changed" if payload.nil?
+              cd payload do
                 bin.install "indexsearch"
                 bin.install_symlink "indexsearch" => "is"
                 pkgshare.install "skills" if Dir.exist?("skills")
