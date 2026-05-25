@@ -1,5 +1,8 @@
 # IndexSearch
 
+[![Build](https://github.com/Abyss116/IndexSearch/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/Abyss116/IndexSearch/actions/workflows/build.yml?query=branch%3Amain)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 IndexSearch is a Rust command line search tool for very large source trees. It
 keeps a persistent binary trigram index plus stored text snapshots, so repeated
 searches avoid walking the filesystem. The CLI intentionally follows common
