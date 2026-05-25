@@ -235,10 +235,11 @@ also create a GitHub Release with platform archives.
 
 ## Supported rg-like Flags
 
-Normal search output defaults to `path:line:match`, matching `rg`'s line-number
-behavior. Use `-N`/`--no-line-number` to suppress line numbers. ANSI colors are
-enabled automatically for terminals and can be controlled with
-`--color auto|always|never`.
+Normal search output defaults to rg-style headings: each matching file is printed
+once, followed by `line:match` rows, with a blank line between files. Use
+`--no-heading` to print `path:line:match` on every matching line. Use
+`-N`/`--no-line-number` to suppress line numbers. ANSI colors are enabled
+automatically for terminals and can be controlled with `--color auto|always|never`.
 
 - `-i`, `--ignore-case`
 - `-s`, `--case-sensitive`
@@ -252,6 +253,8 @@ enabled automatically for terminals and can be controlled with
 - `--column`
 - `-H`, `--with-filename`
 - `-I`, `--no-filename`
+- `--heading`
+- `--no-heading`
 - `-l`, `--files-with-matches`
 - `-c`, `--count`
 - `-o`, `--only-matching`

@@ -106,6 +106,7 @@ struct Options {
     line_number: bool,
     column: bool,
     with_filename: Option<bool>,
+    heading: Option<bool>,
     files_with_matches: bool,
     count: bool,
     files: bool,
@@ -567,6 +568,12 @@ fn print_help() {
     help_option(&style, "--column", "show columns");
     help_option(&style, "-H, --with-filename", "always show file names");
     help_option(&style, "-I, --no-filename", "never show file names");
+    help_option(&style, "--heading", "group matches under file headings");
+    help_option(
+        &style,
+        "--no-heading",
+        "print file name on each matching line",
+    );
     help_option(
         &style,
         "-l, --files-with-matches",
@@ -802,6 +809,12 @@ fn print_search_help() {
     help_option(&style, "--column", "show columns");
     help_option(&style, "-H, --with-filename", "always show file names");
     help_option(&style, "-I, --no-filename", "never show file names");
+    help_option(&style, "--heading", "group matches under file headings");
+    help_option(
+        &style,
+        "--no-heading",
+        "print file name on each matching line",
+    );
     help_option(
         &style,
         "-l, --files-with-matches",
@@ -2020,7 +2033,7 @@ fn search_with_index_output(index: &MappedIndex, options: &Options) -> Result<Se
     };
     let mut stdout = Vec::new();
     if !options.quiet {
-        write_rendered_results(&mut stdout, &results)?;
+        write_rendered_results(&mut stdout, &results, options)?;
     }
     if let Some(output_timer) = output_timer {
         profile.record("search_collect_stdout", output_timer.elapsed());
@@ -2423,6 +2436,8 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
             "--column" => options.column = true,
             "-H" | "--with-filename" => options.with_filename = Some(true),
             "-I" | "--no-filename" => options.with_filename = Some(false),
+            "--heading" => options.heading = Some(true),
+            "--no-heading" => options.heading = Some(false),
             "-l" | "--files-with-matches" => options.files_with_matches = true,
             "-c" | "--count" => options.count = true,
             "-o" | "--only-matching" => options.only_matching = true,
@@ -2443,7 +2458,7 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
                 options.git_untracked = true;
             }
             "--" => positional_only = true,
-            "--no-heading" | "--no-messages" | "--no-ignore" | "--no-ignore-vcs" => {}
+            "--no-messages" | "--no-ignore" | "--no-ignore-vcs" => {}
             "--colors" | "--sort" | "--sortr" | "-j" | "--threads" => {
                 let _ = need_value(arg)?;
             }
@@ -4902,6 +4917,8 @@ fn search_fixed_rendered(
         }
         match_count += 1;
         if !options.count && !options.files_with_matches {
+            let match_show_path =
+                prepare_match_render(&mut output, path, options, show_path, &mut path_written)?;
             render_match_to(
                 &mut output,
                 path,
@@ -4910,7 +4927,7 @@ fn search_fixed_rendered(
                 cursor.line(),
                 &content[start..end],
                 options,
-                show_path,
+                match_show_path,
             )?;
         } else if options.files_with_matches && !path_written {
             writeln!(output, "{path}")?;
@@ -5029,6 +5046,8 @@ fn search_word_prefix_rendered(
         }
         match_count += 1;
         if !options.count && !options.files_with_matches {
+            let match_show_path =
+                prepare_match_render(&mut output, path, options, show_path, &mut path_written)?;
             render_match_to(
                 &mut output,
                 path,
@@ -5037,7 +5056,7 @@ fn search_word_prefix_rendered(
                 cursor.line(),
                 &content[start..end],
                 options,
-                show_path,
+                match_show_path,
             )?;
         } else if options.files_with_matches && !path_written {
             writeln!(output, "{path}")?;
@@ -5073,6 +5092,8 @@ fn search_literal_set_rendered(
         }
         match_count += 1;
         if !options.count && !options.files_with_matches {
+            let match_show_path =
+                prepare_match_render(&mut output, path, options, show_path, &mut path_written)?;
             render_match_to(
                 &mut output,
                 path,
@@ -5081,7 +5102,7 @@ fn search_literal_set_rendered(
                 cursor.line(),
                 &content[start..found.end()],
                 options,
-                show_path,
+                match_show_path,
             )?;
         } else if options.files_with_matches && !path_written {
             writeln!(output, "{path}")?;
@@ -5142,6 +5163,8 @@ fn search_ordered_literals_rendered(
 
         match_count += 1;
         if !options.count && !options.files_with_matches {
+            let match_show_path =
+                prepare_match_render(&mut output, path, options, show_path, &mut path_written)?;
             render_match_to(
                 &mut output,
                 path,
@@ -5150,7 +5173,7 @@ fn search_ordered_literals_rendered(
                 line,
                 &line[first_start..last_end.min(line.len())],
                 options,
-                show_path,
+                match_show_path,
             )?;
         } else if options.files_with_matches && !path_written {
             writeln!(output, "{path}")?;
@@ -5194,6 +5217,8 @@ fn search_ordered_wordspan_rendered(
         {
             match_count += 1;
             if !options.count && !options.files_with_matches {
+                let match_show_path =
+                    prepare_match_render(&mut output, path, options, show_path, &mut path_written)?;
                 render_match_to(
                     &mut output,
                     path,
@@ -5202,7 +5227,7 @@ fn search_ordered_wordspan_rendered(
                     line,
                     &line[match_start..match_end.min(line.len())],
                     options,
-                    show_path,
+                    match_show_path,
                 )?;
             } else if options.files_with_matches && !path_written {
                 writeln!(output, "{path}")?;
@@ -5418,6 +5443,8 @@ fn search_qualified_call_rendered(
             if line.ends_with(b"\r") {
                 line = &line[..line.len() - 1];
             }
+            let match_show_path =
+                prepare_match_render(&mut output, path, options, show_path, &mut path_written)?;
             render_match_to(
                 &mut output,
                 path,
@@ -5426,7 +5453,7 @@ fn search_qualified_call_rendered(
                 line,
                 &content[class_start..=method_end],
                 options,
-                show_path,
+                match_show_path,
             )?;
         } else if options.files_with_matches && !path_written {
             writeln!(output, "{path}")?;
@@ -6162,12 +6189,53 @@ fn render_file_result(
         writeln!(out, "{}", matches.len())?;
         return Ok(out);
     }
+    let grouped = grouped_heading_output(options, show_path);
+    if grouped {
+        render_file_heading(&mut out, path, options)?;
+    }
     for m in matches {
         render_match_to(
-            &mut out, path, m.line_no, m.column, &m.line, &m.matched, options, show_path,
+            &mut out,
+            path,
+            m.line_no,
+            m.column,
+            &m.line,
+            &m.matched,
+            options,
+            show_path && !grouped,
         )?;
     }
     Ok(out)
+}
+
+fn grouped_heading_output(options: &Options, show_path: bool) -> bool {
+    show_path
+        && options.heading.unwrap_or(true)
+        && !options.json
+        && !options.vimgrep
+        && !options.count
+        && !options.files_with_matches
+}
+
+fn prepare_match_render<W: Write>(
+    out: &mut W,
+    path: &str,
+    options: &Options,
+    show_path: bool,
+    heading_written: &mut bool,
+) -> Result<bool> {
+    let grouped = grouped_heading_output(options, show_path);
+    if grouped && !*heading_written {
+        render_file_heading(out, path, options)?;
+        *heading_written = true;
+    }
+    Ok(show_path && !grouped)
+}
+
+fn render_file_heading<W: Write>(out: &mut W, path: &str, options: &Options) -> Result<()> {
+    write_styled(out, path.as_bytes(), options.color.enabled(), "35")?;
+    writeln!(out)?;
+    Ok(())
 }
 
 fn render_match_to<W: Write>(
@@ -6264,8 +6332,16 @@ fn write_styled_display<W: Write, T: std::fmt::Display>(
     Ok(())
 }
 
-fn write_rendered_results<W: Write>(out: &mut W, results: &[RenderedFileResult]) -> Result<()> {
-    for result in results {
+fn write_rendered_results<W: Write>(
+    out: &mut W,
+    results: &[RenderedFileResult],
+    options: &Options,
+) -> Result<()> {
+    let separated = grouped_heading_output(options, should_show_path(options));
+    for (idx, result) in results.iter().enumerate() {
+        if separated && idx != 0 {
+            writeln!(out)?;
+        }
         out.write_all(&result.output)?;
     }
     Ok(())
