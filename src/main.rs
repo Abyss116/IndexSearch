@@ -105,6 +105,8 @@ struct Options {
     whole_word: bool,
     line_number: bool,
     column: bool,
+    before_context: usize,
+    after_context: usize,
     with_filename: Option<bool>,
     heading: Option<bool>,
     files_with_matches: bool,
@@ -567,6 +569,21 @@ fn print_help() {
     help_option(&style, "-n, --line-number", "show line numbers");
     help_option(&style, "-N, --no-line-number", "suppress line numbers");
     help_option(&style, "--column", "show columns");
+    help_option(
+        &style,
+        "-A, --after-context NUM",
+        "show NUM lines after each match",
+    );
+    help_option(
+        &style,
+        "-B, --before-context NUM",
+        "show NUM lines before each match",
+    );
+    help_option(
+        &style,
+        "-C, --context NUM",
+        "show NUM lines before and after each match",
+    );
     help_option(&style, "-H, --with-filename", "always show file names");
     help_option(&style, "-I, --no-filename", "never show file names");
     help_option(&style, "--heading", "group matches under file headings");
@@ -808,6 +825,21 @@ fn print_search_help() {
     help_option(&style, "-n, --line-number", "show line numbers");
     help_option(&style, "-N, --no-line-number", "suppress line numbers");
     help_option(&style, "--column", "show columns");
+    help_option(
+        &style,
+        "-A, --after-context NUM",
+        "show NUM lines after each match",
+    );
+    help_option(
+        &style,
+        "-B, --before-context NUM",
+        "show NUM lines before each match",
+    );
+    help_option(
+        &style,
+        "-C, --context NUM",
+        "show NUM lines before and after each match",
+    );
     help_option(&style, "-H, --with-filename", "always show file names");
     help_option(&style, "-I, --no-filename", "never show file names");
     help_option(&style, "--heading", "group matches under file headings");
@@ -2469,6 +2501,17 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
             "-n" | "--line-number" => options.line_number = true,
             "-N" | "--no-line-number" => options.line_number = false,
             "--column" => options.column = true,
+            "-A" | "--after-context" => {
+                options.after_context = parse_context_count(&need_value(arg)?)?
+            }
+            "-B" | "--before-context" => {
+                options.before_context = parse_context_count(&need_value(arg)?)?
+            }
+            "-C" | "--context" => {
+                let value = parse_context_count(&need_value(arg)?)?;
+                options.before_context = value;
+                options.after_context = value;
+            }
             "-H" | "--with-filename" => options.with_filename = Some(true),
             "-I" | "--no-filename" => options.with_filename = Some(false),
             "--heading" => options.heading = Some(true),
@@ -2505,6 +2548,40 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
                         .map(|(_, value)| value)
                         .unwrap_or_default(),
                 )?
+            }
+            _ if arg.starts_with("--after-context=") => {
+                options.after_context = parse_context_count(
+                    arg.split_once('=')
+                        .map(|(_, value)| value)
+                        .unwrap_or_default(),
+                )?
+            }
+            _ if arg.starts_with("--before-context=") => {
+                options.before_context = parse_context_count(
+                    arg.split_once('=')
+                        .map(|(_, value)| value)
+                        .unwrap_or_default(),
+                )?
+            }
+            _ if arg.starts_with("--context=") => {
+                let value = parse_context_count(
+                    arg.split_once('=')
+                        .map(|(_, value)| value)
+                        .unwrap_or_default(),
+                )?;
+                options.before_context = value;
+                options.after_context = value;
+            }
+            _ if arg.starts_with("-A") && arg.len() > 2 => {
+                options.after_context = parse_context_count(&arg[2..])?
+            }
+            _ if arg.starts_with("-B") && arg.len() > 2 => {
+                options.before_context = parse_context_count(&arg[2..])?
+            }
+            _ if arg.starts_with("-C") && arg.len() > 2 => {
+                let value = parse_context_count(&arg[2..])?;
+                options.before_context = value;
+                options.after_context = value;
             }
             _ if arg.starts_with("--sort=") || arg.starts_with("--sortr=") => {}
             _ if arg.starts_with('-') => bail!("unsupported option: {arg}"),
@@ -2556,6 +2633,12 @@ fn parse_color_choice(value: &str) -> Result<ColorChoice> {
         "never" => Ok(ColorChoice::Never),
         _ => bail!("unsupported color mode: {value}"),
     }
+}
+
+fn parse_context_count(value: &str) -> Result<usize> {
+    value
+        .parse()
+        .with_context(|| format!("invalid context line count: {value}"))
 }
 
 fn load_config(start: &Path) -> Result<ProjectConfig> {
@@ -4412,6 +4495,19 @@ impl QueryMatcher {
         options: &Options,
         show_path: bool,
     ) -> Result<Option<RenderedFileResult>> {
+        if context_requested(options) && !options.json && !options.vimgrep {
+            let matches = self.search_file(content, options);
+            if matches.is_empty() {
+                return Ok(None);
+            }
+            let output =
+                render_file_result_with_content(path, content, &matches, options, show_path)?;
+            return Ok(Some(RenderedFileResult {
+                path: path.to_string(),
+                output,
+                match_count: matches.len(),
+            }));
+        }
         if let QueryMatcher::Fixed {
             needle,
             finder,
@@ -6249,6 +6345,111 @@ fn render_file_result(
     Ok(out)
 }
 
+fn render_file_result_with_content(
+    path: &str,
+    content: &[u8],
+    matches: &[MatchLine],
+    options: &Options,
+    show_path: bool,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    if options.files_with_matches {
+        writeln!(out, "{path}")?;
+        return Ok(out);
+    }
+    if options.count {
+        if show_path {
+            write!(out, "{path}:")?;
+        }
+        writeln!(out, "{}", matches.len())?;
+        return Ok(out);
+    }
+    if matches.is_empty() {
+        return Ok(out);
+    }
+
+    let lines = file_lines(content);
+    let grouped = grouped_heading_output(options, show_path);
+    if grouped {
+        render_file_heading(&mut out, path, options)?;
+    }
+
+    let ranges = context_ranges(matches, lines.len(), options);
+    let mut match_idx = 0usize;
+    for (range_idx, (start, end)) in ranges.into_iter().enumerate() {
+        if range_idx != 0 {
+            writeln!(out, "--")?;
+        }
+        for line_no in start..=end {
+            while match_idx < matches.len() && matches[match_idx].line_no < line_no {
+                match_idx += 1;
+            }
+            if matches
+                .get(match_idx)
+                .is_some_and(|matched| matched.line_no == line_no)
+            {
+                let matched = &matches[match_idx];
+                render_match_to(
+                    &mut out,
+                    path,
+                    matched.line_no,
+                    matched.column,
+                    &matched.line,
+                    &matched.matched,
+                    options,
+                    show_path && !grouped,
+                )?;
+            } else if let Some(line) = lines.get(line_no.saturating_sub(1)) {
+                render_context_line_to(
+                    &mut out,
+                    path,
+                    line_no,
+                    line,
+                    options,
+                    show_path && !grouped,
+                )?;
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn context_requested(options: &Options) -> bool {
+    options.before_context != 0 || options.after_context != 0
+}
+
+fn context_ranges(
+    matches: &[MatchLine],
+    line_count: usize,
+    options: &Options,
+) -> Vec<(usize, usize)> {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for m in matches {
+        let start = m.line_no.saturating_sub(options.before_context).max(1);
+        let end = (m.line_no + options.after_context).min(line_count);
+        if let Some((_, prev_end)) = ranges.last_mut() {
+            if start <= *prev_end + 1 {
+                *prev_end = (*prev_end).max(end);
+                continue;
+            }
+        }
+        ranges.push((start, end));
+    }
+    ranges
+}
+
+fn file_lines(content: &[u8]) -> Vec<&[u8]> {
+    let mut lines = Vec::new();
+    for line in content.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        lines.push(line);
+    }
+    if content.ends_with(b"\n") {
+        lines.pop();
+    }
+    lines
+}
+
 fn grouped_heading_output(options: &Options, show_path: bool) -> bool {
     show_path
         && options
@@ -6328,6 +6529,28 @@ fn render_match_to<W: Write>(
     } else {
         write_line_with_match(out, line, column.saturating_sub(1), matched.len(), color)?;
     }
+    writeln!(out)?;
+    Ok(())
+}
+
+fn render_context_line_to<W: Write>(
+    out: &mut W,
+    path: &str,
+    line_no: usize,
+    line: &[u8],
+    options: &Options,
+    show_path: bool,
+) -> Result<()> {
+    let color = options.color.enabled();
+    if show_path {
+        write_styled(out, path.as_bytes(), color, "35")?;
+        write!(out, "-")?;
+    }
+    if options.line_number {
+        write_styled_display(out, line_no, color, "32")?;
+        write!(out, "-")?;
+    }
+    out.write_all(line)?;
     writeln!(out)?;
     Ok(())
 }

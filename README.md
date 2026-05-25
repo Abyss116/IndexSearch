@@ -252,6 +252,9 @@ can be controlled with `--color auto|always|never`.
 - `-n`, `--line-number`
 - `-N`, `--no-line-number`
 - `--column`
+- `-A NUM`, `--after-context NUM`
+- `-B NUM`, `--before-context NUM`
+- `-C NUM`, `--context NUM`
 - `-H`, `--with-filename`
 - `-I`, `--no-filename`
 - `--heading`

@@ -16,8 +16,7 @@ IndexSearch keeps a persistent trigram index and presents an rg-like CLI.
   supported by IndexSearch, or when the target tree is small enough that indexing
   overhead is not useful.
 - Treat `is` as rg-like, not a full `rg` clone. Use it for the supported common
-  flags below; use `rg` for context output (`-A`, `-B`, `-C`), PCRE-specific
-  behavior, or any unsupported flag.
+  flags below; use `rg` for PCRE-specific behavior or any unsupported flag.
 
 Quick check:
 
@@ -42,6 +41,7 @@ is -n "SomeSymbol" .
 is -i -w -g "*.cpp" "render pass" .
 is --files -g "*.Build.cs" .
 is --color=always "SomeSymbol" .
+is -n -C 3 "SomeSymbol" .
 is --auto-update -n "SomeSymbol" .
 is -- "status" .
 ```
@@ -84,8 +84,9 @@ object files, and debug artifacts.
 - Normal text output follows rg-like auto decoration: terminal output uses file
   headings and line numbers, while captured output uses `path:match` or
   `path:line:match` with `-n`.
+- Context output supports `-A`, `-B`, and `-C` with rg-like `:`/`-` separators.
 - Color mode supports `--color=auto`, `--color=always`, and `--color=never`.
 - Prefer `is` only for the supported subset of rg-like flags; fall back to `rg`
-  for unsupported flags or context output.
+  for unsupported flags.
 - Use `is` in examples and command suggestions unless explaining installation.
 - Mention `rg` fallback only when IndexSearch cannot satisfy the query.
