@@ -37,14 +37,15 @@ Direct downloads:
 Continuous builds are available from the
 [GitHub Actions build workflow](https://github.com/Abyss116/IndexSearch/actions/workflows/build.yml).
 
-After extracting an archive:
+After extracting a direct-download archive, you can copy the extracted binary
+into a user-writable bin directory:
 
 ```bash
 ./indexsearch install
 ```
 
-This installs `indexsearch` and the short `is` alias into `~/.local/bin` on
-macOS/Linux or `%USERPROFILE%\.local\bin` on Windows. Use
+This self-copy install puts `indexsearch` and the short `is` alias into
+`~/.local/bin` on macOS/Linux or `%USERPROFILE%\.local\bin` on Windows. Use
 `indexsearch install --dir PATH` to override the install directory. Package
 manager installs already put `indexsearch` and `is` on PATH and do not need
 this step.
@@ -241,7 +242,6 @@ Requirements:
 cargo build --release
 cargo test --locked
 ./target/release/indexsearch --version
-./target/release/indexsearch install
 ./target/release/indexsearch install-skills --help
 ```
 
@@ -323,6 +323,10 @@ is install-skills [OPTIONS]
 is status [PATH]
 is search [OPTIONS] PATTERN [PATH ...]
 ```
+
+`is install` is only for self-copy installs from a direct-download archive or a
+local source build. Homebrew and WinGet installs already expose `indexsearch`
+and `is` through their normal command locations.
 
 The explicit `search` subcommand is optional. `is PATTERN` searches directly,
 like `rg PATTERN`. If the pattern is also an IndexSearch command name such as

@@ -563,7 +563,7 @@ fn print_help() {
     help_command(
         &style,
         "install [--dir PATH]",
-        "install indexsearch and the is alias",
+        "copy this executable and the is alias into a user bin dir",
     );
     help_command(
         &style,
@@ -807,13 +807,13 @@ fn print_install_help() {
         &style,
         "install",
         "[OPTIONS] [DIR]",
-        "install indexsearch and the is alias",
+        "copy this executable and the is alias into a user bin dir",
     );
     help_section(&style, "Options");
     help_option(
         &style,
         "--dir PATH",
-        "install into PATH instead of the user bin directory",
+        "copy into PATH instead of the default user bin directory",
     );
 }
 
