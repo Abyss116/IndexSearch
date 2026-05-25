@@ -197,10 +197,16 @@ skills_home="$(mktemp -d)"
 skills_project="$(mktemp -d)"
 trap 'rm -rf "$tmp" "$git_tmp" "$watch_tmp" "$install_tmp" "$skills_home" "$skills_project"' EXIT
 ./indexsearch install --dir "$install_tmp" >/dev/null
-"$install_tmp/indexsearch" --version >/dev/null
-"$install_tmp/is" --version >/dev/null
+install_exe="$install_tmp/indexsearch"
+install_alias="$install_tmp/is"
+if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* ]]; then
+  install_exe="$install_exe.exe"
+  install_alias="$install_alias.exe"
+fi
+"$install_exe" --version >/dev/null
+"$install_alias" --version >/dev/null
 if [[ "$(uname -s)" != MINGW* && "$(uname -s)" != MSYS* ]]; then
-  [[ -L "$install_tmp/is" ]]
+  [[ -L "$install_alias" ]]
 fi
 HOME="$skills_home" ./indexsearch install-skills --target all --scope user >/dev/null
 [[ -f "$skills_home/.codex/skills/indexsearch/SKILL.md" ]]

@@ -1515,12 +1515,15 @@ fn command_install(args: &[String]) -> Result<i32> {
     let src = env::current_exe()?;
     let exe_name = executable_name("indexsearch");
     let exe_path = dir.join(exe_name);
-    let alias_path = if cfg!(windows) {
-        dir.join("is.cmd")
-    } else {
-        dir.join("is")
-    };
+    let alias_path = dir.join(executable_name("is"));
     install_executable(&src, &exe_path)?;
+    #[cfg(windows)]
+    {
+        let legacy_alias_path = dir.join("is.cmd");
+        if legacy_alias_path != alias_path && legacy_alias_path.exists() {
+            let _ = fs::remove_file(&legacy_alias_path);
+        }
+    }
     install_alias(&exe_path, &alias_path)?;
     println!("installed: {}", exe_path.display());
     println!("alias: {}", alias_path.display());
@@ -7634,11 +7637,7 @@ fn install_alias(exe_path: &Path, alias_path: &Path) -> Result<()> {
     }
     #[cfg(windows)]
     {
-        let target = exe_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("indexsearch.exe");
-        fs::write(alias_path, format!("@echo off\r\n\"%~dp0{target}\" %*\r\n"))?;
+        install_executable(exe_path, alias_path)?;
     }
     Ok(())
 }

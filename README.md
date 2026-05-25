@@ -48,7 +48,9 @@ This self-copy install puts `indexsearch` and the short `is` alias into
 `~/.local/bin` on macOS/Linux or `%USERPROFILE%\.local\bin` on Windows. Use
 `indexsearch install --dir PATH` to override the install directory. Package
 manager installs already put `indexsearch` and `is` on PATH and do not need
-this step.
+this step. On Windows the alias is a native `is.exe`, not an `is.cmd` wrapper,
+so PowerShell metacharacters inside quoted patterns are not re-parsed by
+`cmd.exe`.
 
 ## Quick Start
 
