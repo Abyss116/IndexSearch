@@ -3705,14 +3705,11 @@ fn write_segment_files<W: Write>(
     options: &Options,
 ) -> Result<()> {
     let path_filter = PathFilter::new(options, &index.root)?;
+    let display_path = DisplayPathMapper::new(&index.root, options);
     for id in 0..index.file_count {
         let path = bytes_to_string(index.file_path(id)?);
         if path_filter.allows(&path, excluded_paths) {
-            writeln!(
-                out,
-                "{}",
-                display_path_for_result(&index.root, &path, options)
-            )?;
+            writeln!(out, "{}", display_path.display(&path))?;
         }
     }
     Ok(())
@@ -4901,13 +4898,14 @@ fn execute_search_rendered(
 
     let matcher = QueryMatcher::new(options)?;
     let show_path = should_show_path(options);
+    let display_path = DisplayPathMapper::new(&index.root, options);
     let mut results: Vec<(usize, RenderedFileResult)> = filtered
         .par_iter()
         .enumerate()
         .map_init(Vec::new, |scratch, (ordinal, id)| {
             let (path_bytes, content) = index.file_for_search(*id as usize, scratch).ok()?;
             let rel_path = bytes_to_string(path_bytes);
-            let path = display_path_for_result(&index.root, &rel_path, options);
+            let path = display_path.display(&rel_path);
             let rendered = matcher
                 .search_file_rendered(content, &path, options, show_path)
                 .ok()??;
@@ -5001,12 +4999,13 @@ fn execute_search_rendered_chunks(
 
     let matcher = QueryMatcher::new(options)?;
     let show_path = should_show_path(options);
+    let display_path = DisplayPathMapper::new(&index.root, options);
     let mut results: Vec<(u32, RenderedFileResult)> = filtered
         .par_iter()
         .map_init(Vec::new, |scratch, (file_id, chunks)| {
             let (path_bytes, content) = index.file_for_search(*file_id as usize, scratch).ok()?;
             let rel_path = bytes_to_string(path_bytes);
-            let path = display_path_for_result(&index.root, &rel_path, options);
+            let path = display_path.display(&rel_path);
             let rendered = matcher
                 .search_file_rendered(content, &path, options, show_path)
                 .ok()??;
@@ -7369,78 +7368,162 @@ fn should_show_path(options: &Options) -> bool {
     true
 }
 
-fn display_path_for_result(root: &Path, rel: &str, options: &Options) -> String {
-    if options.paths.is_empty() {
-        if let Some(prefix) = implicit_cwd_prefix(options, root) {
-            if rel == prefix {
-                return ".".to_string();
-            }
-            if let Some(rest) = rel.strip_prefix(&format!("{prefix}/")) {
-                return rest.to_string();
-            }
+#[derive(Clone)]
+struct DisplayPathMapper {
+    mode: DisplayPathMode,
+}
+
+#[derive(Clone)]
+enum DisplayPathMode {
+    Identity,
+    ImplicitCwd {
+        prefix: String,
+        prefix_slash: String,
+    },
+    Absolute {
+        root: PathBuf,
+        display_base: PathBuf,
+        prefix: Option<String>,
+        prefix_slash: Option<String>,
+    },
+    Relative {
+        trimmed: String,
+        prefix: Option<String>,
+        prefix_slash: Option<String>,
+    },
+}
+
+impl DisplayPathMapper {
+    fn new(root: &Path, options: &Options) -> Self {
+        if options.paths.is_empty() {
+            return implicit_cwd_prefix(options, root)
+                .map(|prefix| Self {
+                    mode: DisplayPathMode::ImplicitCwd {
+                        prefix_slash: format!("{prefix}/"),
+                        prefix,
+                    },
+                })
+                .unwrap_or_else(Self::identity);
         }
-        return rel.to_string();
-    }
-    if options.paths.len() != 1 {
-        return rel.to_string();
-    }
-    let raw = &options.paths[0];
-    let resolved = resolve_search_path(options, raw);
-    let path = Path::new(raw);
-    if path.is_file() {
-        return rel.to_string();
-    }
-    if path.is_absolute() {
-        let display_base = path.to_path_buf();
-        let comparable_base = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        if let Some(prefix) = rel_path(root, &comparable_base) {
-            if prefix.is_empty() {
-                return slash_path(display_base.join(rel));
-            }
-            if rel == prefix {
-                return slash_path(display_base);
-            }
-            if let Some(rest) = rel.strip_prefix(&(prefix + "/")) {
-                return slash_path(display_base.join(rest));
-            }
+        if options.paths.len() != 1 {
+            return Self::identity();
         }
-        return slash_path(root.join(rel));
+
+        let raw = &options.paths[0];
+        let resolved = resolve_search_path(options, raw);
+        let path = Path::new(raw);
+        if path.is_file() {
+            return Self::identity();
+        }
+        if path.is_absolute() {
+            let comparable_base = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let prefix = rel_path(root, &comparable_base);
+            return Self {
+                mode: DisplayPathMode::Absolute {
+                    root: root.to_path_buf(),
+                    display_base: path.to_path_buf(),
+                    prefix_slash: prefix.as_ref().map(|prefix| format!("{prefix}/")),
+                    prefix,
+                },
+            };
+        }
+
+        let normalized = raw.replace('\\', "/");
+        let trimmed = normalized.trim_end_matches('/').to_string();
+        let comparable_base = fs::canonicalize(&resolved).unwrap_or(resolved);
+        let prefix = rel_path(root, &comparable_base);
+        Self {
+            mode: DisplayPathMode::Relative {
+                trimmed,
+                prefix_slash: prefix.as_ref().map(|prefix| format!("{prefix}/")),
+                prefix,
+            },
+        }
     }
 
-    let normalized = raw.replace('\\', "/");
-    let trimmed = normalized.trim_end_matches('/');
-    let comparable_base = fs::canonicalize(&resolved).unwrap_or(resolved);
-    if let Some(prefix) = rel_path(root, &comparable_base) {
-        if prefix.is_empty() {
-            return if trimmed == "." {
-                format!("./{rel}")
-            } else {
-                format!("{trimmed}/{rel}")
-            };
-        }
-        if rel == prefix {
-            return trimmed.to_string();
-        }
-        if let Some(rest) = rel.strip_prefix(&format!("{prefix}/")) {
-            return if trimmed == "." {
-                format!("./{rest}")
-            } else {
-                format!("{trimmed}/{rest}")
-            };
+    fn identity() -> Self {
+        Self {
+            mode: DisplayPathMode::Identity,
         }
     }
-    if trimmed == "." {
-        return format!("./{rel}");
-    }
-    if let Some(prefix) = trimmed.strip_prefix("./") {
-        if rel == prefix {
-            return trimmed.to_string();
+
+    fn display(&self, rel: &str) -> String {
+        match &self.mode {
+            DisplayPathMode::Identity => rel.to_string(),
+            DisplayPathMode::ImplicitCwd {
+                prefix,
+                prefix_slash,
+            } => {
+                if rel == prefix {
+                    ".".to_string()
+                } else if let Some(rest) = rel.strip_prefix(prefix_slash) {
+                    rest.to_string()
+                } else {
+                    rel.to_string()
+                }
+            }
+            DisplayPathMode::Absolute {
+                root,
+                display_base,
+                prefix,
+                prefix_slash,
+            } => {
+                if prefix.as_deref() == Some("") {
+                    return slash_path(display_base.join(rel));
+                }
+                if let Some(prefix) = prefix {
+                    if rel == prefix {
+                        return slash_path(display_base.clone());
+                    }
+                    if let Some(prefix_slash) = prefix_slash {
+                        if let Some(rest) = rel.strip_prefix(prefix_slash) {
+                            return slash_path(display_base.join(rest));
+                        }
+                    }
+                }
+                slash_path(root.join(rel))
+            }
+            DisplayPathMode::Relative {
+                trimmed,
+                prefix,
+                prefix_slash,
+            } => {
+                if prefix.as_deref() == Some("") {
+                    return if trimmed == "." {
+                        format!("./{rel}")
+                    } else {
+                        format!("{trimmed}/{rel}")
+                    };
+                }
+                if let Some(prefix) = prefix {
+                    if rel == prefix {
+                        return trimmed.clone();
+                    }
+                    if let Some(prefix_slash) = prefix_slash {
+                        if let Some(rest) = rel.strip_prefix(prefix_slash) {
+                            return if trimmed == "." {
+                                format!("./{rest}")
+                            } else {
+                                format!("{trimmed}/{rest}")
+                            };
+                        }
+                    }
+                }
+                if trimmed == "." {
+                    return format!("./{rel}");
+                }
+                if let Some(prefix) = trimmed.strip_prefix("./") {
+                    if rel == prefix {
+                        return trimmed.clone();
+                    }
+                    if let Some(rest) = rel.strip_prefix(&format!("{prefix}/")) {
+                        return format!("{trimmed}/{rest}");
+                    }
+                }
+                rel.to_string()
+            }
         }
-        if let Some(rest) = rel.strip_prefix(&format!("{prefix}/")) {
-            return format!("{trimmed}/{rest}");
-        }
     }
-    rel.to_string()
 }
 
 fn slash_path(path: PathBuf) -> String {

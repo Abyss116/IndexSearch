@@ -241,15 +241,15 @@ stdout redirected to `/dev/null`.
 
 | Workload | Pattern | Matches `is/qgrep/rg` | `is` | qgrep | `rg` | `is` vs qgrep |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Literal: common token | `Nanite` | 14664 / 14672 / 13013 | 6.70ms | 17.57ms | 2977.62ms | 2.6x |
-| Literal: long symbol | `SkeletalMeshComponent` | 7606 / 7593 / 7605 | 7.20ms | 16.81ms | 3124.14ms | 2.3x |
-| Literal: missing | `DefinitelyMissingIndexSearchNeedle` | 0 / 0 / 0 | 2.73ms | 11.29ms | 3067.72ms | 4.1x |
-| Case-insensitive literal | `skeletalmeshcomponent` | 7616 / 7603 / 7615 | 7.66ms | 17.55ms | 3102.40ms | 2.3x |
-| Word regex | `\bActor\b` | 23675 / 23677 / 23665 | 23.28ms | 51.56ms | 3006.40ms | 2.2x |
-| Regex: alternation | `(Nanite\|Lumen\|SkeletalMeshComponent)` | 34500 / 34498 / 31439 | 38.71ms | 116.64ms | 3122.51ms | 3.0x |
-| Regex: prefix/suffix | `Skeletal[A-Za-z0-9_]*Component` | 7930 / 7917 / 7929 | 13.85ms | 20.32ms | 2992.84ms | 1.5x |
-| Regex: qualified call | `[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(` | 1487547 / 1487316 / 1481806 | 228.04ms | 372.15ms | 3123.33ms | 1.6x |
-| Glob: `*.cpp` literal | `Nanite` in `*.cpp` | 10061 / 10061 / 10061 | 6.40ms | 19.85ms | 1314.23ms | 3.1x |
+| Literal: common token | `Nanite` | 14664 / 14672 / 13013 | 6.29ms | 19.70ms | 2971.12ms | 3.1x |
+| Literal: long symbol | `SkeletalMeshComponent` | 7606 / 7593 / 7605 | 5.65ms | 17.96ms | 3082.29ms | 3.2x |
+| Literal: missing | `DefinitelyMissingIndexSearchNeedle` | 0 / 0 / 0 | 2.76ms | 11.71ms | 3023.29ms | 4.2x |
+| Case-insensitive literal | `skeletalmeshcomponent` | 7616 / 7603 / 7615 | 8.75ms | 18.07ms | 3146.05ms | 2.1x |
+| Word regex | `\bActor\b` | 23675 / 23677 / 23665 | 11.88ms | 54.55ms | 3120.59ms | 4.6x |
+| Regex: alternation | `(Nanite\|Lumen\|SkeletalMeshComponent)` | 34500 / 34498 / 31439 | 26.55ms | 143.78ms | 3232.60ms | 5.4x |
+| Regex: prefix/suffix | `Skeletal[A-Za-z0-9_]*Component` | 7930 / 7917 / 7929 | 11.32ms | 21.15ms | 3009.33ms | 1.9x |
+| Regex: qualified call | `[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(` | 1487547 / 1487316 / 1481806 | 126.78ms | 362.25ms | 3148.65ms | 2.9x |
+| Glob: `*.cpp` literal | `Nanite` in `*.cpp` | 10061 / 10061 / 10061 | 5.40ms | 19.78ms | 1229.10ms | 3.7x |
 
 For `-q` existence checks, IndexSearch stops as soon as a verified match is
 found. Quiet timings are median wall-clock time across 31 IndexSearch runs and
@@ -270,6 +270,14 @@ To reproduce the search benchmark:
 
 ```bash
 python3 scripts/benchmark-ue.py /path/to/UnrealEngine --prepare-qgrep
+```
+
+For changes that may affect search performance, compare against one or more
+historical revisions with the same checkout and index:
+
+```bash
+python3 scripts/benchmark-history.py /path/to/UnrealEngine \
+  --refs b42de13 HEAD --case qualified-call
 ```
 
 ## Build From Source
