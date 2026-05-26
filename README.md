@@ -1,6 +1,6 @@
 # IndexSearch
 
-[![Build](https://github.com/Abyss116/IndexSearch/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/Abyss116/IndexSearch/actions/workflows/build.yml?query=branch%3Amain)
+[![Build](https://github.com/Abyss116/IndexSearch/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/Abyss116/IndexSearch/actions/workflows/release.yml?query=branch%3Amain)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 IndexSearch is a Rust command line search tool for very large source trees. It
@@ -40,7 +40,7 @@ Direct downloads:
 - [Windows x86_64](https://github.com/Abyss116/IndexSearch/releases/latest/download/indexsearch-windows-x86_64.zip)
 
 Continuous builds are available from the
-[GitHub Actions build workflow](https://github.com/Abyss116/IndexSearch/actions/workflows/build.yml).
+[GitHub Actions build workflow](https://github.com/Abyss116/IndexSearch/actions/workflows/release.yml).
 
 After extracting a direct-download archive, you can copy the extracted binaries
 into a user-writable bin directory:
