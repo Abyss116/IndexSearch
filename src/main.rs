@@ -1028,7 +1028,40 @@ fn stdout_supports_color() -> bool {
     let force_color = env::var("CLICOLOR_FORCE").is_ok_and(|value| value != "0");
     force_color
         || (std::io::stdout().is_terminal()
-            && env::var("TERM").map(|term| term != "dumb").unwrap_or(true))
+            && env::var("TERM").map(|term| term != "dumb").unwrap_or(true)
+            && stdout_supports_ansi())
+}
+
+#[cfg(not(windows))]
+fn stdout_supports_ansi() -> bool {
+    true
+}
+
+#[cfg(windows)]
+fn stdout_supports_ansi() -> bool {
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+
+    unsafe extern "system" {
+        fn GetStdHandle(n_std_handle: u32) -> *mut std::ffi::c_void;
+        fn GetConsoleMode(h_console_handle: *mut std::ffi::c_void, lp_mode: *mut u32) -> i32;
+        fn SetConsoleMode(h_console_handle: *mut std::ffi::c_void, dw_mode: u32) -> i32;
+    }
+
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if handle.is_null() || handle as isize == -1 {
+            return false;
+        }
+        let mut mode = 0u32;
+        if GetConsoleMode(handle, &mut mode) == 0 {
+            return false;
+        }
+        if mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0 {
+            return true;
+        }
+        SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+    }
 }
 
 fn stdout_supports_search_decoration() -> bool {
