@@ -187,6 +187,7 @@ struct FileEntry {
     mtime: i64,
     size: u64,
     content: Vec<u8>,
+    compressed_content: Vec<u8>,
 }
 
 struct BuiltIndex {
@@ -1127,8 +1128,8 @@ fn command_index(args: &[String]) -> Result<i32> {
         elapsed
     );
     print_timings(&timings);
-    println!("root: {}", cfg.root.display());
-    println!("index: {}", index_path(&cfg.root).display());
+    println!("root: {}", display_path(&cfg.root));
+    println!("index: {}", display_path(&index_path(&cfg.root)));
     Ok(0)
 }
 
@@ -1157,8 +1158,8 @@ fn command_update(args: &[String]) -> Result<i32> {
                             timer.elapsed().as_secs_f64()
                         );
                         print_timings(&timings);
-                        println!("root: {}", cfg.root.display());
-                        println!("index: {}", path.display());
+                        println!("root: {}", display_path(&cfg.root));
+                        println!("index: {}", display_path(&path));
                         save_index_state(&cfg.root)?;
                         return Ok(0);
                     }
@@ -1190,9 +1191,9 @@ fn command_update(args: &[String]) -> Result<i32> {
                             elapsed
                         );
                         print_timings(&timings);
-                        println!("root: {}", cfg.root.display());
-                        println!("index: {}", path.display());
-                        println!("delta: {}", delta_dir(&cfg.root).display());
+                        println!("root: {}", display_path(&cfg.root));
+                        println!("index: {}", display_path(&path));
+                        println!("delta: {}", display_path(&delta_dir(&cfg.root)));
                         return Ok(0);
                     }
                     None => {
@@ -1241,8 +1242,8 @@ fn command_update(args: &[String]) -> Result<i32> {
         elapsed
     );
     print_timings(&timings);
-    println!("root: {}", cfg.root.display());
-    println!("index: {}", path.display());
+    println!("root: {}", display_path(&cfg.root));
+    println!("index: {}", display_path(&path));
     Ok(0)
 }
 
@@ -1266,8 +1267,8 @@ fn update_from_filesystem_scan(
             visible_before, visible_before, skipped, scanned, elapsed
         );
         print_timings(timings);
-        println!("root: {}", cfg.root.display());
-        println!("index: {}", path.display());
+        println!("root: {}", display_path(&cfg.root));
+        println!("index: {}", display_path(path));
         return Ok(0);
     }
 
@@ -1309,10 +1310,10 @@ fn update_from_filesystem_scan(
         elapsed
     );
     print_timings(timings);
-    println!("root: {}", cfg.root.display());
-    println!("index: {}", path.display());
+    println!("root: {}", display_path(&cfg.root));
+    println!("index: {}", display_path(path));
     if stats.added != 0 || stats.updated != 0 || stats.removed != 0 {
-        println!("delta: {}", delta_dir(&cfg.root).display());
+        println!("delta: {}", display_path(&delta_dir(&cfg.root)));
     }
     Ok(0)
 }
@@ -2278,8 +2279,8 @@ fn command_compact(args: &[String]) -> Result<i32> {
             timer.elapsed().as_secs_f64()
         );
         print_timings(&timings);
-        println!("root: {}", cfg.root.display());
-        println!("index: {}", path.display());
+        println!("root: {}", display_path(&cfg.root));
+        println!("index: {}", display_path(&path));
         return Ok(0);
     }
     let process_timer = Instant::now();
@@ -2298,8 +2299,8 @@ fn command_compact(args: &[String]) -> Result<i32> {
         timer.elapsed().as_secs_f64()
     );
     print_timings(&timings);
-    println!("root: {}", cfg.root.display());
-    println!("index: {}", path.display());
+    println!("root: {}", display_path(&cfg.root));
+    println!("index: {}", display_path(&path));
     Ok(0)
 }
 
@@ -2312,15 +2313,15 @@ fn command_status(args: &[String]) -> Result<i32> {
     let _lock = acquire_shared_lock(&cfg.root)?;
     let path = index_path(&cfg.root);
     let loaded = MappedIndex::open(&path);
-    println!("root: {}", cfg.root.display());
+    println!("root: {}", display_path(&cfg.root));
     println!(
         "config: {}",
         cfg.path
             .as_ref()
-            .map(|p| p.display().to_string())
+            .map(|p| display_path(p))
             .unwrap_or_default()
     );
-    println!("index: {}", path.display());
+    println!("index: {}", display_path(&path));
     match loaded {
         Ok(index) => {
             let deltas = load_deltas(&cfg.root).unwrap_or_default();
@@ -3812,13 +3813,15 @@ fn build_index(
                 return None;
             }
             let (grams, fragments) = index_grams_and_word_fragments(&bytes, scratch);
+            let compressed_content = lz4_flex::compress_prepend_size(&bytes);
             Some((
                 entry.ordinal,
                 FileEntry {
                     path: entry.rel.clone(),
                     mtime: entry.mtime,
                     size: bytes.len() as u64,
-                    content: bytes,
+                    content: ENABLE_CHUNK_EXTENSION.then_some(bytes).unwrap_or_default(),
+                    compressed_content,
                 },
                 grams,
                 fragments,
@@ -3869,12 +3872,14 @@ fn read_current_file_entry(
     }
     let mut scratch = TrigramScratch::new();
     let grams = index_grams(&bytes, &mut scratch);
+    let compressed_content = lz4_flex::compress_prepend_size(&bytes);
     Ok(Some((
         FileEntry {
             path: rel,
             mtime: mtime_ns(&meta),
             size: bytes.len() as u64,
-            content: bytes,
+            content: ENABLE_CHUNK_EXTENSION.then_some(bytes).unwrap_or_default(),
+            compressed_content,
         },
         grams,
     )))
@@ -4079,6 +4084,11 @@ fn compact_segments(
             index_grams_and_word_fragments(&file.content, scratch)
         })
         .collect();
+    if !ENABLE_CHUNK_EXTENSION {
+        for file in &mut files {
+            file.content.clear();
+        }
+    }
     let selected_fragments = selected_word_fragments(
         indexed_files
             .iter()
@@ -4114,11 +4124,13 @@ fn append_visible_files(
             continue;
         }
         let rec = index.file_record(id)?;
+        let compressed_content = index.file_compressed_content(&rec)?.to_vec();
         out.push(FileEntry {
             path,
             mtime: rec.mtime,
             size: rec.size,
             content: file.content.to_vec(),
+            compressed_content,
         });
     }
     Ok(())
@@ -4661,32 +4673,28 @@ fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
     let tmp_path = path.with_file_name(format!("{file_name}.tmp.{}", std::process::id()));
     let root = index.root.to_string_lossy().as_bytes().to_vec();
 
-    let compressed_contents: Vec<Vec<u8>> = index
+    let content_blob_size: u64 = index
         .files
-        .par_iter()
-        .map(|file| lz4_flex::compress_prepend_size(&file.content))
-        .collect();
-    let content_blob_size: u64 = compressed_contents
         .iter()
-        .map(|content| content.len() as u64)
+        .map(|file| file.compressed_content.len() as u64)
         .sum();
 
     let path_blob_size: usize = index.files.iter().map(|file| file.path.len()).sum();
     let mut path_blob = Vec::with_capacity(path_blob_size);
     let mut file_records = Vec::with_capacity(index.files.len());
     let mut content_offset = 0u64;
-    for (file, compressed) in index.files.iter().zip(compressed_contents.iter()) {
+    for file in &index.files {
         let path_offset = path_blob.len() as u64;
         path_blob.extend_from_slice(file.path.as_bytes());
         file_records.push(FileRecord {
             path_offset,
             path_size: file.path.len() as u64,
             content_offset,
-            content_size: compressed.len() as u64,
+            content_size: file.compressed_content.len() as u64,
             mtime: file.mtime,
             size: file.size,
         });
-        content_offset += compressed.len() as u64;
+        content_offset += file.compressed_content.len() as u64;
     }
     let mut posting_entries: Vec<_> = index.postings.iter().collect();
     posting_entries.sort_by_key(|entry| *entry.0);
@@ -4781,8 +4789,8 @@ fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
     )?;
     writer.write_all(&posting_data)?;
     writer.write_all(&path_blob)?;
-    for compressed in &compressed_contents {
-        writer.write_all(compressed)?;
+    for file in &index.files {
+        writer.write_all(&file.compressed_content)?;
     }
     if let Some(chunk_extension) = &chunk_extension {
         write_padding(
@@ -4930,6 +4938,19 @@ impl MappedIndex {
             Ok(scratch.as_slice())
         } else {
             Ok(bytes)
+        }
+    }
+
+    fn file_compressed_content(&self, rec: &FileRecord) -> Result<Cow<'_, [u8]>> {
+        let bytes = checked_slice(
+            &self.mmap,
+            self.content_blob_offset as u64 + rec.content_offset,
+            rec.content_size,
+        )?;
+        if self.version >= 3 {
+            Ok(Cow::Borrowed(bytes))
+        } else {
+            Ok(Cow::Owned(lz4_flex::compress_prepend_size(bytes)))
         }
     }
 
@@ -8284,7 +8305,24 @@ impl DisplayPathMapper {
 }
 
 fn slash_path(path: PathBuf) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    clean_path_string(&path.to_string_lossy()).replace('\\', "/")
+}
+
+fn display_path(path: &Path) -> String {
+    clean_path_string(&path.to_string_lossy())
+}
+
+fn clean_path_string(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = path.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+    }
+    path.to_string()
 }
 
 fn file_trigrams(bytes: &[u8], scratch: &mut TrigramScratch) -> Vec<u32> {
@@ -8292,8 +8330,13 @@ fn file_trigrams(bytes: &[u8], scratch: &mut TrigramScratch) -> Vec<u32> {
         return Vec::new();
     }
     let mut grams = Vec::with_capacity((bytes.len() - 2).min(4096));
-    for window in bytes.windows(3) {
-        let gram = trigram(window[0], window[1], window[2]);
+    let mut a = bytes[0].to_ascii_lowercase() as u32;
+    let mut b = bytes[1].to_ascii_lowercase() as u32;
+    for &byte in &bytes[2..] {
+        let c = byte.to_ascii_lowercase() as u32;
+        let gram = (a << 16) | (b << 8) | c;
+        a = b;
+        b = c;
         let idx = gram as usize;
         let word = idx / TRIGRAM_WORD_BITS;
         let mask = 1u64 << (idx % TRIGRAM_WORD_BITS);
@@ -8362,10 +8405,16 @@ fn add_word_fragment_keys(word: &[u8], keys: &mut Vec<u32>) {
     if word.len() < WORD_FRAGMENT_MIN_LEN {
         return;
     }
-    let max_len = word.len().min(WORD_FRAGMENT_MAX_LEN);
-    for len in WORD_FRAGMENT_MIN_LEN..=max_len {
-        for start in 0..=word.len() - len {
-            keys.push(word_fragment_key(&word[start..start + len]));
+    if WORD_FRAGMENT_MIN_LEN == 6 && WORD_FRAGMENT_MAX_LEN == 6 {
+        for start in 0..=word.len() - 6 {
+            keys.push(word_fragment_key6(&word[start..start + 6]));
+        }
+    } else {
+        let max_len = word.len().min(WORD_FRAGMENT_MAX_LEN);
+        for len in WORD_FRAGMENT_MIN_LEN..=max_len {
+            for start in 0..=word.len() - len {
+                keys.push(word_fragment_key(&word[start..start + len]));
+            }
         }
     }
 }
@@ -8412,25 +8461,40 @@ fn add_word_prefix_postings(word: &[u8], grams: &mut Vec<u32>) {
         return;
     }
     let max = word.len().min(PREFIX_MAX_LEN);
-    for len in PREFIX_MIN_LEN..=max {
-        grams.push(prefix_posting_key(&word[..len]));
+    let mut hash = FNV_OFFSET;
+    for (idx, &byte) in word.iter().take(max).enumerate() {
+        hash = fnv1a_step(hash, byte);
+        if idx + 1 >= PREFIX_MIN_LEN {
+            grams.push(PREFIX_POSTING_TAG | (hash & 0x3fff_ffff));
+        }
     }
 }
 
 fn word_fragment_key(fragment: &[u8]) -> u32 {
-    let mut hash = 0x811c_9dc5_u32;
+    let mut hash = FNV_OFFSET;
     for &byte in fragment {
-        hash ^= byte.to_ascii_lowercase() as u32;
-        hash = hash.wrapping_mul(0x0100_0193);
+        hash = fnv1a_step(hash, byte);
     }
     WORD_FRAGMENT_TAG | (hash & 0x1fff_ffff)
 }
 
+#[inline]
+fn word_fragment_key6(fragment: &[u8]) -> u32 {
+    debug_assert!(fragment.len() == 6);
+    let mut hash = FNV_OFFSET;
+    hash = fnv1a_step(hash, fragment[0]);
+    hash = fnv1a_step(hash, fragment[1]);
+    hash = fnv1a_step(hash, fragment[2]);
+    hash = fnv1a_step(hash, fragment[3]);
+    hash = fnv1a_step(hash, fragment[4]);
+    hash = fnv1a_step(hash, fragment[5]);
+    WORD_FRAGMENT_TAG | (hash & 0x1fff_ffff)
+}
+
 fn prefix_posting_key(prefix: &[u8]) -> u32 {
-    let mut hash = 0x811c_9dc5_u32;
+    let mut hash = FNV_OFFSET;
     for &byte in prefix {
-        hash ^= byte.to_ascii_lowercase() as u32;
-        hash = hash.wrapping_mul(0x0100_0193);
+        hash = fnv1a_step(hash, byte);
     }
     PREFIX_POSTING_TAG | (hash & 0x3fff_ffff)
 }
@@ -8460,19 +8524,28 @@ fn add_qualified_call_postings(content: &[u8], grams: &mut Vec<u32>) {
 fn add_qualified_class_fragments(class: &[u8], grams: &mut Vec<u32>) {
     for start in 0..class.len() {
         let max_end = (start + QUALIFIED_CLASS_FRAGMENT_MAX_LEN).min(class.len());
-        for end in start + 1..=max_end {
-            grams.push(qualified_class_fragment_key(&class[start..end]));
+        let mut hash = FNV_OFFSET;
+        for &byte in &class[start..max_end] {
+            hash = fnv1a_step(hash, byte);
+            grams.push(QUALIFIED_CLASS_FRAGMENT_TAG | (hash & 0x3fff_ffff));
         }
     }
 }
 
 fn qualified_class_fragment_key(fragment: &[u8]) -> u32 {
-    let mut hash = 0x811c_9dc5_u32;
+    let mut hash = FNV_OFFSET;
     for &byte in fragment {
-        hash ^= byte.to_ascii_lowercase() as u32;
-        hash = hash.wrapping_mul(0x0100_0193);
+        hash = fnv1a_step(hash, byte);
     }
     QUALIFIED_CLASS_FRAGMENT_TAG | (hash & 0x3fff_ffff)
+}
+
+const FNV_OFFSET: u32 = 0x811c_9dc5;
+const FNV_PRIME: u32 = 0x0100_0193;
+
+#[inline]
+fn fnv1a_step(hash: u32, byte: u8) -> u32 {
+    (hash ^ byte.to_ascii_lowercase() as u32).wrapping_mul(FNV_PRIME)
 }
 
 fn trigram(a: u8, b: u8, c: u8) -> u32 {

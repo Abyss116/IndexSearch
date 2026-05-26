@@ -67,7 +67,7 @@ Get-Process is-daemon -ErrorAction SilentlyContinue | Stop-Process -Force
 ```
 
 Newer releases also write a versioned backend such as
-`is-daemon-0.3.6.exe`, so a locked old backend no longer prevents installing
+`is-daemon-0.3.7.exe`, so a locked old backend no longer prevents installing
 the new frontend.
 
 ## Quick Start
@@ -252,7 +252,7 @@ stdout redirected to `/dev/null`.
 
 | Operation | IndexSearch | qgrep | Notes |
 | --- | ---: | ---: | --- |
-| Fresh index | 11.52s | 21.50s | IndexSearch timing: scan 4.19s, process 6.21s, write 1.11s |
+| Fresh index | 10.90s | 21.50s | IndexSearch timing: scan 3.98s, process 5.99s, write 0.94s |
 | No-change update | 0.27s | 4.19s | Git changed-path check, no file scan work |
 | Compact 2 deltas | 8.61s | n/a | Folded 196,961 visible files into a new base index |
 
