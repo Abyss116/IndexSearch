@@ -1371,9 +1371,9 @@ fn command_watch(args: &[String]) -> Result<i32> {
         if path_is_ancestor(&record_root, &requested_root) {
             println!(
                 "watch already covered: {} pid={} covers {}",
-                record.root.display(),
+                display_path(&record.root),
                 record.pid,
-                cfg.root.display()
+                display_path(&cfg.root)
             );
             return Ok(0);
         }
@@ -1389,14 +1389,14 @@ fn command_watch(args: &[String]) -> Result<i32> {
             &format!(
                 "watch-stop pid={} superseded_by={}",
                 record.pid,
-                cfg.root.display()
+                display_path(&cfg.root)
             ),
         );
         println!(
             "stopped child watch {} pid={} {}",
             record.id,
             record.pid,
-            record.root.display()
+            display_path(&record.root)
         );
     }
     if record_path.exists() {
@@ -1470,7 +1470,7 @@ fn command_watch(args: &[String]) -> Result<i32> {
     )?;
     println!(
         "watching {} pid={} id={}",
-        cfg.root.display(),
+        display_path(&cfg.root),
         record.pid,
         record.id
     );
@@ -1502,7 +1502,7 @@ fn command_list_watches(_args: &[String]) -> Result<i32> {
             record.id,
             record.pid,
             alive,
-            record.root.display()
+            display_path(&record.root)
         );
         if !alive {
             let _ = fs::remove_file(path);
@@ -1540,7 +1540,7 @@ fn command_unwatch(args: &[String]) -> Result<i32> {
             "unwatched {} pid={} {}",
             record.id,
             record.pid,
-            record.root.display()
+            display_path(&record.root)
         );
     }
     Ok(0)
@@ -1555,7 +1555,7 @@ fn command_watch_log(args: &[String]) -> Result<i32> {
     let path = watch_log_path(&cfg.root);
     let lines = fs::read_to_string(&path).unwrap_or_default();
     if lines.is_empty() {
-        println!("watch log is empty: {}", path.display());
+        println!("watch log is empty: {}", display_path(&path));
     } else {
         print!("{lines}");
     }
@@ -1590,8 +1590,8 @@ fn command_install(args: &[String]) -> Result<i32> {
         if let Err(err) = install_executable(&src, &daemon_path) {
             eprintln!(
                 "indexsearch: warning: could not replace {}; installed versioned backend {} instead ({err:#})",
-                daemon_path.display(),
-                versioned_daemon_path.display()
+                display_path(&daemon_path),
+                display_path(&versioned_daemon_path)
             );
         }
         versioned_daemon_path
@@ -1628,16 +1628,16 @@ fn command_install(args: &[String]) -> Result<i32> {
         install_alias(&installed_backend_path, &alias_path)?;
         install_alias(&installed_backend_path, &exe_path)?;
     }
-    println!("installed: {}", installed_backend_path.display());
+    println!("installed: {}", display_path(&installed_backend_path));
     if installed_backend_path != daemon_path {
-        println!("legacy backend: {}", daemon_path.display());
+        println!("legacy backend: {}", display_path(&daemon_path));
     }
-    println!("frontend: {}", exe_path.display());
-    println!("frontend: {}", alias_path.display());
+    println!("frontend: {}", display_path(&exe_path));
+    println!("frontend: {}", display_path(&alias_path));
     if !path_contains(&dir) {
         println!(
             "note: add {} to PATH to use indexsearch and is from any shell",
-            dir.display()
+            display_path(&dir)
         );
     }
     Ok(0)
@@ -1948,7 +1948,7 @@ fn install_ue_template(project: &Path, force: bool, dry_run: bool) -> Result<()>
     if dst.exists() && !force {
         println!(
             "kept existing {}; pass --force to replace it",
-            dst.display()
+            display_path(&dst)
         );
         return Ok(());
     }
@@ -1957,14 +1957,14 @@ fn install_ue_template(project: &Path, force: bool, dry_run: bool) -> Result<()>
 
 fn write_text_file(path: &Path, text: &str, dry_run: bool) -> Result<()> {
     if dry_run {
-        println!("would install {}", path.display());
+        println!("would install {}", display_path(path));
         return Ok(());
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, text)?;
-    println!("installed {}", path.display());
+    println!("installed {}", display_path(path));
     Ok(())
 }
 
@@ -2001,14 +2001,14 @@ fn write_marked_block(path: &Path, block: &str, dry_run: bool) -> Result<()> {
         wrapped
     };
     if dry_run {
-        println!("would update {}", path.display());
+        println!("would update {}", display_path(path));
         return Ok(());
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     fs::write(path, updated)?;
-    println!("updated {}", path.display());
+    println!("updated {}", display_path(path));
     Ok(())
 }
 
@@ -2269,7 +2269,10 @@ fn command_compact(args: &[String]) -> Result<i32> {
     let path = index_path(&cfg.root);
     let base = MappedIndex::open(&path)?;
     if base.config_hash != cfg.hash {
-        eprintln!("indexsearch: index not found or stale: {}", path.display());
+        eprintln!(
+            "indexsearch: index not found or stale: {}",
+            display_path(&path)
+        );
         return Ok(2);
     }
     let deltas = load_deltas(&cfg.root)?;
@@ -2429,7 +2432,10 @@ fn command_search(args: &[String]) -> Result<i32> {
         .unwrap_or(true)
     {
         if !options.auto_index {
-            eprintln!("indexsearch: index not found or stale: {}", path.display());
+            eprintln!(
+                "indexsearch: index not found or stale: {}",
+                display_path(&path)
+            );
             return Ok(2);
         }
         drop(index);
@@ -3685,7 +3691,10 @@ fn load_config_inner(start: &Path, create_default: bool) -> Result<ProjectConfig
         if create_default {
             fs::create_dir_all(&root)?;
             fs::write(&path, DEFAULT_PROJECT_CONFIG)?;
-            eprintln!("indexsearch: created default config: {}", path.display());
+            eprintln!(
+                "indexsearch: created default config: {}",
+                display_path(&path)
+            );
         }
         DEFAULT_PROJECT_CONFIG.to_string()
     };
@@ -4838,7 +4847,7 @@ fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
         fs::rename(&tmp_path, path).with_context(|| {
             format!(
                 "failed to replace {} after initial rename error: {err}",
-                path.display()
+                display_path(path)
             )
         })?;
     }
@@ -8749,8 +8758,13 @@ fn install_executable(src: &Path, dst: &Path) -> Result<()> {
         return Ok(());
     }
     let tmp = dst.with_extension(format!("tmp.{}", std::process::id()));
-    fs::copy(src, &tmp)
-        .with_context(|| format!("failed to copy {} to {}", src.display(), tmp.display()))?;
+    fs::copy(src, &tmp).with_context(|| {
+        format!(
+            "failed to copy {} to {}",
+            display_path(src),
+            display_path(&tmp)
+        )
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -8759,7 +8773,7 @@ fn install_executable(src: &Path, dst: &Path) -> Result<()> {
     if dst.exists() {
         let _ = fs::remove_file(dst);
     }
-    fs::rename(&tmp, dst).with_context(|| format!("failed to replace {}", dst.display()))?;
+    fs::rename(&tmp, dst).with_context(|| format!("failed to replace {}", display_path(dst)))?;
     Ok(())
 }
 
@@ -8917,7 +8931,7 @@ fn read_search_daemon_record(path: &Path) -> Result<SearchDaemonRecord> {
         || token.is_empty()
         || root.as_os_str().is_empty()
     {
-        bail!("invalid search daemon record {}", path.display());
+        bail!("invalid search daemon record {}", display_path(path));
     }
     Ok(SearchDaemonRecord {
         pid,
@@ -9008,7 +9022,7 @@ fn read_watch_record(path: &Path) -> Result<WatchRecord> {
         }
     }
     if id.is_empty() || pid == 0 || root.as_os_str().is_empty() {
-        bail!("invalid watch record {}", path.display());
+        bail!("invalid watch record {}", display_path(path));
     }
     Ok(WatchRecord { id, root, pid })
 }

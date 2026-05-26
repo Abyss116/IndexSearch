@@ -278,7 +278,7 @@ fn handle_missing_index(args: &[String]) -> Result<i32, String> {
         let cwd = env::current_dir().map_err(|err| err.to_string())?;
         eprint!(
             "is: no IndexSearch index found above {}. Create one here? [y/N] ",
-            cwd.display()
+            display_path(&cwd)
         );
         let _ = io::stderr().flush();
         let mut answer = String::new();
@@ -570,7 +570,7 @@ fn backend_path() -> Result<PathBuf, String> {
     Err(format!(
         "cannot find `{}` next to {}",
         executable_name("is-daemon"),
-        exe.display()
+        display_path(&exe)
     ))
 }
 
@@ -580,6 +580,23 @@ fn executable_name(stem: &str) -> String {
     } else {
         stem.to_string()
     }
+}
+
+fn display_path(path: &Path) -> String {
+    clean_path_string(&path.to_string_lossy())
+}
+
+fn clean_path_string(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = path.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+    }
+    path.to_string()
 }
 
 #[cfg(unix)]
