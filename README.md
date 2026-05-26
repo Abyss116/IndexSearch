@@ -67,7 +67,7 @@ Get-Process is-daemon -ErrorAction SilentlyContinue | Stop-Process -Force
 ```
 
 Newer releases also write a versioned backend such as
-`is-daemon-0.3.11.exe`, so a locked old backend no longer prevents installing
+`is-daemon-0.3.12.exe`, so a locked old backend no longer prevents installing
 the new frontend.
 
 ## Quick Start
@@ -166,7 +166,8 @@ is unwatch .
 
 The watcher writes batched delta updates on file events and can compact during
 idle periods. If no base index exists, `is watch .` builds it first. Overlapping
-watches are normalized so a parent watch covers child directories.
+watches are normalized so a parent watch covers child directories. `watch-log`
+records real index/update/compact activity and omits no-op filesystem events.
 
 Useful watcher knobs:
 

@@ -2103,6 +2103,9 @@ fn collect_event_paths(cfg: &ProjectConfig, event: Event, pending: &mut HashSet<
             continue;
         }
         if let Some(rel) = rel_path(&cfg.root, &path) {
+            if path.exists() && (is_hidden(&rel) || !is_searchable(cfg, &rel)) {
+                continue;
+            }
             pending.insert(rel);
         }
     }
@@ -2161,17 +2164,6 @@ fn flush_watch_batch(cfg: &ProjectConfig, paths: &HashSet<String>) -> Result<()>
         build_delta_index(cfg, &options, &changes, &mut scanned, &mut skipped)?;
     let process_elapsed = process_timer.elapsed().as_secs_f64();
     if stats.added == 0 && stats.updated == 0 && stats.removed == 0 {
-        append_watch_log(
-            &cfg.root,
-            &format!(
-                "auto-update-noop events={} scanned={} skipped={} elapsed={:.3}s process={:.3}s",
-                paths.len(),
-                scanned,
-                skipped,
-                timer.elapsed().as_secs_f64(),
-                process_elapsed
-            ),
-        )?;
         return Ok(());
     }
     let write_timer = Instant::now();
