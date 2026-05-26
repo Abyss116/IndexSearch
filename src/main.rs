@@ -4073,36 +4073,23 @@ fn compact_segments(
 ) -> Result<BuiltIndex> {
     let exclusions = segment_exclusions(base, deltas)?;
     let mut files = Vec::new();
-    append_visible_files(base, &exclusions[0], &mut files)?;
+    let mut id_maps = Vec::with_capacity(deltas.len() + 1);
+    id_maps.push(append_compacted_segment_files(
+        base,
+        &exclusions[0],
+        &mut files,
+    )?);
     for (idx, delta) in deltas.iter().enumerate() {
-        append_visible_files(&delta.index, &exclusions[idx + 1], &mut files)?;
+        id_maps.push(append_compacted_segment_files(
+            &delta.index,
+            &exclusions[idx + 1],
+            &mut files,
+        )?);
     }
     let mut postings: HashMap<u32, Vec<u32>> = HashMap::default();
-    let indexed_files: Vec<(Vec<u32>, Vec<u32>)> = files
-        .par_iter()
-        .map_init(TrigramScratch::new, |scratch, file| {
-            index_grams_and_word_fragments(&file.content, scratch)
-        })
-        .collect();
-    if !ENABLE_CHUNK_EXTENSION {
-        for file in &mut files {
-            file.content.clear();
-        }
-    }
-    let selected_fragments = selected_word_fragments(
-        indexed_files
-            .iter()
-            .map(|(_, fragments)| fragments.as_slice()),
-    );
-    for id in 0..files.len() {
-        for &gram in &indexed_files[id].0 {
-            postings.entry(gram).or_default().push(id as u32);
-        }
-        for &fragment in &indexed_files[id].1 {
-            if selected_fragments.contains(&fragment) {
-                postings.entry(fragment).or_default().push(id as u32);
-            }
-        }
+    merge_segment_postings(base, &id_maps[0], &mut postings)?;
+    for (idx, delta) in deltas.iter().enumerate() {
+        merge_segment_postings(&delta.index, &id_maps[idx + 1], &mut postings)?;
     }
     Ok(BuiltIndex {
         root: cfg.root.clone(),
@@ -4112,27 +4099,52 @@ fn compact_segments(
     })
 }
 
-fn append_visible_files(
+fn append_compacted_segment_files(
     index: &MappedIndex,
     excluded_paths: &HashSet<String>,
     out: &mut Vec<FileEntry>,
-) -> Result<()> {
+) -> Result<Vec<Option<u32>>> {
+    let mut id_map = vec![None; index.file_count];
     for id in 0..index.file_count {
-        let file = index.file(id)?;
         let path = bytes_to_string(index.file_path(id)?);
         if excluded_paths.contains(&path) {
             continue;
         }
         let rec = index.file_record(id)?;
         let compressed_content = index.file_compressed_content(&rec)?.to_vec();
+        let content = if ENABLE_CHUNK_EXTENSION {
+            index.file(id)?.content.to_vec()
+        } else {
+            Vec::new()
+        };
+        id_map[id] = Some(out.len() as u32);
         out.push(FileEntry {
             path,
             mtime: rec.mtime,
             size: rec.size,
-            content: file.content.to_vec(),
+            content,
             compressed_content,
         });
     }
+    Ok(id_map)
+}
+
+fn merge_segment_postings(
+    index: &MappedIndex,
+    id_map: &[Option<u32>],
+    postings: &mut HashMap<u32, Vec<u32>>,
+) -> Result<()> {
+    for posting_id in 0..index.posting_count {
+        let rec = index.posting_record(posting_id)?;
+        let data = index.posting_data_for_record(posting_id, &rec)?;
+        let out = postings.entry(rec.gram).or_default();
+        for &old_id in data.as_ref() {
+            if let Some(Some(new_id)) = id_map.get(old_id as usize) {
+                out.push(*new_id);
+            }
+        }
+    }
+    postings.retain(|_, ids| !ids.is_empty());
     Ok(())
 }
 
@@ -5004,31 +5016,33 @@ impl MappedIndex {
                 Ordering::Less => lo = mid + 1,
                 Ordering::Greater => hi = mid,
                 Ordering::Equal => {
-                    if self.version >= 4 {
-                        let start = self.postings_data_offset as u64 + rec.offset;
-                        let end = self.posting_data_end(mid)?;
-                        let bytes = checked_slice(&self.mmap, start, end - start)?;
-                        let data = read_varint_postings(bytes, rec.count as usize)?;
-                        return Ok(Some(PostingView {
-                            data: Cow::Owned(data),
-                        }));
-                    } else {
-                        let start = self.postings_data_offset as u64 + rec.offset * 4;
-                        let bytes = checked_slice(&self.mmap, start, rec.count * 4)?;
-                        let data = unsafe {
-                            std::slice::from_raw_parts(
-                                bytes.as_ptr() as *const u32,
-                                rec.count as usize,
-                            )
-                        };
-                        return Ok(Some(PostingView {
-                            data: Cow::Borrowed(data),
-                        }));
-                    }
+                    return Ok(Some(PostingView {
+                        data: self.posting_data_for_record(mid, &rec)?,
+                    }));
                 }
             }
         }
         Ok(None)
+    }
+
+    fn posting_data_for_record<'a>(
+        &'a self,
+        posting_id: usize,
+        rec: &PostingRecord,
+    ) -> Result<Cow<'a, [u32]>> {
+        if self.version >= 4 {
+            let start = self.postings_data_offset as u64 + rec.offset;
+            let end = self.posting_data_end(posting_id)?;
+            let bytes = checked_slice(&self.mmap, start, end - start)?;
+            Ok(Cow::Owned(read_varint_postings(bytes, rec.count as usize)?))
+        } else {
+            let start = self.postings_data_offset as u64 + rec.offset * 4;
+            let bytes = checked_slice(&self.mmap, start, rec.count * 4)?;
+            let data = unsafe {
+                std::slice::from_raw_parts(bytes.as_ptr() as *const u32, rec.count as usize)
+            };
+            Ok(Cow::Borrowed(data))
+        }
     }
 
     fn posting_data_end(&self, posting_id: usize) -> Result<u64> {
