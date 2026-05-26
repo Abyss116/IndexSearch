@@ -252,58 +252,6 @@ jobs:
             exit 0
           }
 
-          Write-Host "wingetcreate update failed; generating initial manifest submission"
-          Invoke-WebRequest $installerUrl -OutFile indexsearch-windows-x86_64.zip
-          $sha = (Get-FileHash indexsearch-windows-x86_64.zip -Algorithm SHA256).Hash
-          New-Item -ItemType Directory -Force -Path winget | Out-Null
-          @"
-          # yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.1.10.0.schema.json
-          PackageIdentifier: Abyss116.IndexSearch
-          PackageVersion: $version
-          DefaultLocale: en-US
-          ManifestType: version
-          ManifestVersion: 1.10.0
-          "@ | Set-Content -Encoding utf8 winget/Abyss116.IndexSearch.yaml
-          @"
-          # yaml-language-server: `$schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
-          PackageIdentifier: Abyss116.IndexSearch
-          PackageVersion: $version
-          PackageLocale: en-US
-          Publisher: Abyss116
-          PublisherUrl: https://github.com/Abyss116
-          PublisherSupportUrl: https://github.com/Abyss116/IndexSearch/issues
-          PackageName: IndexSearch
-          PackageUrl: https://github.com/Abyss116/IndexSearch
-          License: MIT OR Apache-2.0
-          ShortDescription: Persistent-index rg-like search for large source trees.
-          Moniker: indexsearch
-          Tags:
-          - search
-          - cli
-          - ripgrep
-          - code-search
-          ReleaseNotesUrl: https://github.com/Abyss116/IndexSearch/releases/tag/$env:GITHUB_REF_NAME
-          ManifestType: defaultLocale
-          ManifestVersion: 1.10.0
-          "@ | Set-Content -Encoding utf8 winget/Abyss116.IndexSearch.locale.en-US.yaml
-          @"
-          # yaml-language-server: `$schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
-          PackageIdentifier: Abyss116.IndexSearch
-          PackageVersion: $version
-          InstallerType: zip
-          NestedInstallerType: portable
-          NestedInstallerFiles:
-          - RelativeFilePath: is-daemon.exe
-            PortableCommandAlias: is-daemon
-          - RelativeFilePath: indexsearch.exe
-            PortableCommandAlias: indexsearch
-          - RelativeFilePath: is.exe
-            PortableCommandAlias: is
-          Installers:
-          - Architecture: x64
-            InstallerUrl: $installerUrl
-            InstallerSha256: $sha
-          ManifestType: installer
-          ManifestVersion: 1.10.0
-          "@ | Set-Content -Encoding utf8 winget/Abyss116.IndexSearch.installer.yaml
-          .\wingetcreate.exe submit winget -t $env:WINGET_TOKEN -p "Abyss116.IndexSearch $version" --no-open
+          Write-Host "wingetcreate update failed. The package may not be accepted into winget-pkgs yet."
+          Write-Host "Skipping automatic initial submission to avoid creating duplicate new-package PRs."
+          exit 0

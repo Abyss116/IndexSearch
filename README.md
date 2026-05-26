@@ -327,8 +327,10 @@ Tagged releases also contain optional package-manager publication jobs:
 
 - `HOMEBREW_TAP_TOKEN` updates
   [`Abyss116/homebrew-indexsearch`](https://github.com/Abyss116/homebrew-indexsearch).
-- `WINGET_TOKEN` submits the WinGet manifest PR to
-  [`microsoft/winget-pkgs`](https://github.com/microsoft/winget-pkgs).
+- `WINGET_TOKEN` submits WinGet version updates to
+  [`microsoft/winget-pkgs`](https://github.com/microsoft/winget-pkgs) after
+  `Abyss116.IndexSearch` has been accepted. Initial package submission is kept
+  manual to avoid duplicate "new package" PRs while moderation is pending.
 
 If either secret is absent, that publication job is skipped and the release
 artifacts are still produced.
