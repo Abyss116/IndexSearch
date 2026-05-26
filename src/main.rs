@@ -4,7 +4,15 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, IsTerminal, Read, Write};
-use std::net::{TcpListener, TcpStream};
+#[cfg(not(unix))]
+use std::net::TcpListener;
+use std::net::TcpStream;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -23,6 +31,13 @@ use regex::bytes::{Regex, RegexBuilder};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use walkdir::{DirEntry, WalkDir};
 
+#[cfg(unix)]
+type StdoutFd = RawFd;
+#[cfg(windows)]
+type StdoutFd = RawHandle;
+#[cfg(not(any(unix, windows)))]
+type StdoutFd = i32;
+
 const PROJECT_FILE: &str = "index-search-project.txt";
 const INDEX_DIR: &str = ".indexsearch";
 const INDEX_FILE: &str = "index.bin";
@@ -39,6 +54,7 @@ const SEARCH_DAEMON_STDERR_FRAME: u8 = 2;
 const SEARCH_DAEMON_DONE_FRAME: u8 = 3;
 const SEARCH_DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_millis(20);
 const SEARCH_DAEMON_START_TIMEOUT: Duration = Duration::from_millis(250);
+const STREAMING_PIPELINE_MIN_CANDIDATES: usize = 50_000;
 const DEFAULT_PROJECT_CONFIG: &str = "[IndexSearch.paths.ignore]\n.git/\n.hg/\n.svn/\n.indexsearch/\n\n\
 [IndexSearch.files.ignore]\nindex-search-project.txt\n*.png\n*.jpg\n*.jpeg\n*.gif\n*.pdf\n*.zip\n*.gz\n*.dll\n*.exe\n*.pdb\n*.o\n*.obj\n\n\
 [IndexSearch.files.include]\n*\n";
@@ -133,6 +149,7 @@ struct Options {
     auto_update: bool,
     daemon: bool,
     profile: bool,
+    sort_path: bool,
     git_update: bool,
     git_untracked: bool,
     hidden: bool,
@@ -376,6 +393,12 @@ struct SearchOutput {
 }
 
 #[derive(Default)]
+struct RenderStats {
+    matched_files: usize,
+    match_count: usize,
+}
+
+#[derive(Default)]
 struct SearchProfile {
     events: Vec<(&'static str, f64)>,
 }
@@ -395,6 +418,7 @@ struct QualifiedCallSpec {
 struct SearchDaemonRecord {
     pid: u32,
     port: u16,
+    socket_path: Option<PathBuf>,
     token: String,
     root: PathBuf,
     exe_path: PathBuf,
@@ -627,6 +651,7 @@ fn print_help() {
     help_option(&style, "--files", "print indexed searchable files");
     help_option(&style, "--json", "print JSON Lines matches");
     help_option(&style, "--vimgrep", "print path:line:column:line");
+    help_option(&style, "--sort path", "sort matches by path");
     help_option(
         &style,
         "--color WHEN",
@@ -913,6 +938,7 @@ fn print_search_help() {
     help_option(&style, "--files", "print indexed searchable files");
     help_option(&style, "--json", "print JSON Lines matches");
     help_option(&style, "--vimgrep", "print path:line:column:line");
+    help_option(&style, "--sort path", "sort matches by path");
     help_option(
         &style,
         "--color WHEN",
@@ -2709,16 +2735,294 @@ fn command_search_daemon(args: &[String]) -> Result<i32> {
     run_search_daemon(&root)
 }
 
+enum SearchDaemonListener {
+    #[cfg(not(unix))]
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    Unix {
+        listener: UnixListener,
+        path: PathBuf,
+    },
+}
+
+impl SearchDaemonListener {
+    fn bind(root: &Path) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            let path = search_daemon_socket_path(root);
+            let _ = fs::remove_file(&path);
+            let listener = UnixListener::bind(&path)?;
+            return Ok(Self::Unix { listener, path });
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = root;
+            Ok(Self::Tcp(TcpListener::bind(("127.0.0.1", 0))?))
+        }
+    }
+
+    fn port(&self) -> u16 {
+        match self {
+            #[cfg(not(unix))]
+            Self::Tcp(listener) => listener.local_addr().map(|addr| addr.port()).unwrap_or(0),
+            #[cfg(unix)]
+            Self::Unix { .. } => 0,
+        }
+    }
+
+    fn socket_path(&self) -> Option<PathBuf> {
+        match self {
+            #[cfg(not(unix))]
+            Self::Tcp(_) => None,
+            #[cfg(unix)]
+            Self::Unix { path, .. } => Some(path.clone()),
+        }
+    }
+
+    fn accept(&self) -> Result<SearchDaemonStream> {
+        match self {
+            #[cfg(not(unix))]
+            Self::Tcp(listener) => {
+                let (stream, _) = listener.accept()?;
+                Ok(SearchDaemonStream::Tcp(stream))
+            }
+            #[cfg(unix)]
+            Self::Unix { listener, .. } => {
+                let (stream, _) = listener.accept()?;
+                Ok(SearchDaemonStream::Unix(stream))
+            }
+        }
+    }
+}
+
+enum SearchDaemonStream {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+}
+
+impl SearchDaemonStream {
+    fn connect(record: &SearchDaemonRecord) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            if let Some(path) = record.socket_path.as_ref() {
+                return Ok(Self::Unix(UnixStream::connect(path)?));
+            }
+        }
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], record.port));
+        let stream = TcpStream::connect_timeout(&addr, SEARCH_DAEMON_CONNECT_TIMEOUT)?;
+        stream.set_nodelay(true)?;
+        Ok(Self::Tcp(stream))
+    }
+
+    #[cfg(unix)]
+    fn send_stdout_fd(&mut self, _record: &SearchDaemonRecord) -> std::io::Result<()> {
+        match self {
+            Self::Unix(stream) => send_fd(stream, std::io::stdout().as_raw_fd()),
+            Self::Tcp(_) => Ok(()),
+        }
+    }
+
+    #[cfg(windows)]
+    fn send_stdout_fd(&mut self, record: &SearchDaemonRecord) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(stream) => {
+                let handle = duplicate_stdout_for_process(record.pid)
+                    .map(|handle| handle as usize as u64)
+                    .unwrap_or(0);
+                stream.write_all(&handle.to_le_bytes())
+            }
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn send_stdout_fd(&mut self, _record: &SearchDaemonRecord) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn receive_stdout_fd(&mut self) -> std::io::Result<Option<RawFd>> {
+        match self {
+            Self::Unix(stream) => receive_fd(stream).map(Some),
+            Self::Tcp(_) => Ok(None),
+        }
+    }
+
+    #[cfg(windows)]
+    fn receive_stdout_fd(&mut self) -> std::io::Result<Option<StdoutFd>> {
+        match self {
+            Self::Tcp(stream) => {
+                let mut bytes = [0u8; 8];
+                stream.read_exact(&mut bytes)?;
+                let raw = u64::from_le_bytes(bytes);
+                Ok((raw != 0).then_some(raw as usize as RawHandle))
+            }
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn receive_stdout_fd(&mut self) -> std::io::Result<Option<StdoutFd>> {
+        Ok(None)
+    }
+}
+
+impl Read for SearchDaemonStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.read(buf),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for SearchDaemonStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.write(buf),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.flush(),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.flush(),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn send_fd(stream: &UnixStream, fd: RawFd) -> std::io::Result<()> {
+    use std::mem;
+    use std::ptr;
+
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: byte.len(),
+    };
+    let fd_size = mem::size_of::<RawFd>();
+    let mut control = vec![0u8; unsafe { libc::CMSG_SPACE(fd_size as _) } as usize];
+    let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len() as _;
+
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null() {
+            return Err(std::io::Error::other("missing fd control header"));
+        }
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(fd_size as _) as _;
+        ptr::copy_nonoverlapping(
+            (&fd as *const RawFd).cast::<u8>(),
+            libc::CMSG_DATA(cmsg).cast::<u8>(),
+            fd_size,
+        );
+        msg.msg_controllen = (*cmsg).cmsg_len as _;
+        if libc::sendmsg(stream.as_raw_fd(), &msg, 0) == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn receive_fd(stream: &UnixStream) -> std::io::Result<RawFd> {
+    use std::mem;
+    use std::ptr;
+
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: byte.len(),
+    };
+    let fd_size = mem::size_of::<RawFd>();
+    let mut control = vec![0u8; unsafe { libc::CMSG_SPACE(fd_size as _) } as usize];
+    let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len() as _;
+
+    unsafe {
+        let received = libc::recvmsg(stream.as_raw_fd(), &mut msg, 0);
+        if received == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null()
+            || (*cmsg).cmsg_level != libc::SOL_SOCKET
+            || (*cmsg).cmsg_type != libc::SCM_RIGHTS
+        {
+            return Err(std::io::Error::other("missing stdout fd"));
+        }
+        let mut fd: RawFd = -1;
+        ptr::copy_nonoverlapping(
+            libc::CMSG_DATA(cmsg).cast::<u8>(),
+            (&mut fd as *mut RawFd).cast::<u8>(),
+            fd_size,
+        );
+        if fd < 0 {
+            return Err(std::io::Error::other("invalid stdout fd"));
+        }
+        Ok(fd)
+    }
+}
+
+#[cfg(windows)]
+fn duplicate_stdout_for_process(pid: u32) -> std::io::Result<RawHandle> {
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE,
+    };
+
+    unsafe {
+        let target_process = OpenProcess(PROCESS_DUP_HANDLE, 0, pid);
+        if target_process.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut target_handle: HANDLE = ptr::null_mut();
+        let ok = DuplicateHandle(
+            GetCurrentProcess(),
+            std::io::stdout().as_raw_handle() as HANDLE,
+            target_process,
+            &mut target_handle,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        );
+        let result = if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(target_handle as RawHandle)
+        };
+        CloseHandle(target_process);
+        result
+    }
+}
+
 fn run_search_daemon(root: &Path) -> Result<i32> {
     let index_meta = fs::metadata(index_path(root))?;
     let exe = env::current_exe()?;
     let exe_meta = fs::metadata(&exe)?;
-    let listener = TcpListener::bind(("127.0.0.1", 0))?;
-    let port = listener.local_addr()?.port();
+    let listener = SearchDaemonListener::bind(root)?;
+    let port = listener.port();
+    let socket_path = listener.socket_path();
     let token = search_daemon_token(root);
     let record = SearchDaemonRecord {
         pid: std::process::id(),
         port,
+        socket_path,
         token,
         root: root.to_path_buf(),
         exe_path: exe,
@@ -2733,19 +3037,20 @@ fn run_search_daemon(root: &Path) -> Result<i32> {
         MappedIndex::open(&index_path(record.root.as_path()))?
     };
     loop {
-        let (mut stream, _) = listener.accept()?;
+        let mut stream = listener.accept()?;
         let _ = handle_search_daemon_client(&mut stream, &record, &index);
     }
 }
 
 fn handle_search_daemon_client(
-    stream: &mut TcpStream,
+    stream: &mut SearchDaemonStream,
     record: &SearchDaemonRecord,
     index: &MappedIndex,
 ) -> Result<()> {
     let mut profile = SearchProfile::default();
     let read_timer = Instant::now();
     let cwd = read_search_daemon_request(stream, &record.token)?;
+    let mut stdout_fd = stream.receive_stdout_fd().ok().flatten();
     let wants_profile = cwd.args.iter().any(|arg| arg == "--profile-search");
     if wants_profile {
         profile.record("daemon_read_request", read_timer.elapsed());
@@ -2771,7 +3076,13 @@ fn handle_search_daemon_client(
             profile.record("daemon_parse_args", parse_timer.elapsed());
         }
         let search_timer = Instant::now();
-        let code = search_daemon_output_to_stream(index, &options, stream, &mut profile)?;
+        let code = search_daemon_output_to_stream(
+            index,
+            &options,
+            stream,
+            stdout_fd.take(),
+            &mut profile,
+        )?;
         if options.profile {
             profile.record("daemon_search_with_index_output", search_timer.elapsed());
             let mut stderr = Vec::new();
@@ -2782,6 +3093,7 @@ fn handle_search_daemon_client(
         Ok(())
     });
     if let Err(err) = result {
+        close_stdout_fd(stdout_fd.take());
         write_search_daemon_error(stream, &format!("indexsearch: {err:#}\n"))?;
     };
     if let Some(dir) = current_dir {
@@ -2793,10 +3105,12 @@ fn handle_search_daemon_client(
 fn search_daemon_output_to_stream(
     index: &MappedIndex,
     options: &Options,
-    stream: &mut TcpStream,
+    stream: &mut SearchDaemonStream,
+    stdout_fd: Option<StdoutFd>,
     profile: &mut SearchProfile,
 ) -> Result<i32> {
     if quiet_search_fast_path(options) {
+        close_stdout_fd(stdout_fd);
         let output = search_quiet_with_index_output(index, options)?;
         write_search_daemon_response_begin(stream)?;
         if !output.stderr.is_empty() {
@@ -2815,6 +3129,7 @@ fn search_daemon_output_to_stream(
         profile.record("search_load_deltas", delta_timer.elapsed());
     }
     if options.files {
+        close_stdout_fd(stdout_fd);
         let render_timer = if options.profile {
             Some(Instant::now())
         } else {
@@ -2842,48 +3157,100 @@ fn search_daemon_output_to_stream(
     } else {
         None
     };
-    let results = execute_search_rendered_segments(index, &deltas, options, &mut searched)?;
-    if let Some(execute_timer) = execute_timer {
-        profile.record(
-            "search_execute_and_render_segments",
-            execute_timer.elapsed(),
-        );
-    }
-
-    let output_timer = if options.profile {
-        Some(Instant::now())
-    } else {
-        None
-    };
     let mut stderr = Vec::new();
-    if options.stats {
-        let match_count: usize = results.iter().map(|r| r.match_count).sum();
-        writeln!(stderr, "{match_count} matches")?;
-        writeln!(stderr, "{} matched files", results.len())?;
-        writeln!(stderr, "{searched} candidate files")?;
-        writeln!(stderr, "{:.6} seconds", timer.elapsed().as_secs_f64())?;
-    }
     write_search_daemon_response_begin(stream)?;
-    if !options.quiet {
+    let stats = if let Some(stdout_fd) = stdout_fd {
+        #[cfg(unix)]
+        {
+            let stdout = unsafe { File::from_raw_fd(stdout_fd) };
+            let mut out = BufWriter::with_capacity(64 * 1024, stdout);
+            let stats = execute_search_rendered_segments_to_writer(
+                index,
+                &deltas,
+                options,
+                &mut searched,
+                &mut out,
+            )?;
+            out.flush()?;
+            stats
+        }
+        #[cfg(windows)]
+        {
+            let stdout = unsafe { File::from_raw_handle(stdout_fd) };
+            let mut out = BufWriter::with_capacity(64 * 1024, stdout);
+            let stats = execute_search_rendered_segments_to_writer(
+                index,
+                &deltas,
+                options,
+                &mut searched,
+                &mut out,
+            )?;
+            out.flush()?;
+            stats
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = stdout_fd;
+            unreachable!("stdout fd is only available on Unix")
+        }
+    } else {
         let stdout_writer = SearchDaemonFrameWriter {
             stream,
             tag: SEARCH_DAEMON_STDOUT_FRAME,
         };
         let mut out = BufWriter::with_capacity(64 * 1024, stdout_writer);
-        write_rendered_results(&mut out, &results, options)?;
+        let stats = execute_search_rendered_segments_to_writer(
+            index,
+            &deltas,
+            options,
+            &mut searched,
+            &mut out,
+        )?;
         out.flush()?;
+        stats
+    };
+    if let Some(execute_timer) = execute_timer {
+        profile.record("search_execute_render_and_stream", execute_timer.elapsed());
     }
-    if let Some(output_timer) = output_timer {
-        profile.record("search_stream_stdout", output_timer.elapsed());
+    if options.stats {
+        writeln!(stderr, "{} matches", stats.match_count)?;
+        writeln!(stderr, "{} matched files", stats.matched_files)?;
+        writeln!(stderr, "{searched} candidate files")?;
+        writeln!(stderr, "{:.6} seconds", timer.elapsed().as_secs_f64())?;
     }
     if !stderr.is_empty() {
         write_search_daemon_chunk(stream, SEARCH_DAEMON_STDERR_FRAME, &stderr)?;
     }
-    Ok(if results.is_empty() { 1 } else { 0 })
+    Ok(if stats.matched_files == 0 { 1 } else { 0 })
+}
+
+fn close_stdout_fd(stdout_fd: Option<StdoutFd>) {
+    #[cfg(unix)]
+    {
+        if let Some(stdout_fd) = stdout_fd {
+            unsafe {
+                libc::close(stdout_fd);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(stdout_fd) = stdout_fd {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(
+                    stdout_fd as windows_sys::Win32::Foundation::HANDLE,
+                );
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = stdout_fd;
+    }
 }
 
 struct SearchDaemonFrameWriter<'a> {
-    stream: &'a mut TcpStream,
+    stream: &'a mut SearchDaemonStream,
     tag: u8,
 }
 
@@ -2911,15 +3278,14 @@ fn request_search_daemon(
     args: &[String],
     mut profile: Option<&mut SearchProfile>,
 ) -> Result<i32> {
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], record.port));
     let connect_timer = Instant::now();
-    let mut stream = TcpStream::connect_timeout(&addr, SEARCH_DAEMON_CONNECT_TIMEOUT)?;
-    stream.set_nodelay(true)?;
+    let mut stream = SearchDaemonStream::connect(record)?;
     if let Some(profile) = profile.as_deref_mut() {
         profile.record("client_daemon_connect", connect_timer.elapsed());
     }
     let write_timer = Instant::now();
     write_search_daemon_request(&mut stream, record, args)?;
+    stream.send_stdout_fd(record)?;
     if let Some(profile) = profile.as_deref_mut() {
         profile.record("client_daemon_write_request", write_timer.elapsed());
     }
@@ -2932,7 +3298,7 @@ fn request_search_daemon(
 }
 
 fn write_search_daemon_request(
-    stream: &mut TcpStream,
+    stream: &mut SearchDaemonStream,
     record: &SearchDaemonRecord,
     args: &[String],
 ) -> Result<()> {
@@ -2952,7 +3318,7 @@ fn write_search_daemon_request(
 }
 
 fn read_search_daemon_request(
-    stream: &mut TcpStream,
+    stream: &mut SearchDaemonStream,
     expected_token: &str,
 ) -> Result<SearchDaemonRequest> {
     let mut magic = [0u8; 8];
@@ -2976,12 +3342,12 @@ fn read_search_daemon_request(
     })
 }
 
-fn write_search_daemon_response_begin(stream: &mut TcpStream) -> Result<()> {
+fn write_search_daemon_response_begin(stream: &mut SearchDaemonStream) -> Result<()> {
     stream.write_all(SEARCH_DAEMON_RESPONSE_MAGIC)?;
     Ok(())
 }
 
-fn write_search_daemon_chunk(stream: &mut TcpStream, tag: u8, bytes: &[u8]) -> Result<()> {
+fn write_search_daemon_chunk(stream: &mut SearchDaemonStream, tag: u8, bytes: &[u8]) -> Result<()> {
     if bytes.is_empty() {
         return Ok(());
     }
@@ -2991,20 +3357,20 @@ fn write_search_daemon_chunk(stream: &mut TcpStream, tag: u8, bytes: &[u8]) -> R
     Ok(())
 }
 
-fn write_search_daemon_done(stream: &mut TcpStream, code: i32) -> Result<()> {
+fn write_search_daemon_done(stream: &mut SearchDaemonStream, code: i32) -> Result<()> {
     stream.write_all(&[SEARCH_DAEMON_DONE_FRAME])?;
     write_u32(stream, code as u32)?;
     stream.flush()?;
     Ok(())
 }
 
-fn write_search_daemon_error(stream: &mut TcpStream, message: &str) -> Result<()> {
+fn write_search_daemon_error(stream: &mut SearchDaemonStream, message: &str) -> Result<()> {
     write_search_daemon_response_begin(stream)?;
     write_search_daemon_chunk(stream, SEARCH_DAEMON_STDERR_FRAME, message.as_bytes())?;
     write_search_daemon_done(stream, 2)
 }
 
-fn read_search_daemon_response_to_stdio(stream: &mut TcpStream) -> Result<i32> {
+fn read_search_daemon_response_to_stdio(stream: &mut SearchDaemonStream) -> Result<i32> {
     let mut magic = [0u8; 8];
     stream.read_exact(&mut magic)?;
     if &magic != SEARCH_DAEMON_RESPONSE_MAGIC {
@@ -3137,6 +3503,9 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
             "--stats" => options.stats = true,
             "--profile-search" => options.profile = true,
             "--color" => options.color = parse_color_choice(&need_value(arg)?)?,
+            "--sort" | "--sortr" => {
+                options.sort_path = parse_sort_choice(&need_value(arg)?);
+            }
             "--hidden" => options.hidden = true,
             "-L" | "--follow" => options.follow = true,
             "--no-auto-index" => options.auto_index = false,
@@ -3148,7 +3517,7 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
             }
             "--" => positional_only = true,
             "--no-messages" | "--no-ignore" | "--no-ignore-vcs" => {}
-            "--colors" | "--sort" | "--sortr" | "-j" | "--threads" => {
+            "--colors" | "-j" | "--threads" => {
                 let _ = need_value(arg)?;
             }
             "-m" | "--max-count" => options.max_count = Some(need_value(arg)?.parse()?),
@@ -3194,7 +3563,13 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
                 options.before_context = value;
                 options.after_context = value;
             }
-            _ if arg.starts_with("--sort=") || arg.starts_with("--sortr=") => {}
+            _ if arg.starts_with("--sort=") || arg.starts_with("--sortr=") => {
+                options.sort_path = parse_sort_choice(
+                    arg.split_once('=')
+                        .map(|(_, value)| value)
+                        .unwrap_or_default(),
+                );
+            }
             _ if arg.starts_with('-') => bail!("unsupported option: {arg}"),
             _ if options.pattern.is_empty() && regexps.is_empty() && !options.files => {
                 options.pattern = arg.clone();
@@ -3244,6 +3619,10 @@ fn parse_color_choice(value: &str) -> Result<ColorChoice> {
         "never" => Ok(ColorChoice::Never),
         _ => bail!("unsupported color mode: {value}"),
     }
+}
+
+fn parse_sort_choice(value: &str) -> bool {
+    matches!(value, "path")
 }
 
 fn parse_context_count(value: &str) -> Result<usize> {
@@ -4735,8 +5114,31 @@ fn execute_search_rendered_segments(
             execute_search_rendered(&delta.index, options, searched, &exclusions[idx + 1])?;
         results.append(&mut segment_results);
     }
-    results.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    if options.sort_path {
+        results.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    }
     Ok(results)
+}
+
+fn execute_search_rendered_segments_to_writer<W: Write>(
+    base: &MappedIndex,
+    deltas: &[DeltaSegment],
+    options: &Options,
+    searched: &mut u64,
+    out: &mut W,
+) -> Result<RenderStats> {
+    if !deltas.is_empty() {
+        let results = execute_search_rendered_segments(base, deltas, options, searched)?;
+        if !options.quiet {
+            write_rendered_results(out, &results, options)?;
+        }
+        return Ok(RenderStats {
+            match_count: results.iter().map(|result| result.match_count).sum(),
+            matched_files: results.len(),
+        });
+    }
+    let exclusions = segment_exclusions(base, deltas)?;
+    execute_search_rendered_to_writer(base, options, searched, &exclusions[0], out)
 }
 
 #[cold]
@@ -4913,8 +5315,115 @@ fn execute_search_rendered(
         })
         .filter_map(|result| result)
         .collect();
-    results.sort_by_key(|(ordinal, _)| *ordinal);
+    if options.sort_path {
+        results.sort_unstable_by(|(_, left), (_, right)| left.path.cmp(&right.path));
+    } else {
+        results.sort_by_key(|(ordinal, _)| *ordinal);
+    }
     Ok(results.into_iter().map(|(_, result)| result).collect())
+}
+
+fn execute_search_rendered_to_writer<W: Write>(
+    index: &MappedIndex,
+    options: &Options,
+    searched: &mut u64,
+    excluded_paths: &HashSet<String>,
+    out: &mut W,
+) -> Result<RenderStats> {
+    if let Some(chunk_candidates) = candidate_chunks(index, options)? {
+        return execute_search_rendered_chunks_to_writer(
+            index,
+            options,
+            searched,
+            excluded_paths,
+            chunk_candidates,
+            out,
+        );
+    }
+
+    let candidates = if let Some(prefixes) = whole_word_literal_prefixes(options) {
+        if let Some(candidates) = prefix_candidate_files(index, &prefixes)? {
+            candidates
+        } else if let Some(candidates) = word_fragment_candidate_files(index, options)? {
+            candidates
+        } else {
+            let alternatives = query_trigram_alternatives(options);
+            candidate_files(index, &alternatives)?
+        }
+    } else if let Some(candidates) = word_fragment_candidate_files(index, options)? {
+        candidates
+    } else if let Some(prefixes) = boundary_word_prefixes(options) {
+        if let Some(candidates) = prefix_candidate_files(index, &prefixes)? {
+            candidates
+        } else {
+            let alternatives = query_trigram_alternatives(options);
+            candidate_files(index, &alternatives)?
+        }
+    } else if let Some(spec) = qualified_call_spec(&options.pattern) {
+        if let Some(candidates) = qualified_call_candidate_files(index, &spec)? {
+            candidates
+        } else {
+            let alternatives = query_trigram_alternatives(options);
+            candidate_files(index, &alternatives)?
+        }
+    } else {
+        let alternatives = query_trigram_alternatives(options);
+        candidate_files(index, &alternatives)?
+    };
+    let candidates = chunk_bloom_filter_candidates(index, options, candidates)?;
+    let mut filtered = if excluded_paths.is_empty() && !has_path_restriction(options, &index.root) {
+        candidates
+    } else {
+        let path_filter = PathFilter::new(options, &index.root)?;
+        if excluded_paths.is_empty() && path_filter.is_unrestricted() {
+            candidates
+        } else {
+            candidates
+                .into_iter()
+                .filter_map(|id| {
+                    let path = bytes_to_string(index.file_path(id as usize).ok()?);
+                    path_filter.allows(&path, excluded_paths).then_some(id)
+                })
+                .collect()
+        }
+    };
+    *searched += filtered.len() as u64;
+    if filtered.len() < STREAMING_PIPELINE_MIN_CANDIDATES {
+        return collect_file_ids_to_writer(index, &filtered, options, out);
+    }
+    if options.sort_path {
+        sort_file_ids_by_path(index, &mut filtered);
+    }
+
+    let matcher = QueryMatcher::new(options)?;
+    let show_path = should_show_path(options);
+    let display_path = DisplayPathMapper::new(&index.root, options);
+    let separated = grouped_heading_output(options, show_path);
+    let (tx, rx) = mpsc::channel();
+    let total = filtered.len();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            filtered
+                .par_iter()
+                .enumerate()
+                .for_each_with(tx, |tx, (ordinal, id)| {
+                    let mut scratch = Vec::new();
+                    let result = index
+                        .file_for_search(*id as usize, &mut scratch)
+                        .ok()
+                        .and_then(|(path_bytes, content)| {
+                            let rel_path = bytes_to_string(path_bytes);
+                            let path = display_path.display(&rel_path);
+                            matcher
+                                .search_file_rendered(content, &path, options, show_path)
+                                .ok()
+                                .flatten()
+                        });
+                    let _ = tx.send((ordinal, result));
+                });
+        });
+        consume_ordered_rendered_results(rx, total, separated, out)
+    })
 }
 
 fn chunk_bloom_filter_candidates(
@@ -5014,8 +5523,176 @@ fn execute_search_rendered_chunks(
         })
         .filter_map(|result| result)
         .collect();
-    results.sort_by_key(|(file_id, _)| *file_id);
+    if options.sort_path {
+        results.sort_unstable_by(|(_, left), (_, right)| left.path.cmp(&right.path));
+    } else {
+        results.sort_by_key(|(file_id, _)| *file_id);
+    }
     Ok(results.into_iter().map(|(_, result)| result).collect())
+}
+
+fn execute_search_rendered_chunks_to_writer<W: Write>(
+    index: &MappedIndex,
+    options: &Options,
+    searched: &mut u64,
+    excluded_paths: &HashSet<String>,
+    chunk_candidates: Vec<u32>,
+    out: &mut W,
+) -> Result<RenderStats> {
+    let mut by_file: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for chunk_id in chunk_candidates {
+        let rec = index.chunk_record(chunk_id as usize)?;
+        by_file
+            .entry(rec.file_id)
+            .or_default()
+            .push(chunk_id as usize);
+    }
+
+    let mut filtered: Vec<(u32, Vec<usize>)> =
+        if excluded_paths.is_empty() && !has_path_restriction(options, &index.root) {
+            by_file.into_iter().collect()
+        } else {
+            let path_filter = PathFilter::new(options, &index.root)?;
+            if excluded_paths.is_empty() && path_filter.is_unrestricted() {
+                by_file.into_iter().collect()
+            } else {
+                by_file
+                    .into_iter()
+                    .filter_map(|(file_id, chunks)| {
+                        let path = bytes_to_string(index.file_path(file_id as usize).ok()?);
+                        path_filter
+                            .allows(&path, excluded_paths)
+                            .then_some((file_id, chunks))
+                    })
+                    .collect()
+            }
+        };
+    *searched += filtered.len() as u64;
+    if filtered.len() < STREAMING_PIPELINE_MIN_CANDIDATES {
+        let file_ids: Vec<u32> = filtered.iter().map(|(file_id, _)| *file_id).collect();
+        return collect_file_ids_to_writer(index, &file_ids, options, out);
+    }
+    if options.sort_path {
+        sort_file_entries_by_path(index, &mut filtered);
+    }
+
+    let matcher = QueryMatcher::new(options)?;
+    let show_path = should_show_path(options);
+    let display_path = DisplayPathMapper::new(&index.root, options);
+    let separated = grouped_heading_output(options, show_path);
+    let (tx, rx) = mpsc::channel();
+    let total = filtered.len();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            filtered.par_iter().enumerate().for_each_with(
+                tx,
+                |tx, (ordinal, (file_id, chunks))| {
+                    let mut scratch = Vec::new();
+                    let result = index
+                        .file_for_search(*file_id as usize, &mut scratch)
+                        .ok()
+                        .and_then(|(path_bytes, content)| {
+                            let rel_path = bytes_to_string(path_bytes);
+                            let path = display_path.display(&rel_path);
+                            let rendered = matcher
+                                .search_file_rendered(content, &path, options, show_path)
+                                .ok()
+                                .flatten();
+                            let _ = chunks;
+                            rendered
+                        });
+                    let _ = tx.send((ordinal, result));
+                },
+            );
+        });
+        consume_ordered_rendered_results(rx, total, separated, out)
+    })
+}
+
+fn collect_file_ids_to_writer<W: Write>(
+    index: &MappedIndex,
+    file_ids: &[u32],
+    options: &Options,
+    out: &mut W,
+) -> Result<RenderStats> {
+    let matcher = QueryMatcher::new(options)?;
+    let show_path = should_show_path(options);
+    let display_path = DisplayPathMapper::new(&index.root, options);
+    let mut results: Vec<(usize, RenderedFileResult)> = file_ids
+        .par_iter()
+        .enumerate()
+        .map_init(Vec::new, |scratch, id| {
+            let (ordinal, id) = id;
+            let (path_bytes, content) = index.file_for_search(*id as usize, scratch).ok()?;
+            let rel_path = bytes_to_string(path_bytes);
+            let path = display_path.display(&rel_path);
+            let rendered = matcher
+                .search_file_rendered(content, &path, options, show_path)
+                .ok()??;
+            Some((ordinal, rendered))
+        })
+        .filter_map(|result| result)
+        .collect();
+    if options.sort_path {
+        results.sort_unstable_by(|(_, left), (_, right)| left.path.cmp(&right.path));
+    } else {
+        results.sort_by_key(|(ordinal, _)| *ordinal);
+    }
+    let stats = RenderStats {
+        match_count: results.iter().map(|(_, result)| result.match_count).sum(),
+        matched_files: results.len(),
+    };
+    if !options.quiet {
+        let separated = grouped_heading_output(options, show_path);
+        for (idx, (_, result)) in results.iter().enumerate() {
+            if separated && idx != 0 {
+                writeln!(out)?;
+            }
+            out.write_all(&result.output)?;
+        }
+    }
+    Ok(stats)
+}
+
+fn sort_file_ids_by_path(index: &MappedIndex, file_ids: &mut [u32]) {
+    file_ids.sort_unstable_by(|left, right| compare_index_paths(index, *left, *right));
+}
+
+fn sort_file_entries_by_path(index: &MappedIndex, files: &mut [(u32, Vec<usize>)]) {
+    files.sort_unstable_by(|left, right| compare_index_paths(index, left.0, right.0));
+}
+
+fn compare_index_paths(index: &MappedIndex, left: u32, right: u32) -> Ordering {
+    let left_path = index.file_path(left as usize).unwrap_or_default();
+    let right_path = index.file_path(right as usize).unwrap_or_default();
+    left_path.cmp(right_path)
+}
+
+fn consume_ordered_rendered_results<W: Write>(
+    rx: mpsc::Receiver<(usize, Option<RenderedFileResult>)>,
+    total: usize,
+    separated: bool,
+    out: &mut W,
+) -> Result<RenderStats> {
+    let mut pending: BTreeMap<usize, Option<RenderedFileResult>> = BTreeMap::new();
+    let mut next = 0usize;
+    let mut stats = RenderStats::default();
+    for _ in 0..total {
+        let (ordinal, result) = rx.recv()?;
+        pending.insert(ordinal, result);
+        while let Some(result) = pending.remove(&next) {
+            if let Some(result) = result {
+                if separated && stats.matched_files != 0 {
+                    writeln!(out)?;
+                }
+                out.write_all(&result.output)?;
+                stats.match_count += result.match_count;
+                stats.matched_files += 1;
+            }
+            next += 1;
+        }
+    }
+    Ok(stats)
 }
 
 enum QueryMatcher {
@@ -7864,6 +8541,11 @@ fn search_daemon_record_path(root: &Path) -> PathBuf {
     root.join(INDEX_DIR).join(SEARCH_DAEMON_FILE)
 }
 
+#[cfg(unix)]
+fn search_daemon_socket_path(root: &Path) -> PathBuf {
+    root.join(INDEX_DIR).join("search-daemon.sock")
+}
+
 fn watch_registry_dir() -> PathBuf {
     env::var_os("HOME")
         .map(PathBuf::from)
@@ -7965,7 +8647,7 @@ fn search_daemon_token(root: &Path) -> String {
 
 fn write_search_daemon_record(record: &SearchDaemonRecord) -> Result<()> {
     fs::create_dir_all(record.root.join(INDEX_DIR))?;
-    let text = format!(
+    let mut text = format!(
         "version=1\npid={}\nport={}\ntoken={}\nroot={}\nexe_path={}\nexe_size={}\nexe_mtime={}\nindex_size={}\nindex_mtime={}\n",
         record.pid,
         record.port,
@@ -7977,6 +8659,9 @@ fn write_search_daemon_record(record: &SearchDaemonRecord) -> Result<()> {
         record.index_size,
         record.index_mtime
     );
+    if let Some(socket_path) = record.socket_path.as_ref() {
+        text.push_str(&format!("socket_path={}\n", socket_path.display()));
+    }
     fs::write(search_daemon_record_path(&record.root), text)?;
     Ok(())
 }
@@ -8033,6 +8718,7 @@ fn read_search_daemon_record(path: &Path) -> Result<SearchDaemonRecord> {
     let text = fs::read_to_string(path)?;
     let mut pid = 0;
     let mut port = 0;
+    let mut socket_path = None;
     let mut token = String::new();
     let mut root = PathBuf::new();
     let mut exe_path = PathBuf::new();
@@ -8047,6 +8733,7 @@ fn read_search_daemon_record(path: &Path) -> Result<SearchDaemonRecord> {
         match key {
             "pid" => pid = value.parse().unwrap_or(0),
             "port" => port = value.parse().unwrap_or(0),
+            "socket_path" => socket_path = Some(PathBuf::from(value)),
             "token" => token = value.to_string(),
             "root" => root = PathBuf::from(value),
             "exe_path" => exe_path = PathBuf::from(value),
@@ -8057,12 +8744,17 @@ fn read_search_daemon_record(path: &Path) -> Result<SearchDaemonRecord> {
             _ => {}
         }
     }
-    if pid == 0 || port == 0 || token.is_empty() || root.as_os_str().is_empty() {
+    if pid == 0
+        || (port == 0 && socket_path.is_none())
+        || token.is_empty()
+        || root.as_os_str().is_empty()
+    {
         bail!("invalid search daemon record {}", path.display());
     }
     Ok(SearchDaemonRecord {
         pid,
         port,
+        socket_path,
         token,
         root,
         exe_path,

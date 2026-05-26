@@ -111,7 +111,13 @@ chunk-posting index. Its hot path is:
 - Use a per-project search daemon for hot searches. The daemon keeps the mmap
   index open; the lightweight frontend only resolves the project,
   starts/connects to the daemon, sends the original rg-like search arguments,
-  and streams stdout/stderr response frames back to the caller.
+  and passes stdout to the daemon so it can write search output directly to the
+  caller. Unix/macOS uses descriptor passing over a Unix socket; Windows uses
+  `DuplicateHandle` with the daemon process. Control messages and stderr still
+  use the daemon connection.
+- Default search output is optimized for speed and follows the index candidate
+  order. Use `--sort path` when deterministic path ordering is more important
+  than the lowest latency.
 
 There is experimental chunk/bloom scaffolding in the codebase, but the release
 index described here does not rely on chunk-level postings yet.
@@ -224,8 +230,8 @@ stdout redirected to `/dev/null`.
 - IndexSearch indexed files: 196,961.
 - qgrep indexed files: 196,900 using near-identical UE-oriented include/exclude
   rules translated from `index-search-project.txt`.
-- Search timings are median wall-clock time: 5 runs for IndexSearch/qgrep and 1
-  run for `rg`.
+- Search timings are median wall-clock time: 7 runs for IndexSearch/qgrep and 3
+  runs for `rg`.
 - Match counts differ slightly where the tools' glob and output semantics are
   not perfectly identical; the `*.cpp` constrained row matches exactly.
 
@@ -241,15 +247,15 @@ stdout redirected to `/dev/null`.
 
 | Workload | Pattern | Matches `is/qgrep/rg` | `is` | qgrep | `rg` | `is` vs qgrep |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Literal: common token | `Nanite` | 14664 / 14672 / 13013 | 6.29ms | 19.70ms | 2971.12ms | 3.1x |
-| Literal: long symbol | `SkeletalMeshComponent` | 7606 / 7593 / 7605 | 5.65ms | 17.96ms | 3082.29ms | 3.2x |
-| Literal: missing | `DefinitelyMissingIndexSearchNeedle` | 0 / 0 / 0 | 2.76ms | 11.71ms | 3023.29ms | 4.2x |
-| Case-insensitive literal | `skeletalmeshcomponent` | 7616 / 7603 / 7615 | 8.75ms | 18.07ms | 3146.05ms | 2.1x |
-| Word regex | `\bActor\b` | 23675 / 23677 / 23665 | 11.88ms | 54.55ms | 3120.59ms | 4.6x |
-| Regex: alternation | `(Nanite\|Lumen\|SkeletalMeshComponent)` | 34500 / 34498 / 31439 | 26.55ms | 143.78ms | 3232.60ms | 5.4x |
-| Regex: prefix/suffix | `Skeletal[A-Za-z0-9_]*Component` | 7930 / 7917 / 7929 | 11.32ms | 21.15ms | 3009.33ms | 1.9x |
-| Regex: qualified call | `[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(` | 1487547 / 1487316 / 1481806 | 126.78ms | 362.25ms | 3148.65ms | 2.9x |
-| Glob: `*.cpp` literal | `Nanite` in `*.cpp` | 10061 / 10061 / 10061 | 5.40ms | 19.78ms | 1229.10ms | 3.7x |
+| Literal: common token | `Nanite` | 14664 / 14672 / 13013 | 5.54ms | 20.69ms | 3075.97ms | 3.7x |
+| Literal: long symbol | `SkeletalMeshComponent` | 7606 / 7593 / 7605 | 5.17ms | 17.57ms | 2993.50ms | 3.4x |
+| Literal: missing | `DefinitelyMissingIndexSearchNeedle` | 0 / 0 / 0 | 2.59ms | 12.16ms | 3073.61ms | 4.7x |
+| Case-insensitive literal | `skeletalmeshcomponent` | 7616 / 7603 / 7615 | 5.64ms | 18.36ms | 2987.83ms | 3.3x |
+| Word regex | `\bActor\b` | 23675 / 23677 / 23665 | 10.34ms | 52.20ms | 3032.03ms | 5.0x |
+| Regex: alternation | `(Nanite\|Lumen\|SkeletalMeshComponent)` | 34500 / 34498 / 31439 | 24.34ms | 120.64ms | 3058.48ms | 5.0x |
+| Regex: prefix/suffix | `Skeletal[A-Za-z0-9_]*Component` | 7930 / 7917 / 7929 | 10.13ms | 20.19ms | 3026.95ms | 2.0x |
+| Regex: qualified call | `[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(` | 1487547 / 1487316 / 1481806 | 82.48ms | 349.38ms | 3156.30ms | 4.2x |
+| Glob: `*.cpp` literal | `Nanite` in `*.cpp` | 10061 / 10061 / 10061 | 4.84ms | 20.58ms | 1294.54ms | 4.3x |
 
 For `-q` existence checks, IndexSearch stops as soon as a verified match is
 found. Quiet timings are median wall-clock time across 31 IndexSearch runs and
@@ -257,19 +263,21 @@ found. Quiet timings are median wall-clock time across 31 IndexSearch runs and
 
 | Workload | Pattern | `is -q` | qgrep search to `/dev/null` | `is` vs qgrep |
 | --- | --- | ---: | ---: | ---: |
-| Quiet literal hit | `Nanite` | 2.55ms | 18.97ms | 7.4x |
-| Quiet literal miss | `DefinitelyMissingIndexSearchNeedle` | 2.37ms | 11.16ms | 4.7x |
-| Quiet word regex | `\bActor\b` | 3.45ms | 52.82ms | 15.3x |
-| Quiet qualified regex | `[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(` | 2.72ms | 354.59ms | 130.6x |
+| Quiet literal hit | `Nanite` | 2.35ms | 20.14ms | 8.6x |
+| Quiet literal miss | `DefinitelyMissingIndexSearchNeedle` | 2.36ms | 11.91ms | 5.0x |
+| Quiet word regex | `\bActor\b` | 2.52ms | 53.44ms | 21.2x |
+| Quiet qualified regex | `[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(` | 2.45ms | 345.91ms | 141.1x |
 
 Both `indexsearch` and `is` are lightweight frontends; the installed full
-backend is `is-daemon`. Daemon responses are streamed in stdout/stderr frames so
-large result sets do not require an extra full-output buffer in the frontend.
+backend is `is-daemon`. Large search stdout is written directly from the daemon
+into the frontend's stdout on Unix/macOS and Windows, avoiding an extra RPC
+copy; stderr and control messages remain framed.
 
 To reproduce the search benchmark:
 
 ```bash
-python3 scripts/benchmark-ue.py /path/to/UnrealEngine --prepare-qgrep
+python3 scripts/benchmark-ue.py /path/to/UnrealEngine --prepare-qgrep \
+  --search-repeats 7 --rg-repeats 3
 ```
 
 For changes that may affect search performance, compare against one or more

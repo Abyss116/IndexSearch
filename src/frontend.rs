@@ -2,6 +2,12 @@ use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+#[cfg(windows)]
+use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -324,9 +330,27 @@ fn same_fileish(left: &Path, right: &Path) -> bool {
 }
 
 fn request_daemon(record: &DaemonRecord, args: &[String]) -> io::Result<i32> {
+    #[cfg(unix)]
+    if let Some(socket_path) = record.socket_path.as_ref() {
+        let mut stream = UnixStream::connect(socket_path)?;
+        write_daemon_request(&mut stream, record, args)?;
+        send_stdout_fd(&stream)?;
+        return read_daemon_response(&mut stream);
+    }
+
     let addr = SocketAddr::from(([127, 0, 0, 1], record.port));
     let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
     stream.set_nodelay(true)?;
+    write_daemon_request(&mut stream, record, args)?;
+    send_stdout_handle(&mut stream, record)?;
+    read_daemon_response(&mut stream)
+}
+
+fn write_daemon_request(
+    mut stream: &mut impl Write,
+    record: &DaemonRecord,
+    args: &[String],
+) -> io::Result<()> {
     stream.write_all(REQUEST_MAGIC)?;
     write_frame(&mut stream, record.token.as_bytes())?;
     let cwd = env::current_dir()
@@ -339,7 +363,10 @@ fn request_daemon(record: &DaemonRecord, args: &[String]) -> io::Result<i32> {
         write_frame(&mut stream, arg.as_bytes())?;
     }
     stream.flush()?;
+    Ok(())
+}
 
+fn read_daemon_response(mut stream: &mut impl Read) -> io::Result<i32> {
     let mut magic = [0u8; 8];
     stream.read_exact(&mut magic)?;
     if &magic != RESPONSE_MAGIC {
@@ -371,6 +398,93 @@ fn request_daemon(record: &DaemonRecord, args: &[String]) -> io::Result<i32> {
                 ));
             }
         }
+    }
+}
+
+#[cfg(unix)]
+fn send_stdout_fd(stream: &UnixStream) -> io::Result<()> {
+    use std::mem;
+    use std::ptr;
+
+    let fd = io::stdout().as_raw_fd();
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: byte.len(),
+    };
+    let fd_size = mem::size_of_val(&fd);
+    let mut control = vec![0u8; unsafe { libc::CMSG_SPACE(fd_size as _) } as usize];
+    let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len() as _;
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        if cmsg.is_null() {
+            return Err(io::Error::other("missing fd control header"));
+        }
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(fd_size as _) as _;
+        ptr::copy_nonoverlapping(
+            &fd as *const _ as *const u8,
+            libc::CMSG_DATA(cmsg).cast::<u8>(),
+            fd_size,
+        );
+        msg.msg_controllen = (*cmsg).cmsg_len as _;
+        if libc::sendmsg(stream.as_raw_fd(), &msg, 0) == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn send_stdout_handle(stream: &mut TcpStream, record: &DaemonRecord) -> io::Result<()> {
+    let handle = duplicate_stdout_for_process(record.pid)
+        .map(|handle| handle as usize as u64)
+        .unwrap_or(0);
+    stream.write_all(&handle.to_le_bytes())
+}
+
+#[cfg(not(windows))]
+fn send_stdout_handle(_stream: &mut TcpStream, _record: &DaemonRecord) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn duplicate_stdout_for_process(pid: u32) -> io::Result<RawHandle> {
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE,
+    };
+
+    unsafe {
+        let target_process = OpenProcess(PROCESS_DUP_HANDLE, 0, pid);
+        if target_process.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut target_handle: HANDLE = ptr::null_mut();
+        let ok = DuplicateHandle(
+            GetCurrentProcess(),
+            io::stdout().as_raw_handle() as HANDLE,
+            target_process,
+            &mut target_handle,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        );
+        let result = if ok == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(target_handle as RawHandle)
+        };
+        CloseHandle(target_process);
+        result
     }
 }
 
@@ -495,7 +609,9 @@ fn record_path(root: &Path) -> PathBuf {
 
 #[derive(Default)]
 struct DaemonRecord {
+    pid: u32,
     port: u16,
+    socket_path: Option<PathBuf>,
     token: String,
     root: PathBuf,
     exe_path: PathBuf,
@@ -513,7 +629,9 @@ fn read_record(path: &Path) -> Result<DaemonRecord, String> {
             continue;
         };
         match key {
+            "pid" => record.pid = value.parse().map_err(|_| "invalid daemon pid")?,
             "port" => record.port = value.parse().map_err(|_| "invalid daemon port")?,
+            "socket_path" => record.socket_path = Some(PathBuf::from(value)),
             "token" => record.token = value.to_string(),
             "root" => record.root = PathBuf::from(value),
             "exe_path" => record.exe_path = PathBuf::from(value),
@@ -526,7 +644,8 @@ fn read_record(path: &Path) -> Result<DaemonRecord, String> {
             _ => {}
         }
     }
-    if record.port == 0
+    if record.pid == 0
+        || (record.port == 0 && record.socket_path.is_none())
         || record.token.is_empty()
         || record.root.as_os_str().is_empty()
         || record.exe_path.as_os_str().is_empty()

@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "indexsearch"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -113,6 +113,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "walkdir",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

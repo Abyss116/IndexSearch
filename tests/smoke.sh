@@ -49,6 +49,8 @@ grep -q "$tmp/src/a.cc:2:needle here" <<<"$result"
 grep -q "$tmp/src/b.txt:1:Needle there" <<<"$result"
 ! grep -q 'c.bin' <<<"$result"
 ! grep -q 'out/d.cc' <<<"$result"
+sorted_result="$(./indexsearch --sort path -n -i needle "$tmp")"
+[[ "$sorted_result" == "$tmp/src/a.cc:2:needle here"* ]]
 mkdir -p "$tmp/src/sub"
 printf 'needle nested\n' > "$tmp/src/sub/nested.txt"
 ./indexsearch update "$tmp" >/dev/null
