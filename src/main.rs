@@ -564,7 +564,7 @@ fn print_help() {
     help_command(
         &style,
         "install [--dir PATH]",
-        "copy this executable and the is alias into a user bin dir",
+        "copy indexsearch and is into a user bin dir",
     );
     help_command(
         &style,
@@ -808,7 +808,7 @@ fn print_install_help() {
         &style,
         "install",
         "[OPTIONS] [DIR]",
-        "copy this executable and the is alias into a user bin dir",
+        "copy indexsearch and is into a user bin dir",
     );
     help_section(&style, "Options");
     help_option(
@@ -1550,6 +1550,10 @@ fn command_install(args: &[String]) -> Result<i32> {
     let exe_path = dir.join(exe_name);
     let alias_path = dir.join(executable_name("is"));
     install_executable(&src, &exe_path)?;
+    let frontend_src = src
+        .parent()
+        .map(|parent| parent.join(executable_name("is")))
+        .filter(|path| path.is_file());
     #[cfg(windows)]
     {
         let legacy_alias_path = dir.join("is.cmd");
@@ -1557,7 +1561,11 @@ fn command_install(args: &[String]) -> Result<i32> {
             let _ = fs::remove_file(&legacy_alias_path);
         }
     }
-    install_alias(&exe_path, &alias_path)?;
+    if let Some(frontend_src) = frontend_src {
+        install_executable(&frontend_src, &alias_path)?;
+    } else {
+        install_alias(&exe_path, &alias_path)?;
+    }
     println!("installed: {}", exe_path.display());
     println!("alias: {}", alias_path.display());
     if !path_contains(&dir) {
@@ -4623,7 +4631,16 @@ fn search_candidate_files(
     options: &Options,
     excluded_paths: &HashSet<String>,
 ) -> Result<Vec<u32>> {
-    let candidates = if let Some(candidates) = word_fragment_candidate_files(index, options)? {
+    let candidates = if let Some(prefixes) = whole_word_literal_prefixes(options) {
+        if let Some(candidates) = prefix_candidate_files(index, &prefixes)? {
+            candidates
+        } else if let Some(candidates) = word_fragment_candidate_files(index, options)? {
+            candidates
+        } else {
+            let alternatives = query_trigram_alternatives(options);
+            candidate_files(index, &alternatives)?
+        }
+    } else if let Some(candidates) = word_fragment_candidate_files(index, options)? {
         candidates
     } else if let Some(prefixes) = boundary_word_prefixes(options) {
         if let Some(candidates) = prefix_candidate_files(index, &prefixes)? {
@@ -4697,7 +4714,16 @@ fn execute_search_rendered(
         );
     }
 
-    let candidates = if let Some(candidates) = word_fragment_candidate_files(index, options)? {
+    let candidates = if let Some(prefixes) = whole_word_literal_prefixes(options) {
+        if let Some(candidates) = prefix_candidate_files(index, &prefixes)? {
+            candidates
+        } else if let Some(candidates) = word_fragment_candidate_files(index, options)? {
+            candidates
+        } else {
+            let alternatives = query_trigram_alternatives(options);
+            candidate_files(index, &alternatives)?
+        }
+    } else if let Some(candidates) = word_fragment_candidate_files(index, options)? {
         candidates
     } else if let Some(prefixes) = boundary_word_prefixes(options) {
         if let Some(candidates) = prefix_candidate_files(index, &prefixes)? {
@@ -5326,6 +5352,19 @@ fn boundary_word_prefixes(options: &Options) -> Option<Vec<Vec<u8>>> {
         return None;
     };
     Some(prefixes)
+}
+
+fn whole_word_literal_prefixes(options: &Options) -> Option<Vec<Vec<u8>>> {
+    if !options.whole_word || options.ignore_case && !options.pattern.is_ascii() {
+        return None;
+    }
+    if !(options.fixed || regex_meta_free(&options.pattern)) {
+        return None;
+    }
+    if !is_ascii_word_literal(&options.pattern) || options.pattern.len() < PREFIX_MIN_LEN {
+        return None;
+    }
+    Some(vec![lower_bytes(options.pattern.as_bytes())])
 }
 
 fn qualified_call_regex(options: &Options) -> Option<QueryMatcher> {

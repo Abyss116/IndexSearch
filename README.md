@@ -4,12 +4,15 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
 IndexSearch is a Rust command line search tool for very large source trees. It
-keeps a persistent binary trigram index plus stored text snapshots, so repeated
+keeps a persistent binary index plus compressed text snapshots, so repeated
 searches avoid walking the filesystem. The CLI intentionally follows common
 `rg` output conventions closely enough to stand in for `rg` on large indexed
 codebases.
 
-The short command is `is`; the full command is `indexsearch`.
+The short command is `is`; the full command is `indexsearch`. Release archives
+include both executables: `indexsearch` is the full indexer/backend, while `is`
+is a small search frontend that talks to the per-project daemon and delegates
+management commands back to `indexsearch`.
 
 ## Install
 
@@ -47,13 +50,14 @@ into a user-writable bin directory:
 ./indexsearch install
 ```
 
-This self-copy install puts `indexsearch` and the short `is` alias into
-`~/.local/bin` on macOS/Linux or `%USERPROFILE%\.local\bin` on Windows. Use
-`indexsearch install --dir PATH` to override the install directory. Package
-manager installs already put `indexsearch` and `is` on PATH and do not need
-this step. On Windows the alias is a native `is.exe`, not an `is.cmd` wrapper,
-so PowerShell metacharacters inside quoted patterns are not re-parsed by
-`cmd.exe`.
+This self-copy install puts `indexsearch` and `is` into `~/.local/bin` on
+macOS/Linux or `%USERPROFILE%\.local\bin` on Windows. If the archive contains
+the lightweight `is` frontend, it is installed directly; otherwise `install`
+falls back to an alias for `indexsearch`. Use `indexsearch install --dir PATH`
+to override the install directory. Package manager installs already put
+`indexsearch` and `is` on PATH and do not need this step. On Windows the alias
+is a native `is.exe`, not an `is.cmd` wrapper, so PowerShell metacharacters
+inside quoted patterns are not re-parsed by `cmd.exe`.
 
 ## Quick Start
 
@@ -84,6 +88,35 @@ out/
 [IndexSearch.files.include]
 *
 ```
+
+## How It Works
+
+The current index is file-oriented, not a full suffix array and not a
+chunk-posting index. Its hot path is:
+
+- Walk the configured project once, honoring `index-search-project.txt`, hidden
+  path rules, file globs, and the max file size.
+- Read searchable text files in parallel, skip binary-looking files, and store
+  each file's relative path, size, mtime, and LZ4-compressed content snapshot.
+- Build a case-folded trigram posting table from each file. Search intersects
+  the rarest required trigrams to get candidate file ids before decompressing.
+- Add a few general source-code postings on top of trigrams: identifier prefix
+  keys, selected 6-byte word-fragment keys, and qualified-call keys for patterns
+  such as `Type::Method(`. These are generic identifier indexes, not UE-specific
+  hard-coded symbols.
+- For each candidate, decompress only the stored snapshot and verify with fast
+  literal scanners, Aho-Corasick literal sets, specialized source-pattern
+  matchers, or Rust's regex engine, depending on the query.
+- Keep updates as base index plus delta segments. Git-aware update and watcher
+  updates can write tiny deltas for changed paths; `compact` atomically folds
+  those deltas into a new base index.
+- Use a per-project search daemon for hot searches. The daemon keeps the mmap
+  index open; the `is` frontend only resolves the project, starts/connects to
+  the daemon, sends the original rg-like search arguments, and writes the daemon
+  response.
+
+There is experimental chunk/bloom scaffolding in the codebase, but the release
+index described here does not rely on chunk-level postings yet.
 
 ## Search Freshness
 
@@ -128,11 +161,11 @@ is watch . --idle-seconds 5 --compact-delta-count 16 --compact-delta-bytes 256mb
 
 Hot searches automatically try a per-project search daemon when an existing
 index is present. The daemon keeps the mmap-backed index open and serves
-requests over localhost. This trims repeated index-open work, but every shell
-command still starts a small client process, parses arguments, reads the daemon
-record, checks the binary/index fingerprint, and performs local IPC. That fixed
-client-side cost is why daemon speedups are useful but not dramatic for already
-sub-10ms searches.
+requests over localhost. The `is` executable is intentionally much smaller than
+the full backend and does only enough client-side work to locate the index,
+validate or start the daemon, pass through arguments, and copy the response.
+Use `indexsearch` directly when you need the full management surface or want to
+compare the old full-client path.
 
 Use either form to bypass the daemon:
 
@@ -142,9 +175,11 @@ INDEXSEARCH_NO_DAEMON=1 is -F "SomeSymbol" .
 ```
 
 Daemon records live in `.indexsearch/search-daemon.txt`. If `indexsearch
-install` replaces the executable, or if the base index is rebuilt/compacted, the
-next search detects the fingerprint mismatch, stops the old daemon, and starts a
-fresh one.
+install` replaces the backend executable, or if the base index is
+rebuilt/compacted, the next search detects the fingerprint mismatch and starts a
+fresh daemon. If no index exists above the current directory, interactive `is`
+asks whether to create one in the current directory; non-interactive use prints
+the explicit `indexsearch index .` / `is watch .` hint instead.
 
 ## Unreal Engine
 
@@ -189,10 +224,10 @@ Benchmarks below were run on a local Unreal Engine checkout at
 stdout redirected to `/dev/null`.
 
 - Repository size: 289 GB.
-- IndexSearch indexed files: 196,919.
+- IndexSearch indexed files: 196,961.
 - qgrep indexed files: 196,900 using near-identical UE-oriented include/exclude
   rules translated from `index-search-project.txt`.
-- Search timings are median wall-clock time: 5 runs for IndexSearch/qgrep and 3
+- Search timings are median wall-clock time: 7 runs for IndexSearch/qgrep and 2
   runs for `rg`.
 - Match counts differ slightly where the tools' glob and output semantics are
   not perfectly identical; the `*.cpp` constrained row matches exactly.
@@ -201,23 +236,23 @@ stdout redirected to `/dev/null`.
 
 | Operation | IndexSearch | qgrep | Notes |
 | --- | ---: | ---: | --- |
-| Fresh index | 12.62s | 21.50s | IndexSearch timing: scan 3.38s, process 6.16s, write 3.08s |
-| No-change update | 0.34s | 4.19s | IndexSearch reused the existing index with no file scan work |
-| No-change `update --git` | 0.50s | n/a | Git changed-path check only |
+| Fresh index | 13.53s | 21.50s | IndexSearch timing: scan 3.64s, process 6.67s, write 3.21s |
+| No-change update | 0.27s | 4.19s | Git changed-path check, no file scan work |
+| Compact 2 deltas | 8.61s | n/a | Folded 196,961 visible files into a new base index |
 
 ### Search
 
 | Workload | Pattern | Matches `is/qgrep/rg` | `is` | qgrep | `rg` | `is` vs qgrep |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Literal: common token | `Nanite` | 14664 / 14672 / 13013 | 6.77ms | 20.19ms | 3040.87ms | 3.0x |
-| Literal: long symbol | `SkeletalMeshComponent` | 7593 / 7593 / 7592 | 6.30ms | 17.99ms | 2997.93ms | 2.9x |
-| Literal: missing | `DefinitelyMissingIndexSearchNeedle` | 0 / 0 / 0 | 3.70ms | 10.95ms | 3001.30ms | 3.0x |
-| Case-insensitive literal | `skeletalmeshcomponent` | 7603 / 7603 / 7602 | 6.64ms | 19.01ms | 3041.92ms | 2.9x |
-| Word regex | `\bActor\b` | 23674 / 23677 / 23664 | 33.01ms | 55.19ms | 3009.37ms | 1.7x |
-| Regex: alternation | `(Nanite\|Lumen\|SkeletalMeshComponent)` | 34487 / 34498 / 31426 | 26.69ms | 120.20ms | 2986.67ms | 4.5x |
-| Regex: prefix/suffix | `Skeletal[A-Za-z0-9_]*Component` | 7917 / 7917 / 7916 | 11.20ms | 21.27ms | 3013.93ms | 1.9x |
-| Regex: qualified call | `[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(` | 1487173 / 1487316 / 1481426 | 124.77ms | 365.74ms | 3112.35ms | 2.9x |
-| Glob: `*.cpp` literal | `Nanite` in `*.cpp` | 10061 / 10061 / 10061 | 6.44ms | 21.25ms | 1320.87ms | 3.3x |
+| Literal: common token | `Nanite` | 14664 / 14672 / 13013 | 7.02ms | 21.61ms | 3060.36ms | 3.1x |
+| Literal: long symbol | `SkeletalMeshComponent` | 7606 / 7593 / 7605 | 7.34ms | 19.61ms | 3027.68ms | 2.7x |
+| Literal: missing | `DefinitelyMissingIndexSearchNeedle` | 0 / 0 / 0 | 2.63ms | 12.72ms | 3005.92ms | 4.8x |
+| Case-insensitive literal | `skeletalmeshcomponent` | 7616 / 7603 / 7615 | 7.62ms | 19.76ms | 2935.81ms | 2.6x |
+| Word regex | `\bActor\b` | 23675 / 23677 / 23665 | 22.37ms | 52.76ms | 2981.87ms | 2.4x |
+| Regex: alternation | `(Nanite\|Lumen\|SkeletalMeshComponent)` | 34500 / 34498 / 31439 | 38.39ms | 118.74ms | 2979.52ms | 3.1x |
+| Regex: prefix/suffix | `Skeletal[A-Za-z0-9_]*Component` | 7930 / 7917 / 7929 | 13.69ms | 23.93ms | 2969.24ms | 1.7x |
+| Regex: qualified call | `[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(` | 1487547 / 1487316 / 1481806 | 239.01ms | 345.83ms | 3056.53ms | 1.4x |
+| Glob: `*.cpp` literal | `Nanite` in `*.cpp` | 10061 / 10061 / 10061 | 5.41ms | 21.78ms | 1237.28ms | 4.0x |
 
 For `-q` existence checks, IndexSearch stops as soon as a verified match is
 found. Quiet timings are median wall-clock time across 31 IndexSearch runs and
@@ -225,10 +260,19 @@ found. Quiet timings are median wall-clock time across 31 IndexSearch runs and
 
 | Workload | Pattern | `is -q` | qgrep search to `/dev/null` | `is` vs qgrep |
 | --- | --- | ---: | ---: | ---: |
-| Quiet literal hit | `Nanite` | 3.67ms | 20.99ms | 5.7x |
-| Quiet literal miss | `DefinitelyMissingIndexSearchNeedle` | 3.27ms | 11.78ms | 3.6x |
-| Quiet word regex | `\bActor\b` | 4.03ms | 53.23ms | 13.2x |
-| Quiet qualified regex | `[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(` | 3.28ms | 341.42ms | 104.1x |
+| Quiet literal hit | `Nanite` | 4.61ms | 20.60ms | 4.5x |
+| Quiet literal miss | `DefinitelyMissingIndexSearchNeedle` | 2.39ms | 12.14ms | 5.1x |
+| Quiet word regex | `\bActor\b` | 2.73ms | 55.19ms | 20.2x |
+| Quiet qualified regex | `[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(` | 2.78ms | 347.91ms | 125.1x |
+
+The lightweight `is` frontend reduces fixed process/client overhead compared
+with invoking the full `indexsearch` binary for daemon-backed search:
+
+| Workload | Full `indexsearch` client | Lightweight `is` frontend | Speedup |
+| --- | ---: | ---: | ---: |
+| `-q -F Nanite` | 6.17ms | 4.61ms | 1.3x |
+| `-q -F DefinitelyMissingIndexSearchNeedle` | 3.53ms | 2.20ms | 1.6x |
+| `-q -w Actor` | 3.86ms | 2.65ms | 1.5x |
 
 To reproduce the search benchmark:
 
@@ -247,6 +291,7 @@ Requirements:
 cargo build --release
 cargo test --locked
 ./target/release/indexsearch --version
+./target/release/is --version
 ./target/release/indexsearch install-skills --help
 ```
 

@@ -15,7 +15,7 @@ grep -q 'Commands' <<<"$help_out"
 grep -q 'Common Search Options' <<<"$help_out"
 ! grep -q '<init|' <<<"$help_out"
 install_help="$(./indexsearch install --help)"
-grep -q 'copy this executable and the is alias' <<<"$install_help"
+grep -q 'copy indexsearch and is' <<<"$install_help"
 grep -q -- '--dir PATH' <<<"$install_help"
 watch_help="$(./indexsearch watch --help)"
 grep -q -- '--compact-delta-count NUM' <<<"$watch_help"
@@ -43,6 +43,7 @@ printf 'needle ignored\n' > "$tmp/src/c.bin"
 printf 'needle ignored\n' > "$tmp/out/d.cc"
 
 ./indexsearch index "$tmp" >/dev/null
+./is -q -F needle "$tmp"
 result="$(./indexsearch -n -i needle "$tmp")"
 grep -q "$tmp/src/a.cc:2:needle here" <<<"$result"
 grep -q "$tmp/src/b.txt:1:Needle there" <<<"$result"
@@ -205,9 +206,7 @@ if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* ]]; then
 fi
 "$install_exe" --version >/dev/null
 "$install_alias" --version >/dev/null
-if [[ "$(uname -s)" != MINGW* && "$(uname -s)" != MSYS* ]]; then
-  [[ -L "$install_alias" ]]
-fi
+[[ -x "$install_alias" || -L "$install_alias" ]]
 HOME="$skills_home" ./indexsearch install-skills --target all --scope user >/dev/null
 [[ -f "$skills_home/.codex/skills/indexsearch/SKILL.md" ]]
 [[ -f "$skills_home/.claude/skills/indexsearch/SKILL.md" ]]

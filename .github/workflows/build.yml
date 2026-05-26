@@ -77,10 +77,12 @@ jobs:
           mkdir -p "dist/${{ matrix.artifact }}"
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "target/${{ matrix.target }}/release/indexsearch.exe" "dist/${{ matrix.artifact }}/"
-            cp "target/${{ matrix.target }}/release/indexsearch.exe" "dist/${{ matrix.artifact }}/is.exe"
+            cp "target/${{ matrix.target }}/release/is.exe" "dist/${{ matrix.artifact }}/"
           else
             cp "target/${{ matrix.target }}/release/indexsearch" "dist/${{ matrix.artifact }}/"
+            cp "target/${{ matrix.target }}/release/is" "dist/${{ matrix.artifact }}/"
             chmod +x "dist/${{ matrix.artifact }}/indexsearch"
+            chmod +x "dist/${{ matrix.artifact }}/is"
           fi
           cp README.md "dist/${{ matrix.artifact }}/"
           cp LICENSE-MIT LICENSE-APACHE "dist/${{ matrix.artifact }}/"
@@ -185,7 +187,11 @@ jobs:
               odie "IndexSearch archive layout changed" if payload.nil?
               cd payload do
                 bin.install "indexsearch"
-                bin.install_symlink "indexsearch" => "is"
+                if File.exist?("is")
+                  bin.install "is"
+                else
+                  bin.install_symlink "indexsearch" => "is"
+                end
                 pkgshare.install "skills" if Dir.exist?("skills")
                 pkgshare.install "agent-rules" if Dir.exist?("agent-rules")
                 pkgshare.install "templates" if Dir.exist?("templates")
