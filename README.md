@@ -57,6 +57,19 @@ binaries on PATH and do not need this step. On Windows `is` is a native
 `is.exe`, not an `is.cmd` wrapper, so PowerShell metacharacters inside quoted
 patterns are not re-parsed by `cmd.exe`.
 
+If Windows reports `Access is denied` during `install`, an older
+`is-daemon.exe` is probably still running or temporarily locked by the OS. Stop
+that process and run `indexsearch.exe install` again:
+
+```powershell
+Get-Process is-daemon -ErrorAction SilentlyContinue | Stop-Process -Force
+.\indexsearch.exe install
+```
+
+Newer releases also write a versioned backend such as
+`is-daemon-0.3.4.exe`, so a locked old backend no longer prevents installing
+the new frontend.
+
 ## Quick Start
 
 ```bash
@@ -239,7 +252,7 @@ stdout redirected to `/dev/null`.
 
 | Operation | IndexSearch | qgrep | Notes |
 | --- | ---: | ---: | --- |
-| Fresh index | 13.53s | 21.50s | IndexSearch timing: scan 3.64s, process 6.67s, write 3.21s |
+| Fresh index | 11.52s | 21.50s | IndexSearch timing: scan 4.19s, process 6.21s, write 1.11s |
 | No-change update | 0.27s | 4.19s | Git changed-path check, no file scan work |
 | Compact 2 deltas | 8.61s | n/a | Folded 196,961 visible files into a new base index |
 

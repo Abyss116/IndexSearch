@@ -541,7 +541,8 @@ fn backend_path() -> Result<PathBuf, String> {
     let dir = exe
         .parent()
         .ok_or_else(|| "current executable has no parent".to_string())?;
-    for name in ["is-daemon", "indexsearch"] {
+    let versioned_daemon = format!("is-daemon-{}", env!("CARGO_PKG_VERSION"));
+    for name in [versioned_daemon.as_str(), "is-daemon", "indexsearch"] {
         let sibling = dir.join(executable_name(name));
         if sibling.is_file() && fs::canonicalize(&sibling).ok() != fs::canonicalize(&exe).ok() {
             return Ok(sibling);

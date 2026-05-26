@@ -55,6 +55,7 @@ const SEARCH_DAEMON_DONE_FRAME: u8 = 3;
 const SEARCH_DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_millis(20);
 const SEARCH_DAEMON_START_TIMEOUT: Duration = Duration::from_millis(250);
 const STREAMING_PIPELINE_MIN_CANDIDATES: usize = 50_000;
+const POSTING_BUILD_CHUNK_FILES: usize = 4096;
 const DEFAULT_PROJECT_CONFIG: &str = "[IndexSearch.paths.ignore]\n.git/\n.hg/\n.svn/\n.indexsearch/\n\n\
 [IndexSearch.files.ignore]\nindex-search-project.txt\n*.png\n*.jpg\n*.jpeg\n*.gif\n*.pdf\n*.zip\n*.gz\n*.dll\n*.exe\n*.pdb\n*.o\n*.obj\n\n\
 [IndexSearch.files.include]\n*\n";
@@ -1578,7 +1579,27 @@ fn command_install(args: &[String]) -> Result<i32> {
     let daemon_path = dir.join(executable_name("is-daemon"));
     let exe_path = dir.join(executable_name("indexsearch"));
     let alias_path = dir.join(executable_name("is"));
-    install_executable(&src, &daemon_path)?;
+    #[cfg(windows)]
+    let installed_backend_path = {
+        let versioned_daemon_path = dir.join(executable_name(&format!(
+            "is-daemon-{}",
+            env!("CARGO_PKG_VERSION")
+        )));
+        install_executable(&src, &versioned_daemon_path)?;
+        if let Err(err) = install_executable(&src, &daemon_path) {
+            eprintln!(
+                "indexsearch: warning: could not replace {}; installed versioned backend {} instead ({err:#})",
+                daemon_path.display(),
+                versioned_daemon_path.display()
+            );
+        }
+        versioned_daemon_path
+    };
+    #[cfg(not(windows))]
+    let installed_backend_path = {
+        install_executable(&src, &daemon_path)?;
+        daemon_path.clone()
+    };
     let frontend_src = src
         .parent()
         .map(|parent| parent.join(executable_name("indexsearch")))
@@ -1603,10 +1624,13 @@ fn command_install(args: &[String]) -> Result<i32> {
         install_executable(&short_frontend_src, &alias_path)?;
         install_executable(&short_frontend_src, &exe_path)?;
     } else {
-        install_alias(&daemon_path, &alias_path)?;
-        install_alias(&daemon_path, &exe_path)?;
+        install_alias(&installed_backend_path, &alias_path)?;
+        install_alias(&installed_backend_path, &exe_path)?;
     }
-    println!("installed: {}", daemon_path.display());
+    println!("installed: {}", installed_backend_path.display());
+    if installed_backend_path != daemon_path {
+        println!("legacy backend: {}", daemon_path.display());
+    }
     println!("frontend: {}", exe_path.display());
     println!("frontend: {}", alias_path.display());
     if !path_contains(&dir) {
@@ -3792,25 +3816,13 @@ fn build_index(
         .collect();
     files.sort_by_key(|(idx, _, _, _)| *idx);
 
-    let mut postings: HashMap<u32, Vec<u32>> = HashMap::default();
     let selected_fragments = selected_word_fragments(
         files
             .iter()
             .map(|(_, _, _, fragments)| fragments.as_slice()),
     );
-    let mut out_files = Vec::with_capacity(files.len());
-    for (_, file, grams, fragments) in files {
-        let id = out_files.len() as u32;
-        for gram in grams {
-            postings.entry(gram).or_default().push(id);
-        }
-        for fragment in fragments {
-            if selected_fragments.contains(&fragment) {
-                postings.entry(fragment).or_default().push(id);
-            }
-        }
-        out_files.push(file);
-    }
+    let postings = build_postings_parallel(&files, &selected_fragments);
+    let out_files = files.into_iter().map(|(_, file, _, _)| file).collect();
     *skipped += skipped_reads.load(AtomicOrdering::Relaxed);
     if let Some(timings) = timings {
         timings.process += process_timer.elapsed().as_secs_f64();
@@ -3854,6 +3866,43 @@ fn read_current_file_entry(
         },
         grams,
     )))
+}
+
+fn build_postings_parallel(
+    files: &[(usize, FileEntry, Vec<u32>, Vec<u32>)],
+    selected_fragments: &HashSet<u32>,
+) -> HashMap<u32, Vec<u32>> {
+    let partials: Vec<HashMap<u32, Vec<u32>>> = files
+        .par_chunks(POSTING_BUILD_CHUNK_FILES)
+        .enumerate()
+        .map(|(chunk_idx, chunk)| {
+            let mut local = HashMap::default();
+            let base_id = chunk_idx * POSTING_BUILD_CHUNK_FILES;
+            for (idx, (_, _, grams, fragments)) in chunk.iter().enumerate() {
+                let id = (base_id + idx) as u32;
+                for &gram in grams {
+                    local.entry(gram).or_insert_with(Vec::new).push(id);
+                }
+                for &fragment in fragments {
+                    if selected_fragments.contains(&fragment) {
+                        local.entry(fragment).or_insert_with(Vec::new).push(id);
+                    }
+                }
+            }
+            local
+        })
+        .collect();
+
+    let mut postings = HashMap::default();
+    for partial in partials {
+        for (key, mut ids) in partial {
+            postings
+                .entry(key)
+                .or_insert_with(Vec::new)
+                .append(&mut ids);
+        }
+    }
+    postings
 }
 
 fn build_delta_index(
@@ -4403,19 +4452,23 @@ fn scan_indexable_files(
     scanned: &mut u64,
     skipped: &mut u64,
 ) -> Result<Vec<CurrentFile>> {
-    let entries: Vec<PathBuf> = WalkDir::new(&cfg.root)
+    let mut out = Vec::new();
+    for entry in WalkDir::new(&cfg.root)
         .follow_links(options.follow)
         .into_iter()
         .filter_entry(|entry| should_descend(cfg, options, entry))
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_file())
-        .map(|entry| entry.into_path())
-        .collect();
-
-    *scanned = entries.len() as u64;
-    let mut out = Vec::with_capacity(entries.len());
-    for (ordinal, path) in entries.into_iter().enumerate() {
-        let Some(rel) = rel_path(&cfg.root, &path) else {
+    {
+        let Ok(entry) = entry else {
+            *skipped += 1;
+            continue;
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let ordinal = *scanned as usize;
+        *scanned += 1;
+        let path = entry.path();
+        let Some(rel) = rel_path(&cfg.root, path) else {
             *skipped += 1;
             continue;
         };
@@ -4423,7 +4476,7 @@ fn scan_indexable_files(
             *skipped += 1;
             continue;
         }
-        let Ok(meta) = fs::metadata(&path) else {
+        let Ok(meta) = entry.metadata() else {
             *skipped += 1;
             continue;
         };
@@ -4433,7 +4486,7 @@ fn scan_indexable_files(
         }
         out.push(CurrentFile {
             ordinal,
-            path,
+            path: path.to_path_buf(),
             rel,
             mtime: mtime_ns(&meta),
             size: meta.len(),
@@ -4595,15 +4648,24 @@ fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
         .unwrap_or(INDEX_FILE);
     let tmp_path = path.with_file_name(format!("{file_name}.tmp.{}", std::process::id()));
     let root = index.root.to_string_lossy().as_bytes().to_vec();
-    let mut path_blob = Vec::new();
-    let mut content_blob = Vec::new();
+
+    let compressed_contents: Vec<Vec<u8>> = index
+        .files
+        .par_iter()
+        .map(|file| lz4_flex::compress_prepend_size(&file.content))
+        .collect();
+    let content_blob_size: u64 = compressed_contents
+        .iter()
+        .map(|content| content.len() as u64)
+        .sum();
+
+    let path_blob_size: usize = index.files.iter().map(|file| file.path.len()).sum();
+    let mut path_blob = Vec::with_capacity(path_blob_size);
     let mut file_records = Vec::with_capacity(index.files.len());
-    for file in &index.files {
+    let mut content_offset = 0u64;
+    for (file, compressed) in index.files.iter().zip(compressed_contents.iter()) {
         let path_offset = path_blob.len() as u64;
         path_blob.extend_from_slice(file.path.as_bytes());
-        let content_offset = content_blob.len() as u64;
-        let compressed = lz4_flex::compress_prepend_size(&file.content);
-        content_blob.extend_from_slice(&compressed);
         file_records.push(FileRecord {
             path_offset,
             path_size: file.path.len() as u64,
@@ -4612,6 +4674,7 @@ fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
             mtime: file.mtime,
             size: file.size,
         });
+        content_offset += compressed.len() as u64;
     }
     let mut posting_entries: Vec<_> = index.postings.iter().collect();
     posting_entries.sort_by_key(|entry| *entry.0);
@@ -4640,7 +4703,7 @@ fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
     let path_blob_offset = cursor;
     cursor += path_blob.len() as u64;
     let content_blob_offset = cursor;
-    cursor += content_blob.len() as u64;
+    cursor += content_blob_size;
     let mut chunk_table_offset = 0;
     let mut chunk_posting_table_offset = 0;
     let mut chunk_posting_data_offset = 0;
@@ -4655,9 +4718,12 @@ fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
         chunk_posting_data_offset = cursor;
         cursor += 0;
         chunk_blob_offset = cursor;
+        cursor += chunk_extension.bloom_data.len() as u64 + CHUNK_FOOTER_SIZE as u64;
     }
 
-    let mut writer = BufWriter::new(File::create(&tmp_path)?);
+    let file = File::create(&tmp_path)?;
+    file.set_len(cursor)?;
+    let mut writer = BufWriter::with_capacity(1024 * 1024, file);
     writer.write_all(MAGIC)?;
     write_u32(&mut writer, VERSION)?;
     write_u32(&mut writer, 0)?;
@@ -4703,11 +4769,13 @@ fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
     )?;
     writer.write_all(&posting_data)?;
     writer.write_all(&path_blob)?;
-    writer.write_all(&content_blob)?;
+    for compressed in &compressed_contents {
+        writer.write_all(compressed)?;
+    }
     if let Some(chunk_extension) = &chunk_extension {
         write_padding(
             &mut writer,
-            content_blob_offset + content_blob.len() as u64,
+            content_blob_offset + content_blob_size,
             chunk_table_offset,
         )?;
         for rec in &chunk_extension.records {
@@ -8582,7 +8650,8 @@ fn install_executable(src: &Path, dst: &Path) -> Result<()> {
         return Ok(());
     }
     let tmp = dst.with_extension(format!("tmp.{}", std::process::id()));
-    fs::copy(src, &tmp)?;
+    fs::copy(src, &tmp)
+        .with_context(|| format!("failed to copy {} to {}", src.display(), tmp.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -8591,7 +8660,7 @@ fn install_executable(src: &Path, dst: &Path) -> Result<()> {
     if dst.exists() {
         let _ = fs::remove_file(dst);
     }
-    fs::rename(tmp, dst)?;
+    fs::rename(&tmp, dst).with_context(|| format!("failed to replace {}", dst.display()))?;
     Ok(())
 }
 
