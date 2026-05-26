@@ -1,6 +1,6 @@
 [package]
 name = "indexsearch"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "Persistent-index rg-like search for large source trees"
 repository = "https://github.com/Abyss116/IndexSearch"
@@ -34,8 +34,12 @@ rustc-hash = "2.1"
 walkdir = "2.5"
 
 [[bin]]
-name = "indexsearch"
+name = "is-daemon"
 path = "src/main.rs"
+
+[[bin]]
+name = "indexsearch"
+path = "src/bin/indexsearch.rs"
 
 [[bin]]
 name = "is"

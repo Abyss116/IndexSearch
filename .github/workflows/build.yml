@@ -76,11 +76,14 @@ jobs:
           set -euo pipefail
           mkdir -p "dist/${{ matrix.artifact }}"
           if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/is-daemon.exe" "dist/${{ matrix.artifact }}/"
             cp "target/${{ matrix.target }}/release/indexsearch.exe" "dist/${{ matrix.artifact }}/"
             cp "target/${{ matrix.target }}/release/is.exe" "dist/${{ matrix.artifact }}/"
           else
+            cp "target/${{ matrix.target }}/release/is-daemon" "dist/${{ matrix.artifact }}/"
             cp "target/${{ matrix.target }}/release/indexsearch" "dist/${{ matrix.artifact }}/"
             cp "target/${{ matrix.target }}/release/is" "dist/${{ matrix.artifact }}/"
+            chmod +x "dist/${{ matrix.artifact }}/is-daemon"
             chmod +x "dist/${{ matrix.artifact }}/indexsearch"
             chmod +x "dist/${{ matrix.artifact }}/is"
           fi
@@ -186,6 +189,7 @@ jobs:
               end
               odie "IndexSearch archive layout changed" if payload.nil?
               cd payload do
+                bin.install "is-daemon" if File.exist?("is-daemon")
                 bin.install "indexsearch"
                 if File.exist?("is")
                   bin.install "is"
@@ -288,6 +292,8 @@ jobs:
           InstallerType: zip
           NestedInstallerType: portable
           NestedInstallerFiles:
+          - RelativeFilePath: is-daemon.exe
+            PortableCommandAlias: is-daemon
           - RelativeFilePath: indexsearch.exe
             PortableCommandAlias: indexsearch
           - RelativeFilePath: is.exe

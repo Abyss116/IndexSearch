@@ -34,6 +34,9 @@ const WATCH_LOG_FILE: &str = "watch.log";
 const SEARCH_DAEMON_FILE: &str = "search-daemon.txt";
 const SEARCH_DAEMON_REQUEST_MAGIC: &[u8; 8] = b"ISDREQ1\n";
 const SEARCH_DAEMON_RESPONSE_MAGIC: &[u8; 8] = b"ISDRES1\n";
+const SEARCH_DAEMON_STDOUT_FRAME: u8 = 1;
+const SEARCH_DAEMON_STDERR_FRAME: u8 = 2;
+const SEARCH_DAEMON_DONE_FRAME: u8 = 3;
 const SEARCH_DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_millis(20);
 const SEARCH_DAEMON_START_TIMEOUT: Duration = Duration::from_millis(250);
 const DEFAULT_PROJECT_CONFIG: &str = "[IndexSearch.paths.ignore]\n.git/\n.hg/\n.svn/\n.indexsearch/\n\n\
@@ -564,7 +567,7 @@ fn print_help() {
     help_command(
         &style,
         "install [--dir PATH]",
-        "copy indexsearch and is into a user bin dir",
+        "copy indexsearch, is, and is-daemon into a user bin dir",
     );
     help_command(
         &style,
@@ -808,7 +811,7 @@ fn print_install_help() {
         &style,
         "install",
         "[OPTIONS] [DIR]",
-        "copy indexsearch and is into a user bin dir",
+        "copy indexsearch, is, and is-daemon into a user bin dir",
     );
     help_section(&style, "Options");
     help_option(
@@ -1546,11 +1549,17 @@ fn command_install(args: &[String]) -> Result<i32> {
     }
     fs::create_dir_all(&dir)?;
     let src = env::current_exe()?;
-    let exe_name = executable_name("indexsearch");
-    let exe_path = dir.join(exe_name);
+    let daemon_path = dir.join(executable_name("is-daemon"));
+    let exe_path = dir.join(executable_name("indexsearch"));
     let alias_path = dir.join(executable_name("is"));
-    install_executable(&src, &exe_path)?;
+    install_executable(&src, &daemon_path)?;
     let frontend_src = src
+        .parent()
+        .map(|parent| parent.join(executable_name("indexsearch")))
+        .filter(|path| {
+            path.is_file() && fs::canonicalize(path).ok() != fs::canonicalize(&src).ok()
+        });
+    let short_frontend_src = src
         .parent()
         .map(|parent| parent.join(executable_name("is")))
         .filter(|path| path.is_file());
@@ -1563,11 +1572,17 @@ fn command_install(args: &[String]) -> Result<i32> {
     }
     if let Some(frontend_src) = frontend_src {
         install_executable(&frontend_src, &alias_path)?;
+        install_executable(&frontend_src, &exe_path)?;
+    } else if let Some(short_frontend_src) = short_frontend_src {
+        install_executable(&short_frontend_src, &alias_path)?;
+        install_executable(&short_frontend_src, &exe_path)?;
     } else {
-        install_alias(&exe_path, &alias_path)?;
+        install_alias(&daemon_path, &alias_path)?;
+        install_alias(&daemon_path, &exe_path)?;
     }
-    println!("installed: {}", exe_path.display());
-    println!("alias: {}", alias_path.display());
+    println!("installed: {}", daemon_path.display());
+    println!("frontend: {}", exe_path.display());
+    println!("frontend: {}", alias_path.display());
     if !path_contains(&dir) {
         println!(
             "note: add {} to PATH to use indexsearch and is from any shell",
@@ -2617,15 +2632,12 @@ fn try_search_daemon(
         return Ok(None);
     }
     if let Some(record) = read_valid_search_daemon_record(root, profile.as_deref_mut())? {
-        if let Ok(output) = request_search_daemon(&record, args, profile.as_deref_mut()) {
-            let write_timer = Instant::now();
-            write_search_output(&output)?;
+        if let Ok(code) = request_search_daemon(&record, args, profile.as_deref_mut()) {
             if let Some(profile) = profile.as_deref_mut() {
-                profile.record("client_write_output", write_timer.elapsed());
                 profile.record("client_search_command_total", total_timer.elapsed());
                 write_profile_events(profile)?;
             }
-            return Ok(Some(output.code));
+            return Ok(Some(code));
         }
         let _ = fs::remove_file(search_daemon_record_path(root));
     }
@@ -2637,32 +2649,17 @@ fn try_search_daemon(
     let start = Instant::now();
     while start.elapsed() < SEARCH_DAEMON_START_TIMEOUT {
         if let Some(record) = read_valid_search_daemon_record(root, profile.as_deref_mut())? {
-            if let Ok(output) = request_search_daemon(&record, args, profile.as_deref_mut()) {
-                let write_timer = Instant::now();
-                write_search_output(&output)?;
+            if let Ok(code) = request_search_daemon(&record, args, profile.as_deref_mut()) {
                 if let Some(profile) = profile.as_deref_mut() {
-                    profile.record("client_write_output", write_timer.elapsed());
                     profile.record("client_search_command_total", total_timer.elapsed());
                     write_profile_events(profile)?;
                 }
-                return Ok(Some(output.code));
+                return Ok(Some(code));
             }
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     Ok(None)
-}
-
-fn write_search_output(output: &SearchOutput) -> Result<()> {
-    let stdout = std::io::stdout();
-    let mut out = BufWriter::new(stdout.lock());
-    out.write_all(&output.stdout)?;
-    out.flush()?;
-    let stderr = std::io::stderr();
-    let mut err = BufWriter::new(stderr.lock());
-    err.write_all(&output.stderr)?;
-    err.flush()?;
-    Ok(())
 }
 
 fn write_profile_events(profile: &SearchProfile) -> Result<()> {
@@ -2766,7 +2763,7 @@ fn handle_search_daemon_client(
         profile.record("daemon_set_cwd", cwd_timer.elapsed());
     }
     let parse_timer = Instant::now();
-    let output = match parse_search_args(&cwd.args).and_then(|options| {
+    let result = parse_search_args(&cwd.args).and_then(|options| {
         if options.auto_update {
             bail!("daemon does not run auto-update searches");
         }
@@ -2774,24 +2771,134 @@ fn handle_search_daemon_client(
             profile.record("daemon_parse_args", parse_timer.elapsed());
         }
         let search_timer = Instant::now();
-        let mut output = search_output_for_options(index, &options)?;
+        let code = search_daemon_output_to_stream(index, &options, stream, &mut profile)?;
         if options.profile {
             profile.record("daemon_search_with_index_output", search_timer.elapsed());
-            append_profile_events(&mut output.stderr, &profile)?;
+            let mut stderr = Vec::new();
+            append_profile_events(&mut stderr, &profile)?;
+            write_search_daemon_chunk(stream, SEARCH_DAEMON_STDERR_FRAME, &stderr)?;
         }
-        Ok(output)
-    }) {
-        Ok(output) => output,
-        Err(err) => SearchOutput {
-            code: 2,
-            stdout: Vec::new(),
-            stderr: format!("indexsearch: {err:#}\n").into_bytes(),
-        },
+        write_search_daemon_done(stream, code)?;
+        Ok(())
+    });
+    if let Err(err) = result {
+        write_search_daemon_error(stream, &format!("indexsearch: {err:#}\n"))?;
     };
     if let Some(dir) = current_dir {
         let _ = env::set_current_dir(dir);
     }
-    write_search_daemon_response(stream, &output)
+    Ok(())
+}
+
+fn search_daemon_output_to_stream(
+    index: &MappedIndex,
+    options: &Options,
+    stream: &mut TcpStream,
+    profile: &mut SearchProfile,
+) -> Result<i32> {
+    if quiet_search_fast_path(options) {
+        let output = search_quiet_with_index_output(index, options)?;
+        write_search_daemon_response_begin(stream)?;
+        if !output.stderr.is_empty() {
+            write_search_daemon_chunk(stream, SEARCH_DAEMON_STDERR_FRAME, &output.stderr)?;
+        }
+        return Ok(output.code);
+    }
+
+    let delta_timer = if options.profile {
+        Some(Instant::now())
+    } else {
+        None
+    };
+    let deltas = load_deltas(&index.root)?;
+    if let Some(delta_timer) = delta_timer {
+        profile.record("search_load_deltas", delta_timer.elapsed());
+    }
+    if options.files {
+        let render_timer = if options.profile {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        let stdout = if options.quiet {
+            Vec::new()
+        } else {
+            render_visible_files(index, &deltas, options)?
+        };
+        write_search_daemon_response_begin(stream)?;
+        if !stdout.is_empty() {
+            write_search_daemon_chunk(stream, SEARCH_DAEMON_STDOUT_FRAME, &stdout)?;
+        }
+        if let Some(render_timer) = render_timer {
+            profile.record("search_render_files", render_timer.elapsed());
+        }
+        return Ok(0);
+    }
+
+    let timer = Instant::now();
+    let mut searched = 0;
+    let execute_timer = if options.profile {
+        Some(Instant::now())
+    } else {
+        None
+    };
+    let results = execute_search_rendered_segments(index, &deltas, options, &mut searched)?;
+    if let Some(execute_timer) = execute_timer {
+        profile.record(
+            "search_execute_and_render_segments",
+            execute_timer.elapsed(),
+        );
+    }
+
+    let output_timer = if options.profile {
+        Some(Instant::now())
+    } else {
+        None
+    };
+    let mut stderr = Vec::new();
+    if options.stats {
+        let match_count: usize = results.iter().map(|r| r.match_count).sum();
+        writeln!(stderr, "{match_count} matches")?;
+        writeln!(stderr, "{} matched files", results.len())?;
+        writeln!(stderr, "{searched} candidate files")?;
+        writeln!(stderr, "{:.6} seconds", timer.elapsed().as_secs_f64())?;
+    }
+    write_search_daemon_response_begin(stream)?;
+    if !options.quiet {
+        let stdout_writer = SearchDaemonFrameWriter {
+            stream,
+            tag: SEARCH_DAEMON_STDOUT_FRAME,
+        };
+        let mut out = BufWriter::with_capacity(64 * 1024, stdout_writer);
+        write_rendered_results(&mut out, &results, options)?;
+        out.flush()?;
+    }
+    if let Some(output_timer) = output_timer {
+        profile.record("search_stream_stdout", output_timer.elapsed());
+    }
+    if !stderr.is_empty() {
+        write_search_daemon_chunk(stream, SEARCH_DAEMON_STDERR_FRAME, &stderr)?;
+    }
+    Ok(if results.is_empty() { 1 } else { 0 })
+}
+
+struct SearchDaemonFrameWriter<'a> {
+    stream: &'a mut TcpStream,
+    tag: u8,
+}
+
+impl Write for SearchDaemonFrameWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if !bytes.is_empty() {
+            write_search_daemon_chunk(self.stream, self.tag, bytes)
+                .map_err(std::io::Error::other)?;
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
 }
 
 struct SearchDaemonRequest {
@@ -2803,7 +2910,7 @@ fn request_search_daemon(
     record: &SearchDaemonRecord,
     args: &[String],
     mut profile: Option<&mut SearchProfile>,
-) -> Result<SearchOutput> {
+) -> Result<i32> {
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], record.port));
     let connect_timer = Instant::now();
     let mut stream = TcpStream::connect_timeout(&addr, SEARCH_DAEMON_CONNECT_TIMEOUT)?;
@@ -2817,11 +2924,11 @@ fn request_search_daemon(
         profile.record("client_daemon_write_request", write_timer.elapsed());
     }
     let read_timer = Instant::now();
-    let output = read_search_daemon_response(&mut stream)?;
+    let code = read_search_daemon_response_to_stdio(&mut stream)?;
     if let Some(profile) = profile.as_deref_mut() {
         profile.record("client_daemon_read_response", read_timer.elapsed());
     }
-    Ok(output)
+    Ok(code)
 }
 
 fn write_search_daemon_request(
@@ -2869,29 +2976,59 @@ fn read_search_daemon_request(
     })
 }
 
-fn write_search_daemon_response(stream: &mut TcpStream, output: &SearchOutput) -> Result<()> {
+fn write_search_daemon_response_begin(stream: &mut TcpStream) -> Result<()> {
     stream.write_all(SEARCH_DAEMON_RESPONSE_MAGIC)?;
-    write_u32(stream, output.code as u32)?;
-    write_bytes_frame(stream, &output.stdout)?;
-    write_bytes_frame(stream, &output.stderr)?;
+    Ok(())
+}
+
+fn write_search_daemon_chunk(stream: &mut TcpStream, tag: u8, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    stream.write_all(&[tag])?;
+    write_bytes_frame(stream, bytes)?;
     stream.flush()?;
     Ok(())
 }
 
-fn read_search_daemon_response(stream: &mut TcpStream) -> Result<SearchOutput> {
+fn write_search_daemon_done(stream: &mut TcpStream, code: i32) -> Result<()> {
+    stream.write_all(&[SEARCH_DAEMON_DONE_FRAME])?;
+    write_u32(stream, code as u32)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn write_search_daemon_error(stream: &mut TcpStream, message: &str) -> Result<()> {
+    write_search_daemon_response_begin(stream)?;
+    write_search_daemon_chunk(stream, SEARCH_DAEMON_STDERR_FRAME, message.as_bytes())?;
+    write_search_daemon_done(stream, 2)
+}
+
+fn read_search_daemon_response_to_stdio(stream: &mut TcpStream) -> Result<i32> {
     let mut magic = [0u8; 8];
     stream.read_exact(&mut magic)?;
     if &magic != SEARCH_DAEMON_RESPONSE_MAGIC {
         bail!("invalid search daemon response");
     }
-    let code = read_u32_from_reader(stream)? as i32;
-    let stdout = read_bytes_frame(stream)?;
-    let stderr = read_bytes_frame(stream)?;
-    Ok(SearchOutput {
-        code,
-        stdout,
-        stderr,
-    })
+    let stdout = std::io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    let stderr = std::io::stderr();
+    let mut err = BufWriter::new(stderr.lock());
+    loop {
+        let mut tag = [0u8; 1];
+        stream.read_exact(&mut tag)?;
+        match tag[0] {
+            SEARCH_DAEMON_STDOUT_FRAME => copy_bytes_frame(stream, &mut out)?,
+            SEARCH_DAEMON_STDERR_FRAME => copy_bytes_frame(stream, &mut err)?,
+            SEARCH_DAEMON_DONE_FRAME => {
+                let code = read_u32_from_reader(stream)? as i32;
+                out.flush()?;
+                err.flush()?;
+                return Ok(code);
+            }
+            _ => bail!("invalid search daemon response frame"),
+        }
+    }
 }
 
 fn refresh_index_for_search(cfg: &ProjectConfig, options: &Options) -> Result<()> {
@@ -8138,6 +8275,18 @@ fn read_bytes_frame(reader: &mut impl Read) -> Result<Vec<u8>> {
     let mut bytes = vec![0u8; len as usize];
     reader.read_exact(&mut bytes)?;
     Ok(bytes)
+}
+
+fn copy_bytes_frame(reader: &mut impl Read, writer: &mut impl Write) -> Result<()> {
+    let mut remaining = read_u64_from_reader(reader)?;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining != 0 {
+        let take = remaining.min(buffer.len() as u64) as usize;
+        reader.read_exact(&mut buffer[..take])?;
+        writer.write_all(&buffer[..take])?;
+        remaining -= take as u64;
+    }
+    Ok(())
 }
 
 fn read_string_frame(reader: &mut impl Read) -> Result<String> {

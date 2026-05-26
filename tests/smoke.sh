@@ -15,7 +15,7 @@ grep -q 'Commands' <<<"$help_out"
 grep -q 'Common Search Options' <<<"$help_out"
 ! grep -q '<init|' <<<"$help_out"
 install_help="$(./indexsearch install --help)"
-grep -q 'copy indexsearch and is' <<<"$install_help"
+grep -q 'copy indexsearch, is, and is-daemon' <<<"$install_help"
 grep -q -- '--dir PATH' <<<"$install_help"
 watch_help="$(./indexsearch watch --help)"
 grep -q -- '--compact-delta-count NUM' <<<"$watch_help"
@@ -200,13 +200,17 @@ trap 'rm -rf "$tmp" "$git_tmp" "$watch_tmp" "$install_tmp" "$skills_home" "$skil
 ./indexsearch install --dir "$install_tmp" >/dev/null
 install_exe="$install_tmp/indexsearch"
 install_alias="$install_tmp/is"
+install_daemon="$install_tmp/is-daemon"
 if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* ]]; then
   install_exe="$install_exe.exe"
   install_alias="$install_alias.exe"
+  install_daemon="$install_daemon.exe"
 fi
 "$install_exe" --version >/dev/null
 "$install_alias" --version >/dev/null
+"$install_daemon" --version >/dev/null
 [[ -x "$install_alias" || -L "$install_alias" ]]
+[[ -x "$install_daemon" || -L "$install_daemon" ]]
 HOME="$skills_home" ./indexsearch install-skills --target all --scope user >/dev/null
 [[ -f "$skills_home/.codex/skills/indexsearch/SKILL.md" ]]
 [[ -f "$skills_home/.claude/skills/indexsearch/SKILL.md" ]]

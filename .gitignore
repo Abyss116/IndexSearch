@@ -9,4 +9,5 @@ dist/
 *.egg-info/
 /indexsearch
 /is
+/is-daemon
 target/
