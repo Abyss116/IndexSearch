@@ -2492,11 +2492,12 @@ fn daemon_search_args(args: &[String]) -> Vec<String> {
         out.push(arg.clone());
         i += 1;
     }
+    let mut defaults = Vec::with_capacity(3);
     if !saw_color {
-        out.push(format!("--color={resolved_color}"));
+        defaults.push(format!("--color={resolved_color}"));
     }
     if !saw_heading {
-        out.push(
+        defaults.push(
             if decorated_output {
                 "--heading"
             } else {
@@ -2506,7 +2507,7 @@ fn daemon_search_args(args: &[String]) -> Vec<String> {
         );
     }
     if !saw_line_number {
-        out.push(
+        defaults.push(
             if decorated_output {
                 "--line-number"
             } else {
@@ -2515,7 +2516,19 @@ fn daemon_search_args(args: &[String]) -> Vec<String> {
             .to_string(),
         );
     }
+    insert_before_double_dash(&mut out, defaults);
     out
+}
+
+fn insert_before_double_dash(args: &mut Vec<String>, defaults: Vec<String>) {
+    if defaults.is_empty() {
+        return;
+    }
+    if let Some(pos) = args.iter().position(|arg| arg == "--") {
+        args.splice(pos..pos, defaults);
+    } else {
+        args.extend(defaults);
+    }
 }
 
 fn run_search_with_index(

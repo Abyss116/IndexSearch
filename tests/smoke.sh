@@ -69,6 +69,8 @@ subdir_files="$(cd "$tmp/src/sub" && "$bin" --no-daemon --files)"
 default_plain="$("$bin" -F needle "$tmp")"
 grep -q "$tmp/src/a.cc:needle here" <<<"$default_plain"
 ! grep -q "$tmp/src/a.cc:2:needle here" <<<"$default_plain"
+double_dash_default_path="$(cd "$tmp" && "$bin" -- needle)"
+grep -q "src/a.cc:needle here" <<<"$double_dash_default_path"
 heading_search="$("$bin" --heading -n -F needle "$tmp")"
 [[ "$heading_search" == *"$tmp/src/a.cc"$'\n2:needle here'* ]]
 no_heading_search="$("$bin" --no-heading -n -F needle "$tmp")"
