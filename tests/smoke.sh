@@ -165,11 +165,25 @@ printf 'untracked_symbol\n' > "$git_tmp/src/untracked.cc"
 "$bin" update --git-untracked "$git_tmp" >/dev/null
 "$bin" -q -F 'untracked_symbol' "$git_tmp"
 
+daemon_record="$git_tmp/.indexsearch/search-daemon.txt"
+"$bin" -q -F 'git_symbol new' "$git_tmp"
+daemon_pid_before="$(awk -F= '$1 == "pid" { print $2 }' "$daemon_record")"
+printf 'daemon_delta_symbol\n' > "$git_tmp/src/daemon_delta.txt"
+git -C "$git_tmp" add -A
+git -C "$git_tmp" -c user.name=IndexSearch -c user.email=indexsearch@example.invalid commit -qm daemon-delta
+auto_update_result="$("$bin" --auto-update -F daemon_delta_symbol "$git_tmp")"
+grep -q "$git_tmp/src/daemon_delta.txt:daemon_delta_symbol" <<<"$auto_update_result"
+plain_daemon_result="$("$bin" -F daemon_delta_symbol "$git_tmp")"
+grep -q "$git_tmp/src/daemon_delta.txt:daemon_delta_symbol" <<<"$plain_daemon_result"
+daemon_pid_after="$(awk -F= '$1 == "pid" { print $2 }' "$daemon_record")"
+[[ "$daemon_pid_before" != "$daemon_pid_after" ]]
+
 compact_out="$("$bin" compact "$git_tmp")"
 grep -q 'compacted' <<<"$compact_out"
 [[ ! -d "$git_tmp/.indexsearch/deltas" ]]
 "$bin" -q -F 'git_symbol new' "$git_tmp"
 "$bin" -q -F 'untracked_symbol' "$git_tmp"
+"$bin" -q -F 'daemon_delta_symbol' "$git_tmp"
 
 watch_tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp" "$git_tmp" "$watch_tmp"' EXIT

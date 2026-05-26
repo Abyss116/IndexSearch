@@ -428,6 +428,8 @@ struct SearchDaemonRecord {
     exe_mtime: i64,
     index_size: u64,
     index_mtime: i64,
+    state_size: u64,
+    state_mtime: i64,
 }
 
 fn main() {
@@ -3049,6 +3051,7 @@ fn windows_direct_stdout_enabled() -> bool {
 
 fn run_search_daemon(root: &Path) -> Result<i32> {
     let index_meta = fs::metadata(index_path(root))?;
+    let state_meta = fs::metadata(state_path(root)).ok();
     let exe = env::current_exe()?;
     let exe_meta = fs::metadata(&exe)?;
     let listener = SearchDaemonListener::bind(root)?;
@@ -3066,6 +3069,8 @@ fn run_search_daemon(root: &Path) -> Result<i32> {
         exe_mtime: mtime_ns(&exe_meta),
         index_size: index_meta.len(),
         index_mtime: mtime_ns(&index_meta),
+        state_size: state_meta.as_ref().map(|meta| meta.len()).unwrap_or(0),
+        state_mtime: state_meta.as_ref().map(mtime_ns).unwrap_or(0),
     };
     write_search_daemon_record(&record)?;
     let index = {
@@ -4371,6 +4376,13 @@ fn read_index_state(root: &Path) -> Result<IndexState> {
 fn save_index_state(root: &Path) -> Result<()> {
     fs::create_dir_all(root.join(INDEX_DIR))?;
     let mut text = String::from("version=1\n");
+    let updated_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    text.push_str("updated_ns=");
+    text.push_str(&updated_ns.to_string());
+    text.push('\n');
     if let Some(head) = current_git_head(root)? {
         text.push_str("git_head=");
         text.push_str(&head);
@@ -8853,7 +8865,7 @@ fn search_daemon_token(root: &Path) -> String {
 fn write_search_daemon_record(record: &SearchDaemonRecord) -> Result<()> {
     fs::create_dir_all(record.root.join(INDEX_DIR))?;
     let mut text = format!(
-        "version=1\npid={}\nport={}\ntoken={}\nroot={}\nexe_path={}\nexe_size={}\nexe_mtime={}\nindex_size={}\nindex_mtime={}\n",
+        "version=1\npid={}\nport={}\ntoken={}\nroot={}\nexe_path={}\nexe_size={}\nexe_mtime={}\nindex_size={}\nindex_mtime={}\nstate_size={}\nstate_mtime={}\n",
         record.pid,
         record.port,
         record.token,
@@ -8862,7 +8874,9 @@ fn write_search_daemon_record(record: &SearchDaemonRecord) -> Result<()> {
         record.exe_size,
         record.exe_mtime,
         record.index_size,
-        record.index_mtime
+        record.index_mtime,
+        record.state_size,
+        record.state_mtime
     );
     if let Some(socket_path) = record.socket_path.as_ref() {
         text.push_str(&format!("socket_path={}\n", socket_path.display()));
@@ -8912,11 +8926,16 @@ fn search_daemon_fingerprint_matches(record: &SearchDaemonRecord) -> bool {
     let Ok(index_meta) = fs::metadata(index_path(&record.root)) else {
         return false;
     };
+    let state_meta = fs::metadata(state_path(&record.root)).ok();
+    let state_size = state_meta.as_ref().map(|meta| meta.len()).unwrap_or(0);
+    let state_mtime = state_meta.as_ref().map(mtime_ns).unwrap_or(0);
     exe == record.exe_path
         && exe_meta.len() == record.exe_size
         && mtime_ns(&exe_meta) == record.exe_mtime
         && index_meta.len() == record.index_size
         && mtime_ns(&index_meta) == record.index_mtime
+        && state_size == record.state_size
+        && state_mtime == record.state_mtime
 }
 
 fn read_search_daemon_record(path: &Path) -> Result<SearchDaemonRecord> {
@@ -8931,6 +8950,8 @@ fn read_search_daemon_record(path: &Path) -> Result<SearchDaemonRecord> {
     let mut exe_mtime = 0;
     let mut index_size = 0;
     let mut index_mtime = 0;
+    let mut state_size = u64::MAX;
+    let mut state_mtime = i64::MIN;
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -8946,6 +8967,8 @@ fn read_search_daemon_record(path: &Path) -> Result<SearchDaemonRecord> {
             "exe_mtime" => exe_mtime = value.parse().unwrap_or(0),
             "index_size" => index_size = value.parse().unwrap_or(0),
             "index_mtime" => index_mtime = value.parse().unwrap_or(0),
+            "state_size" => state_size = value.parse().unwrap_or(u64::MAX),
+            "state_mtime" => state_mtime = value.parse().unwrap_or(i64::MIN),
             _ => {}
         }
     }
@@ -8967,6 +8990,8 @@ fn read_search_daemon_record(path: &Path) -> Result<SearchDaemonRecord> {
         exe_mtime,
         index_size,
         index_mtime,
+        state_size,
+        state_mtime,
     })
 }
 
