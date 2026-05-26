@@ -254,7 +254,7 @@ stdout redirected to `/dev/null`.
 | --- | ---: | ---: | --- |
 | Fresh index | 10.90s | 21.50s | IndexSearch timing: scan 3.98s, process 5.99s, write 0.94s |
 | No-change update | 0.27s | 4.19s | Git changed-path check, no file scan work |
-| Compact 2 deltas | 8.61s | n/a | Folded 196,961 visible files into a new base index |
+| Compact delta | 6.39s | n/a | Folded 196,961 visible files into a new base index |
 
 ### Search
 
