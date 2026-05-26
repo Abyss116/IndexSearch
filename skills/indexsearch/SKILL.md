@@ -40,6 +40,17 @@ is -- "status" .
 is search "watch" .
 ```
 
+In PowerShell, quote patterns containing redirection or pipeline characters and
+prefer `--` when the pattern starts with punctuation:
+
+```powershell
+is -- ">>>>"
+is -- "A|B"
+```
+
+If quoted metacharacter patterns fail with a `cmd.exe` syntax error, use
+`is.exe` or `indexsearch.exe`; an old `is.cmd` shim is likely earlier on PATH.
+
 ## Freshness
 
 - If a watcher is running, assume normal edits are indexed.

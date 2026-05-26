@@ -1617,6 +1617,7 @@ fn command_install(args: &[String]) -> Result<i32> {
         if legacy_alias_path != alias_path && legacy_alias_path.exists() {
             let _ = fs::remove_file(&legacy_alias_path);
         }
+        warn_legacy_cmd_shims(&dir, &legacy_alias_path);
     }
     if let Some(frontend_src) = frontend_src {
         install_executable(&frontend_src, &alias_path)?;
@@ -8788,6 +8789,36 @@ fn install_alias(exe_path: &Path, alias_path: &Path) -> Result<()> {
         install_executable(exe_path, alias_path)?;
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn warn_legacy_cmd_shims(install_dir: &Path, target_legacy_alias: &Path) {
+    let install_dir = fs::canonicalize(install_dir).unwrap_or_else(|_| install_dir.to_path_buf());
+    let target_legacy_alias =
+        fs::canonicalize(target_legacy_alias).unwrap_or_else(|_| target_legacy_alias.to_path_buf());
+    let Ok(path) = env::var("PATH") else {
+        return;
+    };
+    for dir in env::split_paths(&path) {
+        let Ok(dir) = fs::canonicalize(&dir) else {
+            continue;
+        };
+        let legacy = dir.join("is.cmd");
+        if !legacy.exists() {
+            continue;
+        }
+        let legacy = fs::canonicalize(&legacy).unwrap_or(legacy);
+        if dir == install_dir || legacy == target_legacy_alias {
+            continue;
+        }
+        eprintln!(
+            "indexsearch: warning: found legacy is.cmd on PATH: {}",
+            display_path(&legacy)
+        );
+        eprintln!(
+            "indexsearch: warning: remove it or call is.exe/indexsearch.exe; cmd shims re-parse PowerShell patterns containing | or >"
+        );
+    }
 }
 
 fn path_contains(dir: &Path) -> bool {

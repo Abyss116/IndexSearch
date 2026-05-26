@@ -57,6 +57,19 @@ binaries on PATH and do not need this step. On Windows `is` is a native
 `is.exe`, not an `is.cmd` wrapper, so PowerShell metacharacters inside quoted
 patterns are not re-parsed by `cmd.exe`.
 
+PowerShell still parses unquoted redirection characters before IndexSearch can
+see them. Quote those patterns or put `--` before the pattern:
+
+```powershell
+is -- ">>>>"
+is -F ">>>>"
+```
+
+If quoted patterns such as `is ">>>>"` still fail with a `cmd.exe` message like
+`>> was unexpected`, an old `is.cmd` shim is being found first on PATH. Check
+with `Get-Command is -All`, remove the stale `.cmd`, or call `is.exe` /
+`indexsearch.exe` directly.
+
 If Windows reports `Access is denied` during `install`, an older
 `is-daemon.exe` is probably still running or temporarily locked by the OS. Stop
 that process and run `indexsearch.exe install` again:
@@ -67,7 +80,7 @@ Get-Process is-daemon -ErrorAction SilentlyContinue | Stop-Process -Force
 ```
 
 Newer releases also write a versioned backend such as
-`is-daemon-0.3.12.exe`, so a locked old backend no longer prevents installing
+`is-daemon-0.3.13.exe`, so a locked old backend no longer prevents installing
 the new frontend.
 
 ## Quick Start

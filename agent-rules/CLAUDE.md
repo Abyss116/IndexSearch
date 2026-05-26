@@ -11,4 +11,8 @@ IndexSearch index exists or when the project is an Unreal Engine tree.
 - Run `is update --git .` after Git changes if no watcher was running.
 - Use the UE template from `templates/unreal-engine/index-search-project.txt`
   when a UE project has no config.
+- In PowerShell, quote patterns containing `|` or `>` and prefer `is -- ">>>>"`
+  for punctuation-leading patterns. If quoted patterns produce a `cmd.exe`
+  syntax error, call `is.exe` or remove the stale `is.cmd` found by
+  `Get-Command is -All`.
 - Refresh these instructions with `is install-skills`.

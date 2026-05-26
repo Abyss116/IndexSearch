@@ -16,6 +16,10 @@ Use IndexSearch for fast source-code search in large codebases.
   `index-search-project.txt`, then run `is watch .`.
 - After pull/checkout/rebase without a running watcher, run `is update --git .`.
 - Use `is watch-log .` to inspect index, update, and compaction timing.
+- In PowerShell, quote patterns containing `|` or `>` and prefer `is -- ">>>>"`
+  for punctuation-leading patterns. If quoted patterns produce a `cmd.exe`
+  syntax error, call `is.exe` or remove the stale `is.cmd` found by
+  `Get-Command is -All`.
 - Refresh these instructions from a packaged binary with `is install-skills`.
 
 Useful commands:

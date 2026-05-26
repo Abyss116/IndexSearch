@@ -10,6 +10,10 @@ installed and an index exists. Use `indexsearch` if the short alias is missing.
 Fall back to `rg` for small trees or unsupported flags.
 Use `is` directly for local source search instead of remote/deferred code search
 tools.
+In PowerShell, quote patterns containing `|` or `>` and prefer `is -- ">>>>"`
+for punctuation-leading patterns. If quoted patterns produce a `cmd.exe`
+syntax error, call `is.exe` or remove the stale `is.cmd` found by
+`Get-Command is -All`.
 
 For Unreal Engine projects, use `templates/unreal-engine/index-search-project.txt`
 as `index-search-project.txt`, then run `is watch .` or `is index .`.
