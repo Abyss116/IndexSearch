@@ -2851,9 +2851,13 @@ impl SearchDaemonStream {
     fn send_stdout_fd(&mut self, record: &SearchDaemonRecord) -> std::io::Result<()> {
         match self {
             Self::Tcp(stream) => {
-                let handle = duplicate_stdout_for_process(record.pid)
-                    .map(|handle| handle as usize as u64)
-                    .unwrap_or(0);
+                let handle = if windows_direct_stdout_enabled() {
+                    duplicate_stdout_for_process(record.pid)
+                        .map(|handle| handle as usize as u64)
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
                 stream.write_all(&handle.to_le_bytes())
             }
         }
@@ -3033,6 +3037,14 @@ fn duplicate_stdout_for_process(pid: u32) -> std::io::Result<RawHandle> {
         CloseHandle(target_process);
         result
     }
+}
+
+#[cfg(windows)]
+fn windows_direct_stdout_enabled() -> bool {
+    matches!(
+        env::var("INDEXSEARCH_WINDOWS_DIRECT_STDOUT").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
 }
 
 fn run_search_daemon(root: &Path) -> Result<i32> {
