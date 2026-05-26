@@ -327,6 +327,8 @@ Tagged releases also contain optional package-manager publication jobs:
 
 - `HOMEBREW_TAP_TOKEN` updates
   [`Abyss116/homebrew-indexsearch`](https://github.com/Abyss116/homebrew-indexsearch).
+- `RELEASE_TOKEN` is optional; if set, release publication uses it instead of
+  the workflow `GITHUB_TOKEN`.
 - `WINGET_TOKEN` submits WinGet version updates to
   [`microsoft/winget-pkgs`](https://github.com/microsoft/winget-pkgs) after
   `Abyss116.IndexSearch` has been accepted. Initial package submission is kept
