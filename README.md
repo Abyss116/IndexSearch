@@ -97,7 +97,7 @@ Get-Process is-daemon -ErrorAction SilentlyContinue | Stop-Process -Force
 ```
 
 Newer releases also write a versioned backend such as
-`is-daemon-0.3.21.exe`, so a locked old backend no longer prevents installing
+`is-daemon-0.3.22.exe`, so a locked old backend no longer prevents installing
 the new frontend.
 
 ## Quick Start

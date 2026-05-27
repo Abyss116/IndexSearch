@@ -440,8 +440,10 @@ impl ProgressLine {
         self.stop();
         if stderr_supports_progress() {
             eprintln!(
-                "  {} {} in {:.1}s",
-                color_success("ok"),
+                "│");
+            eprintln!(
+                "{} {} — done ({:.1}s)",
+                color_success("◆"),
                 label,
                 self.started.elapsed().as_secs_f32()
             );
@@ -523,21 +525,15 @@ fn stderr_supports_color() -> bool {
 
 fn start_watch(root: &Path) -> Result<(), String> {
     let backend = backend_path()?;
-    let progress = ProgressLine::start(if index_path(root).is_file() {
-        "Starting service"
+    let mut command = Command::new(backend);
+    command.arg("watch").arg(root).stdin(Stdio::null()).stdout(Stdio::null());
+    if stderr_supports_progress() {
+        command.stderr(Stdio::inherit());
     } else {
-        "Indexing project"
-    });
-    let status = Command::new(backend)
-        .arg("watch")
-        .arg(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|err| err.to_string())?;
+        command.stderr(Stdio::null());
+    }
+    let status = command.status().map_err(|err| err.to_string())?;
     if status.success() {
-        progress.finish("Project service ready");
         Ok(())
     } else {
         Err(format!(

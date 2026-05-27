@@ -1196,9 +1196,10 @@ impl ProgressLine {
     fn finish(mut self, label: &str) {
         self.stop();
         if stderr_supports_progress() {
+            eprintln!("│");
             eprintln!(
-                "  {} {} in {:.1}s",
-                color_success("ok"),
+                "{} {} — done ({:.1}s)",
+                color_success("◆"),
                 label,
                 self.started.elapsed().as_secs_f32()
             );
@@ -1218,6 +1219,48 @@ impl ProgressLine {
 impl Drop for ProgressLine {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+struct ConsoleFlow {
+    enabled: bool,
+    started: Instant,
+}
+
+impl ConsoleFlow {
+    fn start() -> Self {
+        Self {
+            enabled: stderr_supports_progress(),
+            started: Instant::now(),
+        }
+    }
+
+    fn step_done(&self, label: impl AsRef<str>) {
+        if self.enabled {
+            eprintln!("│");
+            eprintln!("{} {} — done", color_success("◆"), label.as_ref());
+        }
+    }
+
+    fn summary(&self, text: impl AsRef<str>) {
+        if self.enabled {
+            eprintln!("│");
+            eprintln!("{} {}", color_success("◆"), text.as_ref());
+        }
+    }
+
+    fn detail(&self, text: impl AsRef<str>) {
+        if self.enabled {
+            eprintln!("│");
+            eprintln!("{} {}", color_info("●"), text.as_ref());
+        }
+    }
+
+    fn done(&self) {
+        if self.enabled {
+            eprintln!("│");
+            eprintln!("└ Done in {:.1}s", self.started.elapsed().as_secs_f32());
+        }
     }
 }
 
@@ -1268,6 +1311,26 @@ fn color_success(text: &str) -> String {
     }
 }
 
+fn color_info(text: &str) -> String {
+    if stderr_supports_color() {
+        format!("\x1b[1;34m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn format_count(value: u64) -> String {
+    let text = value.to_string();
+    let mut out = String::with_capacity(text.len() + text.len() / 3);
+    for (idx, ch) in text.chars().rev().enumerate() {
+        if idx != 0 && idx % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
 fn stderr_supports_color() -> bool {
     if env::var_os("NO_COLOR").is_some() {
         return false;
@@ -1283,6 +1346,8 @@ fn command_index(args: &[String]) -> Result<i32> {
     let cfg = load_or_create_config(&start)?;
     let _lock = acquire_exclusive_lock(&cfg.root)?;
     let timer = Instant::now();
+    let flow = ConsoleFlow::start();
+    flow.step_done(format!("Resolved project {}", display_path(&cfg.root)));
     let progress = ProgressLine::start("Indexing code");
     let mut timings = Timings::default();
     let mut scanned = 0;
@@ -1301,6 +1366,18 @@ fn command_index(args: &[String]) -> Result<i32> {
     timings.write += write_timer.elapsed().as_secs_f64();
     let elapsed = timer.elapsed().as_secs_f64();
     progress.finish("Indexed code");
+    flow.summary(format!(
+        "Indexed {} files",
+        format_count(index.files.len() as u64)
+    ));
+    flow.detail(format!(
+        "{} scanned, {} skipped in {:.3}s",
+        format_count(scanned),
+        format_count(skipped),
+        elapsed
+    ));
+    flow.detail(timing_summary(&timings));
+    flow.done();
     println!(
         "indexed {} files ({} skipped, {} scanned) in {:.3}s",
         index.files.len(),
@@ -1320,6 +1397,8 @@ fn command_update(args: &[String]) -> Result<i32> {
     let _lock = acquire_exclusive_lock(&cfg.root)?;
     let path = index_path(&cfg.root);
     let timer = Instant::now();
+    let flow = ConsoleFlow::start();
+    flow.step_done(format!("Resolved project {}", display_path(&cfg.root)));
     let progress = ProgressLine::start("Updating index");
     let mut timings = Timings::default();
     let mut scanned = 0;
@@ -1335,6 +1414,13 @@ fn command_update(args: &[String]) -> Result<i32> {
                 match changes {
                     Some(changes) if changes.is_empty() => {
                         progress.finish("Index already current");
+                        flow.summary(format!(
+                            "Checked {} files",
+                            format_count(old_index.file_count as u64)
+                        ));
+                        flow.detail("0 changed by git");
+                        flow.detail(timing_summary(&timings));
+                        flow.done();
                         println!(
                             "updated {} files (0 changed by git) in {:.3}s",
                             old_index.file_count,
@@ -1363,6 +1449,19 @@ fn command_update(args: &[String]) -> Result<i32> {
                         let elapsed = timer.elapsed().as_secs_f64();
                         let visible_count = stats.reused + stats.updated + stats.added;
                         progress.finish("Updated index");
+                        flow.summary(format!(
+                            "Updated {} files",
+                            format_count(visible_count as u64)
+                        ));
+                        flow.detail(format!(
+                            "{} reused, {} added, {} modified, {} removed",
+                            format_count(stats.reused as u64),
+                            format_count(stats.added as u64),
+                            format_count(stats.updated as u64),
+                            format_count(stats.removed as u64)
+                        ));
+                        flow.detail(timing_summary(&timings));
+                        flow.done();
                         println!(
                             "updated {} files ({} reused, {} added, {} modified, {} removed, {} skipped, {} scanned) in {:.3}s",
                             visible_count,
@@ -1388,6 +1487,7 @@ fn command_update(args: &[String]) -> Result<i32> {
                             &timer,
                             &mut timings,
                             progress,
+                            &flow,
                         );
                     }
                 }
@@ -1399,6 +1499,7 @@ fn command_update(args: &[String]) -> Result<i32> {
                     &timer,
                     &mut timings,
                     progress,
+                    &flow,
                 );
             }
         } else {
@@ -1428,6 +1529,18 @@ fn command_update(args: &[String]) -> Result<i32> {
     timings.write += write_timer.elapsed().as_secs_f64();
     let elapsed = timer.elapsed().as_secs_f64();
     progress.finish("Indexed code");
+    flow.summary(format!(
+        "Indexed {} files",
+        format_count(index.files.len() as u64)
+    ));
+    flow.detail(format!(
+        "{} scanned, {} skipped in {:.3}s",
+        format_count(scanned),
+        format_count(skipped),
+        elapsed
+    ));
+    flow.detail(timing_summary(&timings));
+    flow.done();
     println!(
         "indexed {} files ({} skipped, {} scanned) in {:.3}s",
         index.files.len(),
@@ -1448,6 +1561,7 @@ fn update_from_filesystem_scan(
     timer: &Instant,
     timings: &mut Timings,
     progress: ProgressLine,
+    flow: &ConsoleFlow,
 ) -> Result<i32> {
     let mut scanned = 0;
     let mut skipped = 0;
@@ -1458,6 +1572,18 @@ fn update_from_filesystem_scan(
         save_index_state(&cfg.root)?;
         let elapsed = timer.elapsed().as_secs_f64();
         progress.finish("Index already current");
+        flow.summary(format!(
+            "Checked {} files",
+            format_count(visible_before as u64)
+        ));
+        flow.detail(format!(
+            "{} scanned, {} skipped in {:.3}s",
+            format_count(scanned),
+            format_count(skipped),
+            elapsed
+        ));
+        flow.detail(timing_summary(timings));
+        flow.done();
         println!(
             "updated {} files ({} reused, 0 added, 0 modified, 0 removed, {} skipped, {} scanned) in {:.3}s",
             visible_before, visible_before, skipped, scanned, elapsed
@@ -1495,6 +1621,25 @@ fn update_from_filesystem_scan(
     let elapsed = timer.elapsed().as_secs_f64();
     let visible_count = stats.reused + stats.updated + stats.added;
     progress.finish("Updated index");
+    flow.summary(format!(
+        "Updated {} files",
+        format_count(visible_count as u64)
+    ));
+    flow.detail(format!(
+        "{} reused, {} added, {} modified, {} removed",
+        format_count(stats.reused as u64),
+        format_count(stats.added as u64),
+        format_count(stats.updated as u64),
+        format_count(stats.removed as u64)
+    ));
+    flow.detail(format!(
+        "{} scanned, {} skipped in {:.3}s",
+        format_count(scanned),
+        format_count(skipped),
+        elapsed
+    ));
+    flow.detail(timing_summary(timings));
+    flow.done();
     println!(
         "updated {} files ({} reused, {} added, {} modified, {} removed, {} skipped, {} scanned) in {:.3}s",
         visible_count,
@@ -1546,6 +1691,8 @@ fn parse_index_args(args: &[String]) -> Result<(Options, PathBuf)> {
 fn command_watch(args: &[String]) -> Result<i32> {
     let (watch_options, start) = parse_watch_args(args)?;
     let cfg = load_or_create_config(&start)?;
+    let flow = ConsoleFlow::start();
+    flow.step_done(format!("Resolved project {}", display_path(&cfg.root)));
     fs::create_dir_all(watch_registry_dir())?;
     let id = watch_id(&cfg.root);
     let record_path = watch_record_path(&id);
@@ -1601,9 +1748,10 @@ fn command_watch(args: &[String]) -> Result<i32> {
         let _ = fs::remove_file(&record_path);
     }
 
-    sync_index_before_watch(&cfg)?;
+    sync_index_before_watch(&cfg, &flow)?;
 
     let exe = env::current_exe()?;
+    let progress = ProgressLine::start("Starting service");
     let mut command = Command::new(exe);
     command
         .arg("search-daemon")
@@ -1643,6 +1791,10 @@ fn command_watch(args: &[String]) -> Result<i32> {
             watch_options.compact_delta_bytes
         ),
     )?;
+    progress.finish("Project service started");
+    flow.summary(format!("Watching {}", display_path(&cfg.root)));
+    flow.detail(format!("pid={} id={}", record.pid, record.id));
+    flow.done();
     println!(
         "watching {} pid={} id={}",
         display_path(&cfg.root),
@@ -1652,7 +1804,7 @@ fn command_watch(args: &[String]) -> Result<i32> {
     Ok(0)
 }
 
-fn sync_index_before_watch(cfg: &ProjectConfig) -> Result<()> {
+fn sync_index_before_watch(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<()> {
     let _lock = acquire_exclusive_lock(&cfg.root)?;
     let options = Options {
         max_filesize: DEFAULT_MAX_FILE_SIZE,
@@ -1695,6 +1847,17 @@ fn sync_index_before_watch(cfg: &ProjectConfig) -> Result<()> {
             ),
         )?;
         progress.finish("Indexed code");
+        flow.summary(format!(
+            "Indexed {} files",
+            format_count(index.files.len() as u64)
+        ));
+        flow.detail(format!(
+            "{} scanned, {} skipped in {:.3}s",
+            format_count(scanned),
+            format_count(skipped),
+            timer.elapsed().as_secs_f64()
+        ));
+        flow.detail(timing_summary(&timings));
         return Ok(());
     }
     drop(loaded);
@@ -1717,6 +1880,17 @@ fn sync_index_before_watch(cfg: &ProjectConfig) -> Result<()> {
             ),
         )?;
         progress.finish("Index already current");
+        flow.summary(format!(
+            "Checked {} files",
+            format_count(visible_before as u64)
+        ));
+        flow.detail(format!(
+            "{} scanned, {} skipped in {:.3}s",
+            format_count(scanned),
+            format_count(skipped),
+            timer.elapsed().as_secs_f64()
+        ));
+        flow.detail(timing_summary(&timings));
         return Ok(());
     }
 
@@ -1757,6 +1931,18 @@ fn sync_index_before_watch(cfg: &ProjectConfig) -> Result<()> {
         ),
     )?;
     progress.finish("Updated index");
+    flow.summary(format!(
+        "Updated {} files",
+        format_count((stats.reused + stats.updated + stats.added) as u64)
+    ));
+    flow.detail(format!(
+        "{} reused, {} added, {} modified, {} removed",
+        format_count(stats.reused as u64),
+        format_count(stats.added as u64),
+        format_count(stats.updated as u64),
+        format_count(stats.removed as u64)
+    ));
+    flow.detail(timing_summary(&timings));
     Ok(())
 }
 
@@ -2602,6 +2788,8 @@ fn command_compact(args: &[String]) -> Result<i32> {
     let cfg = load_config(&start)?;
     let _lock = acquire_exclusive_lock(&cfg.root)?;
     let timer = Instant::now();
+    let flow = ConsoleFlow::start();
+    flow.step_done(format!("Resolved project {}", display_path(&cfg.root)));
     let progress = ProgressLine::start("Compacting index");
     let mut timings = Timings::default();
     let path = index_path(&cfg.root);
@@ -2616,6 +2804,9 @@ fn command_compact(args: &[String]) -> Result<i32> {
     let deltas = load_deltas(&cfg.root)?;
     if deltas.is_empty() {
         progress.finish("No deltas to compact");
+        flow.summary("Compacted 0 delta indexes");
+        flow.detail(timing_summary(&timings));
+        flow.done();
         println!(
             "compacted 0 delta indexes in {:.3}s",
             timer.elapsed().as_secs_f64()
@@ -2626,6 +2817,7 @@ fn command_compact(args: &[String]) -> Result<i32> {
         return Ok(0);
     }
     let process_timer = Instant::now();
+    let delta_count = deltas.len();
     let compacted = compact_segments(&cfg, &base, &deltas, &options)?;
     timings.process += process_timer.elapsed().as_secs_f64();
     drop(deltas);
@@ -2636,6 +2828,16 @@ fn command_compact(args: &[String]) -> Result<i32> {
     save_index_state(&cfg.root)?;
     timings.write += write_timer.elapsed().as_secs_f64();
     progress.finish("Compacted index");
+    flow.summary(format!(
+        "Compacted {} files into base index",
+        format_count(compacted.files.len() as u64)
+    ));
+    flow.detail(format!(
+        "{} delta indexes merged",
+        format_count(delta_count as u64)
+    ));
+    flow.detail(timing_summary(&timings));
+    flow.done();
     println!(
         "compacted {} files into base index in {:.3}s",
         compacted.files.len(),
@@ -2911,15 +3113,37 @@ fn command_search(args: &[String]) -> Result<i32> {
             return Ok(2);
         }
         drop(index);
+        let flow = ConsoleFlow::start();
+        flow.step_done(format!("Resolved project {}", display_path(&cfg.root)));
         let progress = ProgressLine::start("Indexing code");
         let mut scanned = 0;
         let mut skipped = 0;
-        let built = build_index(&cfg, &options, &mut scanned, &mut skipped, None)?;
+        let mut timings = Timings::default();
+        let built = build_index(
+            &cfg,
+            &options,
+            &mut scanned,
+            &mut skipped,
+            Some(&mut timings),
+        )?;
         progress.update("Writing index");
+        let write_timer = Instant::now();
         save_index(&built, &path)?;
         remove_delta_dir(&cfg.root)?;
         save_index_state(&cfg.root)?;
+        timings.write += write_timer.elapsed().as_secs_f64();
         progress.finish("Indexed code");
+        flow.summary(format!(
+            "Indexed {} files",
+            format_count(built.files.len() as u64)
+        ));
+        flow.detail(format!(
+            "{} scanned, {} skipped",
+            format_count(scanned),
+            format_count(skipped)
+        ));
+        flow.detail(timing_summary(&timings));
+        flow.done();
         index = MappedIndex::open(&path);
     }
     let index = index?;
@@ -4004,15 +4228,31 @@ fn refresh_index_for_search(cfg: &ProjectConfig, options: &Options) -> Result<()
         .map(|index| index.config_hash != cfg.hash)
         .unwrap_or(true)
     {
+        let flow = ConsoleFlow::start();
+        flow.step_done(format!("Resolved project {}", display_path(&cfg.root)));
         let progress = ProgressLine::start("Indexing code");
         let mut scanned = 0;
         let mut skipped = 0;
-        let built = build_index(cfg, options, &mut scanned, &mut skipped, None)?;
+        let mut timings = Timings::default();
+        let built = build_index(cfg, options, &mut scanned, &mut skipped, Some(&mut timings))?;
         progress.update("Writing index");
+        let write_timer = Instant::now();
         save_index(&built, &path)?;
         remove_delta_dir(&cfg.root)?;
         save_index_state(&cfg.root)?;
+        timings.write += write_timer.elapsed().as_secs_f64();
         progress.finish("Indexed code");
+        flow.summary(format!(
+            "Indexed {} files",
+            format_count(built.files.len() as u64)
+        ));
+        flow.detail(format!(
+            "{} scanned, {} skipped",
+            format_count(scanned),
+            format_count(skipped)
+        ));
+        flow.detail(timing_summary(&timings));
+        flow.done();
         return Ok(());
     }
 
@@ -4026,15 +4266,37 @@ fn refresh_index_for_search(cfg: &ProjectConfig, options: &Options) -> Result<()
 
     let mut scanned = 0;
     let mut skipped = 0;
+    let flow = ConsoleFlow::start();
+    flow.step_done(format!("Resolved project {}", display_path(&cfg.root)));
     let progress = ProgressLine::start("Updating index");
+    let process_timer = Instant::now();
     let (delta, meta, stats) =
         build_delta_index(cfg, options, &changes, &mut scanned, &mut skipped)?;
+    let mut timings = Timings {
+        process: process_timer.elapsed().as_secs_f64(),
+        ..Timings::default()
+    };
     if stats.added != 0 || stats.updated != 0 || stats.removed != 0 {
         progress.update("Writing update");
+        let write_timer = Instant::now();
         save_delta(&cfg.root, &delta, &meta)?;
+        timings.write += write_timer.elapsed().as_secs_f64();
     }
     save_index_state(&cfg.root)?;
     progress.finish("Updated index");
+    flow.summary(format!(
+        "Updated {} files",
+        format_count((stats.reused + stats.updated + stats.added) as u64)
+    ));
+    flow.detail(format!(
+        "{} reused, {} added, {} modified, {} removed",
+        format_count(stats.reused as u64),
+        format_count(stats.added as u64),
+        format_count(stats.updated as u64),
+        format_count(stats.removed as u64)
+    ));
+    flow.detail(timing_summary(&timings));
+    flow.done();
     Ok(())
 }
 
