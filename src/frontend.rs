@@ -18,7 +18,6 @@ const INDEX_DIR: &str = ".indexsearch";
 const INDEX_FILE: &str = "index.bin";
 const PROJECT_FILE: &str = "index-search-project.txt";
 const SEARCH_DAEMON_FILE: &str = "search-daemon.txt";
-const STATE_FILE: &str = "state.txt";
 const WATCH_DIR: &str = "watches";
 const REQUEST_MAGIC: &[u8; 8] = b"ISDREQ1\n";
 const RESPONSE_MAGIC: &[u8; 8] = b"ISDRES1\n";
@@ -634,16 +633,11 @@ fn record_matches(record: &DaemonRecord) -> bool {
     let Ok(index_meta) = fs::metadata(index_path(&record.root)) else {
         return false;
     };
-    let state_meta = fs::metadata(state_path(&record.root)).ok();
-    let state_size = state_meta.as_ref().map(|meta| meta.len()).unwrap_or(0);
-    let state_mtime = state_meta.as_ref().map(mtime_ns).unwrap_or(0);
     same_fileish(backend, &record.exe_path)
         && backend_meta.len() == record.exe_size
         && mtime_ns(&backend_meta) == record.exe_mtime
         && index_meta.len() == record.index_size
         && mtime_ns(&index_meta) == record.index_mtime
-        && state_size == record.state_size
-        && state_mtime == record.state_mtime
 }
 
 fn same_fileish(left: &Path, right: &Path) -> bool {
@@ -969,10 +963,6 @@ fn index_path(root: &Path) -> PathBuf {
     root.join(INDEX_DIR).join(INDEX_FILE)
 }
 
-fn state_path(root: &Path) -> PathBuf {
-    root.join(INDEX_DIR).join(STATE_FILE)
-}
-
 fn record_path(root: &Path) -> PathBuf {
     root.join(INDEX_DIR).join(SEARCH_DAEMON_FILE)
 }
@@ -1006,8 +996,6 @@ struct DaemonRecord {
     exe_mtime: i64,
     index_size: u64,
     index_mtime: i64,
-    state_size: u64,
-    state_mtime: i64,
 }
 
 fn read_record(path: &Path) -> Result<DaemonRecord, String> {
@@ -1029,10 +1017,6 @@ fn read_record(path: &Path) -> Result<DaemonRecord, String> {
             "index_size" => record.index_size = value.parse().map_err(|_| "invalid index_size")?,
             "index_mtime" => {
                 record.index_mtime = value.parse().map_err(|_| "invalid index_mtime")?
-            }
-            "state_size" => record.state_size = value.parse().map_err(|_| "invalid state_size")?,
-            "state_mtime" => {
-                record.state_mtime = value.parse().map_err(|_| "invalid state_mtime")?
             }
             _ => {}
         }

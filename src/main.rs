@@ -459,8 +459,6 @@ struct SearchDaemonRecord {
     exe_mtime: i64,
     index_size: u64,
     index_mtime: i64,
-    state_size: u64,
-    state_mtime: i64,
 }
 
 fn main() {
@@ -3922,7 +3920,6 @@ fn windows_direct_stdout_enabled() -> bool {
 
 fn run_search_daemon(root: &Path, watch_options: Option<WatchOptions>) -> Result<i32> {
     let index_meta = fs::metadata(index_path(root))?;
-    let state_meta = fs::metadata(state_path(root)).ok();
     let exe = env::current_exe()?;
     let exe_meta = fs::metadata(&exe)?;
     let listener = SearchDaemonListener::bind(root)?;
@@ -3940,8 +3937,6 @@ fn run_search_daemon(root: &Path, watch_options: Option<WatchOptions>) -> Result
         exe_mtime: mtime_ns(&exe_meta),
         index_size: index_meta.len(),
         index_mtime: mtime_ns(&index_meta),
-        state_size: state_meta.as_ref().map(|meta| meta.len()).unwrap_or(0),
-        state_mtime: state_meta.as_ref().map(mtime_ns).unwrap_or(0),
     };
     write_search_daemon_record(&record)?;
     let index = {
@@ -5316,6 +5311,9 @@ fn collect_git_changes(root: &Path, include_untracked: bool) -> Result<Option<Ve
 }
 
 fn is_git_root(root: &Path) -> Result<bool> {
+    if !git_metadata_present(root) {
+        return Ok(false);
+    }
     let top = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -5331,6 +5329,10 @@ fn is_git_root(root: &Path) -> Result<bool> {
     let canonical_git_root = fs::canonicalize(&git_root).unwrap_or(git_root);
     let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     Ok(canonical_git_root == canonical_root)
+}
+
+fn git_metadata_present(root: &Path) -> bool {
+    root.join(".git").exists()
 }
 
 fn parse_git_status(data: &[u8], changes: &mut BTreeMap<String, bool>) {
@@ -5396,7 +5398,7 @@ fn normalize_git_path(bytes: &[u8]) -> String {
 }
 
 fn current_git_head(root: &Path) -> Result<Option<String>> {
-    if !is_git_root(root)? {
+    if !git_metadata_present(root) {
         return Ok(None);
     }
     let output = Command::new("git")
@@ -9493,10 +9495,8 @@ fn file_trigrams(bytes: &[u8], scratch: &mut TrigramScratch) -> Vec<u32> {
 }
 
 fn index_grams(bytes: &[u8], scratch: &mut TrigramScratch) -> Vec<u32> {
-    let mut grams = file_trigrams(bytes, scratch);
-    let mut extras = Vec::new();
+    let (mut grams, mut extras, _) = scan_index_keys(bytes, scratch, false);
     add_qualified_call_postings(bytes, &mut extras);
-    add_identifier_prefix_postings(bytes, &mut extras);
     extras.sort_unstable();
     extras.dedup();
     grams.extend(extras);
@@ -9507,35 +9507,78 @@ fn index_grams_and_word_fragments(
     bytes: &[u8],
     scratch: &mut TrigramScratch,
 ) -> (Vec<u32>, Vec<u32>) {
-    let mut grams = file_trigrams(bytes, scratch);
-    let mut extras = Vec::new();
+    let (mut grams, mut extras, mut fragments) = scan_index_keys(bytes, scratch, true);
     add_qualified_call_postings(bytes, &mut extras);
-    let mut fragments = Vec::new();
-    let mut start = None;
-    for (idx, &byte) in bytes.iter().enumerate() {
-        if is_word_byte(byte) {
-            if start.is_none() {
-                start = Some(idx);
-            }
-            continue;
-        }
-        if let Some(s) = start.take() {
-            let word = &bytes[s..idx];
-            add_word_prefix_postings(word, &mut extras);
-            add_word_fragment_keys(word, &mut fragments);
-        }
-    }
-    if let Some(s) = start {
-        let word = &bytes[s..];
-        add_word_prefix_postings(word, &mut extras);
-        add_word_fragment_keys(word, &mut fragments);
-    }
     extras.sort_unstable();
     extras.dedup();
     grams.extend(extras);
     fragments.sort_unstable();
     fragments.dedup();
     (grams, fragments)
+}
+
+fn scan_index_keys(
+    bytes: &[u8],
+    scratch: &mut TrigramScratch,
+    collect_fragments: bool,
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let mut grams = Vec::with_capacity(bytes.len().saturating_sub(2).min(4096));
+    let mut extras = Vec::new();
+    let mut fragments = Vec::new();
+    let mut word_start = None;
+
+    let mut prev2 = 0u32;
+    let mut prev1 = 0u32;
+    for (idx, &byte) in bytes.iter().enumerate() {
+        let lower = byte.to_ascii_lowercase();
+        if idx == 0 {
+            prev2 = lower as u32;
+        } else if idx == 1 {
+            prev1 = lower as u32;
+        } else {
+            let gram = (prev2 << 16) | (prev1 << 8) | lower as u32;
+            prev2 = prev1;
+            prev1 = lower as u32;
+            push_unique_trigram(gram, scratch, &mut grams);
+        }
+
+        if is_word_byte(byte) {
+            if word_start.is_none() {
+                word_start = Some(idx);
+            }
+        } else if let Some(start) = word_start.take() {
+            let word = &bytes[start..idx];
+            add_word_prefix_postings(word, &mut extras);
+            if collect_fragments {
+                add_word_fragment_keys(word, &mut fragments);
+            }
+        }
+    }
+    if let Some(start) = word_start {
+        let word = &bytes[start..];
+        add_word_prefix_postings(word, &mut extras);
+        if collect_fragments {
+            add_word_fragment_keys(word, &mut fragments);
+        }
+    }
+    for word in scratch.touched_words.drain(..) {
+        scratch.bits[word] = 0;
+    }
+    (grams, extras, fragments)
+}
+
+fn push_unique_trigram(gram: u32, scratch: &mut TrigramScratch, grams: &mut Vec<u32>) {
+    let idx = gram as usize;
+    let word = idx / TRIGRAM_WORD_BITS;
+    let mask = 1u64 << (idx % TRIGRAM_WORD_BITS);
+    let current = scratch.bits[word];
+    if current & mask == 0 {
+        if current == 0 {
+            scratch.touched_words.push(word);
+        }
+        scratch.bits[word] = current | mask;
+        grams.push(gram);
+    }
 }
 
 fn add_word_fragment_keys(word: &[u8], keys: &mut Vec<u32>) {
@@ -9573,24 +9616,6 @@ fn selected_word_fragments<'a>(fragments: impl Iterator<Item = &'a [u32]>) -> Ha
                 .then_some(fragment)
         })
         .collect()
-}
-
-fn add_identifier_prefix_postings(bytes: &[u8], grams: &mut Vec<u32>) {
-    let mut start = None;
-    for (idx, &byte) in bytes.iter().enumerate() {
-        if is_word_byte(byte) {
-            if start.is_none() {
-                start = Some(idx);
-            }
-            continue;
-        }
-        if let Some(s) = start.take() {
-            add_word_prefix_postings(&bytes[s..idx], grams);
-        }
-    }
-    if let Some(s) = start {
-        add_word_prefix_postings(&bytes[s..], grams);
-    }
 }
 
 fn add_word_prefix_postings(word: &[u8], grams: &mut Vec<u32>) {
@@ -9970,7 +9995,7 @@ fn search_daemon_token(root: &Path) -> String {
 fn write_search_daemon_record(record: &SearchDaemonRecord) -> Result<()> {
     fs::create_dir_all(record.root.join(INDEX_DIR))?;
     let mut text = format!(
-        "version=1\npid={}\nport={}\ntoken={}\nroot={}\nexe_path={}\nexe_size={}\nexe_mtime={}\nindex_size={}\nindex_mtime={}\nstate_size={}\nstate_mtime={}\n",
+        "version=1\npid={}\nport={}\ntoken={}\nroot={}\nexe_path={}\nexe_size={}\nexe_mtime={}\nindex_size={}\nindex_mtime={}\n",
         record.pid,
         record.port,
         record.token,
@@ -9979,9 +10004,7 @@ fn write_search_daemon_record(record: &SearchDaemonRecord) -> Result<()> {
         record.exe_size,
         record.exe_mtime,
         record.index_size,
-        record.index_mtime,
-        record.state_size,
-        record.state_mtime
+        record.index_mtime
     );
     if let Some(socket_path) = record.socket_path.as_ref() {
         text.push_str(&format!("socket_path={}\n", socket_path.display()));
@@ -9993,11 +10016,8 @@ fn write_search_daemon_record(record: &SearchDaemonRecord) -> Result<()> {
 fn refresh_search_daemon_record(record: &SearchDaemonRecord) -> Result<()> {
     let mut updated = record.clone();
     let index_meta = fs::metadata(index_path(&updated.root))?;
-    let state_meta = fs::metadata(state_path(&updated.root)).ok();
     updated.index_size = index_meta.len();
     updated.index_mtime = mtime_ns(&index_meta);
-    updated.state_size = state_meta.as_ref().map(|meta| meta.len()).unwrap_or(0);
-    updated.state_mtime = state_meta.as_ref().map(mtime_ns).unwrap_or(0);
     write_search_daemon_record(&updated)
 }
 
@@ -10042,16 +10062,11 @@ fn search_daemon_fingerprint_matches(record: &SearchDaemonRecord) -> bool {
     let Ok(index_meta) = fs::metadata(index_path(&record.root)) else {
         return false;
     };
-    let state_meta = fs::metadata(state_path(&record.root)).ok();
-    let state_size = state_meta.as_ref().map(|meta| meta.len()).unwrap_or(0);
-    let state_mtime = state_meta.as_ref().map(mtime_ns).unwrap_or(0);
     exe == record.exe_path
         && exe_meta.len() == record.exe_size
         && mtime_ns(&exe_meta) == record.exe_mtime
         && index_meta.len() == record.index_size
         && mtime_ns(&index_meta) == record.index_mtime
-        && state_size == record.state_size
-        && state_mtime == record.state_mtime
 }
 
 fn read_search_daemon_record(path: &Path) -> Result<SearchDaemonRecord> {
@@ -10066,8 +10081,6 @@ fn read_search_daemon_record(path: &Path) -> Result<SearchDaemonRecord> {
     let mut exe_mtime = 0;
     let mut index_size = 0;
     let mut index_mtime = 0;
-    let mut state_size = u64::MAX;
-    let mut state_mtime = i64::MIN;
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -10083,8 +10096,6 @@ fn read_search_daemon_record(path: &Path) -> Result<SearchDaemonRecord> {
             "exe_mtime" => exe_mtime = value.parse().unwrap_or(0),
             "index_size" => index_size = value.parse().unwrap_or(0),
             "index_mtime" => index_mtime = value.parse().unwrap_or(0),
-            "state_size" => state_size = value.parse().unwrap_or(u64::MAX),
-            "state_mtime" => state_mtime = value.parse().unwrap_or(i64::MIN),
             _ => {}
         }
     }
@@ -10106,8 +10117,6 @@ fn read_search_daemon_record(path: &Path) -> Result<SearchDaemonRecord> {
         exe_mtime,
         index_size,
         index_mtime,
-        state_size,
-        state_mtime,
     })
 }
 
