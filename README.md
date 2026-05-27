@@ -97,7 +97,7 @@ Get-Process is-daemon -ErrorAction SilentlyContinue | Stop-Process -Force
 ```
 
 Newer releases also write a versioned backend such as
-`is-daemon-0.3.25.exe`, so a locked old backend no longer prevents installing
+`is-daemon-0.3.26.exe`, so a locked old backend no longer prevents installing
 the new frontend.
 
 ## Quick Start
@@ -114,6 +114,29 @@ If `index-search-project.txt` does not exist, `index`, `update`, `watch`, and
 interactive first search can create a default config before building the index.
 Edit that file and rerun `is index .` or `is update .` to rebuild with new
 rules.
+
+## Profiling
+
+Use `--profile` or `--instrument` to print internal timing lines to stderr.
+This is intended for diagnosing platform-specific costs such as Windows
+filesystem scanning, file reads, compression, index writes, daemon RPC, and
+output copying.
+
+PowerShell examples:
+
+```powershell
+is index --profile . 2>&1 | Tee-Object index-profile.txt
+is update --profile . 2>&1 | Tee-Object update-profile.txt
+is --profile -n -g "*.cpp" Nanite . 2>&1 | Tee-Object search-profile.txt
+is --profile --no-daemon -n -g "*.cpp" Nanite . 2>&1 | Tee-Object search-no-daemon-profile.txt
+```
+
+Useful search comparisons are `--profile` with the daemon, `--profile
+--no-daemon` without it, and `--profile --auto-update` when checking refresh
+cost. The `profile:` lines are stable text output and can be pasted into an
+issue or chat for analysis. For parallel indexing, per-file phases such as
+`index_file_read`, `index_tokenize`, and `index_compress` are accumulated
+worker time, while `index_process_total` is wall time.
 
 Minimal project file:
 
@@ -430,6 +453,7 @@ can be controlled with `--color auto|always|never`.
 - `--auto-update`
 - `--auto-update-untracked`
 - `--stats`
+- `--profile`, `--instrument`
 - `--no-daemon`
 
 Unsupported flags are rejected instead of silently changing semantics. Use `rg`

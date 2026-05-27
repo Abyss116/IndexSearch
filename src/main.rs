@@ -207,6 +207,24 @@ struct Timings {
     scan: f64,
     process: f64,
     write: f64,
+    open_index: f64,
+    current_meta: f64,
+    change_diff: f64,
+    file_read: f64,
+    tokenize: f64,
+    compress: f64,
+    sort: f64,
+    select_fragments: f64,
+    postings: f64,
+    write_prepare_files: f64,
+    write_prepare_postings: f64,
+    write_prepare_chunks: f64,
+    write_header_tables: f64,
+    write_postings_paths: f64,
+    write_content: f64,
+    write_flush_publish: f64,
+    write_state: f64,
+    write_delta_meta: f64,
 }
 
 struct DeltaSegment {
@@ -413,6 +431,14 @@ impl SearchProfile {
     fn record(&mut self, name: &'static str, elapsed: Duration) {
         self.events.push((name, elapsed.as_secs_f64() * 1000.0));
     }
+}
+
+fn elapsed_ns(start: Instant) -> u64 {
+    start.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+fn ns_to_secs(ns: u64) -> f64 {
+    ns as f64 / 1_000_000_000.0
 }
 
 #[derive(Clone)]
@@ -680,6 +706,11 @@ fn print_help() {
     );
     help_option(&style, "-m, --max-count NUM", "max matching lines per file");
     help_option(&style, "--stats", "print search stats");
+    help_option(
+        &style,
+        "--profile, --instrument",
+        "print internal timing breakdown to stderr",
+    );
     help_option(&style, "--no-daemon", "do not use the search daemon");
     println!();
 
@@ -710,6 +741,11 @@ fn print_help() {
         &style,
         "--auto-update",
         "search performs a fast Git changed-path refresh first",
+    );
+    help_option(
+        &style,
+        "--profile, --instrument",
+        "print internal timing breakdown to stderr",
     );
     println!();
 
@@ -766,6 +802,11 @@ fn print_index_help() {
     );
     help_option(&style, "--hidden", "include hidden paths while indexing");
     help_option(&style, "-L, --follow", "follow symlinks while indexing");
+    help_option(
+        &style,
+        "--profile, --instrument",
+        "print internal timing breakdown to stderr",
+    );
 }
 
 fn print_update_help() {
@@ -794,6 +835,11 @@ fn print_update_help() {
         "--git-untracked",
         "include untracked files with --git update",
     );
+    help_option(
+        &style,
+        "--profile, --instrument",
+        "print internal timing breakdown to stderr",
+    );
 }
 
 fn print_compact_help() {
@@ -803,6 +849,12 @@ fn print_compact_help() {
         "compact",
         "[PATH]",
         "fold delta indexes into the base index",
+    );
+    help_section(&style, "Options");
+    help_option(
+        &style,
+        "--profile, --instrument",
+        "print internal timing breakdown to stderr",
     );
 }
 
@@ -1015,6 +1067,11 @@ fn print_search_help() {
         "include untracked files with --auto-update",
     );
     help_option(&style, "--stats", "print search stats");
+    help_option(
+        &style,
+        "--profile, --instrument",
+        "print internal timing breakdown to stderr",
+    );
     help_option(&style, "--no-daemon", "do not use the search daemon");
 }
 
@@ -1363,9 +1420,11 @@ fn command_index(args: &[String]) -> Result<i32> {
         Some(&mut timings),
     )?;
     let write_timer = Instant::now();
-    save_index(&index, &index_path(&cfg.root))?;
+    save_index_profiled(&index, &index_path(&cfg.root), Some(&mut timings))?;
     remove_delta_dir(&cfg.root)?;
+    let state_timer = Instant::now();
     save_index_state(&cfg.root)?;
+    timings.write_state += state_timer.elapsed().as_secs_f64();
     timings.write += write_timer.elapsed().as_secs_f64();
     let elapsed = timer.elapsed().as_secs_f64();
     progress.finish("Indexed code");
@@ -1389,6 +1448,9 @@ fn command_index(args: &[String]) -> Result<i32> {
         elapsed
     );
     print_timings(&timings);
+    if options.profile {
+        print_index_profile(&timings);
+    }
     println!("root: {}", display_path(&cfg.root));
     println!("index: {}", display_path(&index_path(&cfg.root)));
     Ok(0)
@@ -1406,7 +1468,9 @@ fn command_update(args: &[String]) -> Result<i32> {
     let mut timings = Timings::default();
     let mut scanned = 0;
     let mut skipped = 0;
+    let open_timer = Instant::now();
     let old = MappedIndex::open(&path).ok();
+    timings.open_index += open_timer.elapsed().as_secs_f64();
     let index = if let Some(ref old_index) = old {
         if old_index.config_hash == cfg.hash {
             let try_git_update = options.git_update || is_git_root(&cfg.root)?;
@@ -1416,6 +1480,9 @@ fn command_update(args: &[String]) -> Result<i32> {
                 timings.git += git_timer.elapsed().as_secs_f64();
                 match changes {
                     Some(changes) if changes.is_empty() => {
+                        let state_timer = Instant::now();
+                        save_index_state(&cfg.root)?;
+                        timings.write_state += state_timer.elapsed().as_secs_f64();
                         progress.finish("Index already current");
                         flow.summary(format!(
                             "Checked {} files",
@@ -1430,9 +1497,11 @@ fn command_update(args: &[String]) -> Result<i32> {
                             timer.elapsed().as_secs_f64()
                         );
                         print_timings(&timings);
+                        if options.profile {
+                            print_index_profile(&timings);
+                        }
                         println!("root: {}", display_path(&cfg.root));
                         println!("index: {}", display_path(&path));
-                        save_index_state(&cfg.root)?;
                         return Ok(0);
                     }
                     Some(changes) => {
@@ -1443,11 +1512,14 @@ fn command_update(args: &[String]) -> Result<i32> {
                             &changes,
                             &mut scanned,
                             &mut skipped,
+                            Some(&mut timings),
                         )?;
                         timings.process += process_timer.elapsed().as_secs_f64();
                         let write_timer = Instant::now();
-                        save_delta(&cfg.root, &delta, &meta)?;
+                        save_delta_profiled(&cfg.root, &delta, &meta, Some(&mut timings))?;
+                        let state_timer = Instant::now();
                         save_index_state(&cfg.root)?;
+                        timings.write_state += state_timer.elapsed().as_secs_f64();
                         timings.write += write_timer.elapsed().as_secs_f64();
                         let elapsed = timer.elapsed().as_secs_f64();
                         let visible_count = stats.reused + stats.updated + stats.added;
@@ -1477,6 +1549,9 @@ fn command_update(args: &[String]) -> Result<i32> {
                             elapsed
                         );
                         print_timings(&timings);
+                        if options.profile {
+                            print_index_profile(&timings);
+                        }
                         println!("root: {}", display_path(&cfg.root));
                         println!("index: {}", display_path(&path));
                         println!("delta: {}", display_path(&delta_dir(&cfg.root)));
@@ -1526,9 +1601,11 @@ fn command_update(args: &[String]) -> Result<i32> {
     };
     drop(old);
     let write_timer = Instant::now();
-    save_index(&index, &path)?;
+    save_index_profiled(&index, &path, Some(&mut timings))?;
     remove_delta_dir(&cfg.root)?;
+    let state_timer = Instant::now();
     save_index_state(&cfg.root)?;
+    timings.write_state += state_timer.elapsed().as_secs_f64();
     timings.write += write_timer.elapsed().as_secs_f64();
     let elapsed = timer.elapsed().as_secs_f64();
     progress.finish("Indexed code");
@@ -1552,6 +1629,9 @@ fn command_update(args: &[String]) -> Result<i32> {
         elapsed
     );
     print_timings(&timings);
+    if options.profile {
+        print_index_profile(&timings);
+    }
     println!("root: {}", display_path(&cfg.root));
     println!("index: {}", display_path(&path));
     Ok(0)
@@ -1572,7 +1652,9 @@ fn update_from_filesystem_scan(
         collect_filesystem_changes(cfg, options, &mut scanned, &mut skipped, timings)?;
 
     if changes.is_empty() {
+        let state_timer = Instant::now();
         save_index_state(&cfg.root)?;
+        timings.write_state += state_timer.elapsed().as_secs_f64();
         let elapsed = timer.elapsed().as_secs_f64();
         progress.finish("Index already current");
         flow.summary(format!(
@@ -1592,6 +1674,9 @@ fn update_from_filesystem_scan(
             visible_before, visible_before, skipped, scanned, elapsed
         );
         print_timings(timings);
+        if options.profile {
+            print_index_profile(timings);
+        }
         println!("root: {}", display_path(&cfg.root));
         println!("index: {}", display_path(path));
         return Ok(0);
@@ -1607,17 +1692,22 @@ fn update_from_filesystem_scan(
         &changes,
         &mut changed_scanned,
         &mut changed_skipped,
+        Some(&mut *timings),
     )?;
     timings.process += process_timer.elapsed().as_secs_f64();
     skipped += changed_skipped;
     scanned = full_scan_count;
 
     if stats.added == 0 && stats.updated == 0 && stats.removed == 0 {
+        let state_timer = Instant::now();
         save_index_state(&cfg.root)?;
+        timings.write_state += state_timer.elapsed().as_secs_f64();
     } else {
         let write_timer = Instant::now();
-        save_delta(&cfg.root, &delta, &meta)?;
+        save_delta_profiled(&cfg.root, &delta, &meta, Some(&mut *timings))?;
+        let state_timer = Instant::now();
         save_index_state(&cfg.root)?;
+        timings.write_state += state_timer.elapsed().as_secs_f64();
         timings.write += write_timer.elapsed().as_secs_f64();
     }
 
@@ -1655,6 +1745,9 @@ fn update_from_filesystem_scan(
         elapsed
     );
     print_timings(timings);
+    if options.profile {
+        print_index_profile(timings);
+    }
     println!("root: {}", display_path(&cfg.root));
     println!("index: {}", display_path(path));
     if stats.added != 0 || stats.updated != 0 || stats.removed != 0 {
@@ -1679,6 +1772,7 @@ fn parse_index_args(args: &[String]) -> Result<(Options, PathBuf)> {
                 options.git_update = true;
                 options.git_untracked = true;
             }
+            "--profile" | "--instrument" => options.profile = true,
             "--max-filesize" => {
                 i += 1;
                 options.max_filesize =
@@ -1907,6 +2001,7 @@ fn sync_index_before_watch(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<()
         &changes,
         &mut changed_scanned,
         &mut changed_skipped,
+        Some(&mut timings),
     )?;
     timings.process += process_timer.elapsed().as_secs_f64();
     skipped += changed_skipped;
@@ -2709,7 +2804,7 @@ fn flush_watch_batch(cfg: &ProjectConfig, paths: &HashSet<String>) -> Result<boo
     let mut skipped = 0;
     let process_timer = Instant::now();
     let (delta, meta, stats) =
-        build_delta_index(cfg, &options, &changes, &mut scanned, &mut skipped)?;
+        build_delta_index(cfg, &options, &changes, &mut scanned, &mut skipped, None)?;
     let process_elapsed = process_timer.elapsed().as_secs_f64();
     if stats.added == 0 && stats.updated == 0 && stats.removed == 0 {
         return Ok(false);
@@ -2830,6 +2925,9 @@ fn command_compact(args: &[String]) -> Result<i32> {
             timer.elapsed().as_secs_f64()
         );
         print_timings(&timings);
+        if options.profile {
+            print_index_profile(&timings);
+        }
         println!("root: {}", display_path(&cfg.root));
         println!("index: {}", display_path(&path));
         return Ok(0);
@@ -2862,6 +2960,9 @@ fn command_compact(args: &[String]) -> Result<i32> {
         timer.elapsed().as_secs_f64()
     );
     print_timings(&timings);
+    if options.profile {
+        print_index_profile(&timings);
+    }
     println!("root: {}", display_path(&cfg.root));
     println!("index: {}", display_path(&path));
     Ok(0)
@@ -3891,7 +3992,12 @@ fn handle_search_daemon_client(
     let read_timer = Instant::now();
     let cwd = read_search_daemon_request(stream, &record.token)?;
     let mut stdout_fd = stream.receive_stdout_fd().ok().flatten();
-    let wants_profile = cwd.args.iter().any(|arg| arg == "--profile-search");
+    let wants_profile = cwd.args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--profile" | "--instrument" | "--profile-search"
+        )
+    });
     if wants_profile {
         profile.record("daemon_read_request", read_timer.elapsed());
     }
@@ -4287,13 +4393,17 @@ fn refresh_index_for_search(cfg: &ProjectConfig, options: &Options) -> Result<()
     let flow = ConsoleFlow::start();
     flow.step_done(format!("Resolved project {}", display_path(&cfg.root)));
     let progress = ProgressLine::start("Updating index");
+    let mut timings = Timings::default();
     let process_timer = Instant::now();
-    let (delta, meta, stats) =
-        build_delta_index(cfg, options, &changes, &mut scanned, &mut skipped)?;
-    let mut timings = Timings {
-        process: process_timer.elapsed().as_secs_f64(),
-        ..Timings::default()
-    };
+    let (delta, meta, stats) = build_delta_index(
+        cfg,
+        options,
+        &changes,
+        &mut scanned,
+        &mut skipped,
+        Some(&mut timings),
+    )?;
+    timings.process += process_timer.elapsed().as_secs_f64();
     if stats.added != 0 || stats.updated != 0 || stats.removed != 0 {
         progress.update("Writing update");
         let write_timer = Instant::now();
@@ -4385,7 +4495,7 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
             "--json" => options.json = true,
             "--vimgrep" => options.vimgrep = true,
             "--stats" => options.stats = true,
-            "--profile-search" => options.profile = true,
+            "--profile" | "--instrument" | "--profile-search" => options.profile = true,
             "--color" => options.color = parse_color_choice(&need_value(arg)?)?,
             "--sort" | "--sortr" => {
                 options.sort_path = parse_sort_choice(&need_value(arg)?);
@@ -4705,16 +4815,25 @@ fn build_index(
     }
     let process_timer = Instant::now();
     let skipped_reads = AtomicU64::new(0);
+    let read_ns = AtomicU64::new(0);
+    let tokenize_ns = AtomicU64::new(0);
+    let compress_ns = AtomicU64::new(0);
     let mut files: Vec<(usize, FileEntry, Vec<u32>, Vec<u32>)> = entries
         .par_iter()
         .map_init(TrigramScratch::new, |scratch, entry| {
+            let read_timer = Instant::now();
             let bytes = fs::read(&entry.path).ok()?;
+            read_ns.fetch_add(elapsed_ns(read_timer), AtomicOrdering::Relaxed);
             if is_binary(&bytes) {
                 skipped_reads.fetch_add(1, AtomicOrdering::Relaxed);
                 return None;
             }
+            let tokenize_timer = Instant::now();
             let (grams, fragments) = index_grams_and_word_fragments(&bytes, scratch);
+            tokenize_ns.fetch_add(elapsed_ns(tokenize_timer), AtomicOrdering::Relaxed);
+            let compress_timer = Instant::now();
             let compressed_content = lz4_flex::compress_prepend_size(&bytes);
+            compress_ns.fetch_add(elapsed_ns(compress_timer), AtomicOrdering::Relaxed);
             Some((
                 entry.ordinal,
                 FileEntry {
@@ -4730,14 +4849,31 @@ fn build_index(
         })
         .filter_map(|result| result)
         .collect();
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.file_read += ns_to_secs(read_ns.load(AtomicOrdering::Relaxed));
+        timings.tokenize += ns_to_secs(tokenize_ns.load(AtomicOrdering::Relaxed));
+        timings.compress += ns_to_secs(compress_ns.load(AtomicOrdering::Relaxed));
+    }
+    let sort_timer = Instant::now();
     files.sort_by_key(|(idx, _, _, _)| *idx);
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.sort += sort_timer.elapsed().as_secs_f64();
+    }
 
+    let fragments_timer = Instant::now();
     let selected_fragments = selected_word_fragments(
         files
             .iter()
             .map(|(_, _, _, fragments)| fragments.as_slice()),
     );
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.select_fragments += fragments_timer.elapsed().as_secs_f64();
+    }
+    let postings_timer = Instant::now();
     let postings = build_postings_parallel(&files, &selected_fragments);
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.postings += postings_timer.elapsed().as_secs_f64();
+    }
     let out_files = files.into_iter().map(|(_, file, _, _)| file).collect();
     *skipped += skipped_reads.load(AtomicOrdering::Relaxed);
     if let Some(timings) = timings {
@@ -4755,6 +4891,7 @@ fn read_current_file_entry(
     cfg: &ProjectConfig,
     options: &Options,
     rel: &str,
+    mut timings: Option<&mut Timings>,
 ) -> Result<Option<(FileEntry, Vec<u32>)>> {
     let rel = rel.replace('\\', "/");
     if (!options.hidden && is_hidden(&rel)) || !is_searchable(cfg, &rel) {
@@ -4767,13 +4904,25 @@ fn read_current_file_entry(
     if !meta.is_file() || meta.len() > options.max_filesize {
         return Ok(None);
     }
+    let read_timer = Instant::now();
     let bytes = fs::read(&path)?;
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.file_read += read_timer.elapsed().as_secs_f64();
+    }
     if is_binary(&bytes) {
         return Ok(None);
     }
+    let tokenize_timer = Instant::now();
     let mut scratch = TrigramScratch::new();
     let grams = index_grams(&bytes, &mut scratch);
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.tokenize += tokenize_timer.elapsed().as_secs_f64();
+    }
+    let compress_timer = Instant::now();
     let compressed_content = lz4_flex::compress_prepend_size(&bytes);
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.compress += compress_timer.elapsed().as_secs_f64();
+    }
     Ok(Some((
         FileEntry {
             path: rel,
@@ -4829,9 +4978,14 @@ fn build_delta_index(
     changes: &[ChangedPath],
     scanned: &mut u64,
     skipped: &mut u64,
+    mut timings: Option<&mut Timings>,
 ) -> Result<(BuiltIndex, DeltaMeta, UpdateStats)> {
     *scanned = changes.len() as u64;
+    let existing_timer = Instant::now();
     let existing = current_visible_paths(&cfg.root)?;
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.current_meta += existing_timer.elapsed().as_secs_f64();
+    }
     let mut files = Vec::new();
     let mut postings: HashMap<u32, Vec<u32>> = HashMap::default();
     let mut meta = DeltaMeta::default();
@@ -4846,7 +5000,7 @@ fn build_delta_index(
             continue;
         }
 
-        match read_current_file_entry(cfg, options, &change.rel)? {
+        match read_current_file_entry(cfg, options, &change.rel, timings.as_deref_mut())? {
             Some((entry, grams)) => {
                 if existing.contains(&change.rel) {
                     stats.updated += 1;
@@ -4855,8 +5009,12 @@ fn build_delta_index(
                     stats.added += 1;
                 }
                 let id = files.len() as u32;
+                let postings_timer = Instant::now();
                 for gram in grams {
                     postings.entry(gram).or_default().push(id);
+                }
+                if let Some(timings) = timings.as_deref_mut() {
+                    timings.postings += postings_timer.elapsed().as_secs_f64();
                 }
                 files.push(entry);
             }
@@ -4897,11 +5055,14 @@ fn collect_filesystem_changes(
     let entries = scan_indexable_files(cfg, options, scanned, skipped)?;
     timings.scan += scan_timer.elapsed().as_secs_f64();
 
+    let current_timer = Instant::now();
     let current = current_visible_file_meta(&cfg.root)?;
+    timings.current_meta += current_timer.elapsed().as_secs_f64();
     let visible_before = current.len();
     let mut seen = HashSet::with_capacity_and_hasher(entries.len(), Default::default());
     let mut changes = Vec::new();
 
+    let diff_timer = Instant::now();
     for entry in entries {
         seen.insert(entry.rel.clone());
         match current.get(&entry.rel) {
@@ -4921,6 +5082,7 @@ fn collect_filesystem_changes(
             });
         }
     }
+    timings.change_diff += diff_timer.elapsed().as_secs_f64();
 
     Ok((changes, visible_before))
 }
@@ -5287,6 +5449,15 @@ fn save_index_state(root: &Path) -> Result<()> {
 }
 
 fn save_delta(root: &Path, index: &BuiltIndex, meta: &DeltaMeta) -> Result<()> {
+    save_delta_profiled(root, index, meta, None)
+}
+
+fn save_delta_profiled(
+    root: &Path,
+    index: &BuiltIndex,
+    meta: &DeltaMeta,
+    mut timings: Option<&mut Timings>,
+) -> Result<()> {
     let dir = delta_dir(root);
     fs::create_dir_all(&dir)?;
     let stamp = std::time::SystemTime::now()
@@ -5296,8 +5467,12 @@ fn save_delta(root: &Path, index: &BuiltIndex, meta: &DeltaMeta) -> Result<()> {
     let stem = format!("delta-{stamp}-{}", std::process::id());
     let bin_path = dir.join(format!("{stem}.bin"));
     let meta_path = dir.join(format!("{stem}.meta"));
-    save_index(index, &bin_path)?;
+    save_index_profiled(index, &bin_path, timings.as_deref_mut())?;
+    let meta_timer = Instant::now();
     save_delta_meta(meta, &meta_path)?;
+    if let Some(timings) = timings {
+        timings.write_delta_meta += meta_timer.elapsed().as_secs_f64();
+    }
     Ok(())
 }
 
@@ -5585,6 +5760,14 @@ fn bytecount_newlines(bytes: &[u8]) -> usize {
 }
 
 fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
+    save_index_profiled(index, path, None)
+}
+
+fn save_index_profiled(
+    index: &BuiltIndex,
+    path: &Path,
+    mut timings: Option<&mut Timings>,
+) -> Result<()> {
     fs::create_dir_all(path.parent().context("index path has no parent")?)?;
     let file_name = path
         .file_name()
@@ -5599,6 +5782,7 @@ fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
         .map(|file| file.compressed_content.len() as u64)
         .sum();
 
+    let prepare_files_timer = Instant::now();
     let path_blob_size: usize = index.files.iter().map(|file| file.path.len()).sum();
     let mut path_blob = Vec::with_capacity(path_blob_size);
     let mut file_records = Vec::with_capacity(index.files.len());
@@ -5616,6 +5800,10 @@ fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
         });
         content_offset += file.compressed_content.len() as u64;
     }
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.write_prepare_files += prepare_files_timer.elapsed().as_secs_f64();
+    }
+    let prepare_postings_timer = Instant::now();
     let mut posting_entries: Vec<_> = index.postings.iter().collect();
     posting_entries.sort_by_key(|entry| *entry.0);
     let mut posting_records = Vec::with_capacity(posting_entries.len());
@@ -5628,7 +5816,14 @@ fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
         });
         write_varint_postings(ids, &mut posting_data);
     }
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.write_prepare_postings += prepare_postings_timer.elapsed().as_secs_f64();
+    }
+    let prepare_chunks_timer = Instant::now();
     let chunk_extension = ENABLE_CHUNK_EXTENSION.then(|| build_chunk_extension(&index.files));
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.write_prepare_chunks += prepare_chunks_timer.elapsed().as_secs_f64();
+    }
     let mut cursor = 96_u64;
     let root_offset = cursor;
     cursor += root.len() as u64;
@@ -5664,6 +5859,7 @@ fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
     let file = File::create(&tmp_path)?;
     file.set_len(cursor)?;
     let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+    let header_timer = Instant::now();
     writer.write_all(MAGIC)?;
     write_u32(&mut writer, VERSION)?;
     write_u32(&mut writer, 0)?;
@@ -5707,11 +5903,23 @@ fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
         posting_table_offset + posting_records.len() as u64 * 24,
         postings_data_offset,
     )?;
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.write_header_tables += header_timer.elapsed().as_secs_f64();
+    }
+    let postings_paths_timer = Instant::now();
     writer.write_all(&posting_data)?;
     writer.write_all(&path_blob)?;
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.write_postings_paths += postings_paths_timer.elapsed().as_secs_f64();
+    }
+    let content_timer = Instant::now();
     for file in &index.files {
         writer.write_all(&file.compressed_content)?;
     }
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.write_content += content_timer.elapsed().as_secs_f64();
+    }
+    let chunk_write_timer = Instant::now();
     if let Some(chunk_extension) = &chunk_extension {
         write_padding(
             &mut writer,
@@ -5739,6 +5947,10 @@ fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
         write_u64(&mut writer, chunk_posting_data_offset)?;
         write_u64(&mut writer, chunk_blob_offset)?;
     }
+    if let Some(timings) = timings.as_deref_mut() {
+        timings.write_prepare_chunks += chunk_write_timer.elapsed().as_secs_f64();
+    }
+    let publish_timer = Instant::now();
     writer.flush()?;
     drop(writer);
     if let Err(err) = fs::rename(&tmp_path, path) {
@@ -5749,6 +5961,9 @@ fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
                 display_path(path)
             )
         })?;
+    }
+    if let Some(timings) = timings {
+        timings.write_flush_publish += publish_timer.elapsed().as_secs_f64();
     }
     Ok(())
 }
@@ -10071,6 +10286,49 @@ fn print_timings(timings: &Timings) {
         "timing: git={:.3}s scan={:.3}s process={:.3}s write={:.3}s",
         timings.git, timings.scan, timings.process, timings.write
     );
+}
+
+fn print_index_profile(timings: &Timings) {
+    let stderr = std::io::stderr();
+    let mut err = BufWriter::new(stderr.lock());
+    let _ = append_index_profile(&mut err, timings);
+    let _ = err.flush();
+}
+
+fn append_index_profile<W: Write>(out: &mut W, timings: &Timings) -> Result<()> {
+    let events = [
+        ("index_git", timings.git),
+        ("index_open_existing", timings.open_index),
+        ("index_scan_walk_filter_meta", timings.scan),
+        ("index_current_meta", timings.current_meta),
+        ("index_change_diff", timings.change_diff),
+        ("index_file_read", timings.file_read),
+        ("index_tokenize", timings.tokenize),
+        ("index_compress", timings.compress),
+        ("index_sort_files", timings.sort),
+        ("index_select_fragments", timings.select_fragments),
+        ("index_build_postings", timings.postings),
+        ("index_process_total", timings.process),
+        ("index_write_prepare_files", timings.write_prepare_files),
+        (
+            "index_write_prepare_postings",
+            timings.write_prepare_postings,
+        ),
+        ("index_write_prepare_chunks", timings.write_prepare_chunks),
+        ("index_write_header_tables", timings.write_header_tables),
+        ("index_write_postings_paths", timings.write_postings_paths),
+        ("index_write_content", timings.write_content),
+        ("index_write_flush_publish", timings.write_flush_publish),
+        ("index_write_state", timings.write_state),
+        ("index_write_delta_meta", timings.write_delta_meta),
+        ("index_write_total", timings.write),
+    ];
+    for (name, secs) in events {
+        if secs > 0.0 {
+            writeln!(out, "profile: {name}={:.3}ms", secs * 1000.0)?;
+        }
+    }
+    Ok(())
 }
 
 fn timing_summary(timings: &Timings) -> String {

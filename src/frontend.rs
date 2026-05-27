@@ -28,6 +28,45 @@ const DONE_FRAME: u8 = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(20);
 const START_TIMEOUT: Duration = Duration::from_millis(250);
 
+#[derive(Default)]
+struct FrontendProfile {
+    enabled: bool,
+    events: Vec<(&'static str, f64)>,
+}
+
+impl FrontendProfile {
+    fn new(args: &[String]) -> Self {
+        Self {
+            enabled: args.iter().any(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "--profile" | "--instrument" | "--profile-search"
+                )
+            }),
+            events: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, name: &'static str, start: Instant) {
+        if self.enabled {
+            self.events
+                .push((name, start.elapsed().as_secs_f64() * 1000.0));
+        }
+    }
+
+    fn print(&self) {
+        if !self.enabled {
+            return;
+        }
+        let stderr = io::stderr();
+        let mut err = io::BufWriter::new(stderr.lock());
+        for (name, ms) in &self.events {
+            let _ = writeln!(err, "profile: {name}={ms:.3}ms");
+        }
+        let _ = err.flush();
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     match run(&args) {
@@ -43,8 +82,12 @@ fn run(args: &[String]) -> Result<i32, String> {
     if should_delegate(args) {
         return run_backend(args);
     }
+    let total_timer = Instant::now();
+    let mut profile = FrontendProfile::new(args);
+    let prepare_timer = Instant::now();
     let daemon_args = search_daemon_args(args);
     let search_args = strip_search_command(args);
+    profile.record("frontend_prepare_args", prepare_timer);
     if search_args.iter().any(|arg| {
         matches!(
             arg.as_str(),
@@ -53,30 +96,50 @@ fn run(args: &[String]) -> Result<i32, String> {
     }) {
         return run_backend(args);
     }
+    let start_timer = Instant::now();
     let Some(start) = search_start_path(&search_args) else {
         return run_backend(args);
     };
+    profile.record("frontend_resolve_start_path", start_timer);
     if search_args.iter().any(|arg| arg == "--no-auto-index") {
         return run_backend(args);
     }
+    let root_timer = Instant::now();
     let Some(mut root) = find_project_root(&start) else {
         return handle_missing_project(args);
     };
+    profile.record("frontend_find_project_root", root_timer);
     let ready_record;
+    let ensure_timer = Instant::now();
     (root, ready_record) = ensure_watch(&root)?;
+    profile.record("frontend_ensure_project_service", ensure_timer);
+    let record_timer = Instant::now();
     if let Some(record) = ready_record.or_else(|| read_valid_record(&root)) {
-        if let Ok(code) = request_daemon(&record, &daemon_args) {
+        profile.record("frontend_read_daemon_record", record_timer);
+        if let Ok(code) = request_daemon(&record, &daemon_args, &mut profile) {
+            profile.record("frontend_total", total_timer);
+            profile.print();
             return Ok(code);
         }
         let _ = fs::remove_file(record_path(&root));
+    } else {
+        profile.record("frontend_read_daemon_record", record_timer);
     }
+    let start_daemon_timer = Instant::now();
     start_daemon(&root)?;
+    profile.record("frontend_start_daemon", start_daemon_timer);
     let deadline = Instant::now() + START_TIMEOUT;
     while Instant::now() < deadline {
+        let record_timer = Instant::now();
         if let Some(record) = read_valid_record(&root) {
-            if let Ok(code) = request_daemon(&record, &daemon_args) {
+            profile.record("frontend_read_daemon_record", record_timer);
+            if let Ok(code) = request_daemon(&record, &daemon_args, &mut profile) {
+                profile.record("frontend_total", total_timer);
+                profile.print();
                 return Ok(code);
             }
+        } else {
+            profile.record("frontend_read_daemon_record", record_timer);
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -587,21 +650,42 @@ fn same_fileish(left: &Path, right: &Path) -> bool {
     left == right || fs::canonicalize(left).ok() == fs::canonicalize(right).ok()
 }
 
-fn request_daemon(record: &DaemonRecord, args: &[String]) -> io::Result<i32> {
+fn request_daemon(
+    record: &DaemonRecord,
+    args: &[String],
+    profile: &mut FrontendProfile,
+) -> io::Result<i32> {
+    let rpc_timer = Instant::now();
     #[cfg(unix)]
     if let Some(socket_path) = record.socket_path.as_ref() {
+        let connect_timer = Instant::now();
         let mut stream = UnixStream::connect(socket_path)?;
+        profile.record("frontend_daemon_connect", connect_timer);
+        let write_timer = Instant::now();
         write_daemon_request(&mut stream, record, args)?;
         send_stdout_fd(&stream)?;
-        return read_daemon_response(&mut stream);
+        profile.record("frontend_daemon_write_request", write_timer);
+        let read_timer = Instant::now();
+        let code = read_daemon_response(&mut stream)?;
+        profile.record("frontend_daemon_read_response", read_timer);
+        profile.record("frontend_daemon_rpc_total", rpc_timer);
+        return Ok(code);
     }
 
     let addr = SocketAddr::from(([127, 0, 0, 1], record.port));
+    let connect_timer = Instant::now();
     let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
     stream.set_nodelay(true)?;
+    profile.record("frontend_daemon_connect", connect_timer);
+    let write_timer = Instant::now();
     write_daemon_request(&mut stream, record, args)?;
     send_stdout_handle(&mut stream, record)?;
-    read_daemon_response(&mut stream)
+    profile.record("frontend_daemon_write_request", write_timer);
+    let read_timer = Instant::now();
+    let code = read_daemon_response(&mut stream)?;
+    profile.record("frontend_daemon_read_response", read_timer);
+    profile.record("frontend_daemon_rpc_total", rpc_timer);
+    Ok(code)
 }
 
 fn write_daemon_request(
