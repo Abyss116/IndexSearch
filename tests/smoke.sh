@@ -213,7 +213,7 @@ for _ in 1 2 3 4 5; do
 done
 "$bin" -q -F watch_second "$watch_tmp"
 watch_log="$("$bin" watch-log "$watch_tmp")"
-grep -q 'initial-index' <<<"$watch_log"
+grep -q 'startup-index' <<<"$watch_log"
 grep -q 'auto-update' <<<"$watch_log"
 printf 'ignored\n' > "$watch_tmp/ignored.bin"
 sleep 2
@@ -224,10 +224,28 @@ if grep -q 'auto-update-noop' <<<"$watch_log"; then
 fi
 "$bin" unwatch "$watch_tmp" >/dev/null
 
+offline_watch_tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp" "$git_tmp" "$watch_tmp" "$offline_watch_tmp"' EXIT
+cat > "$offline_watch_tmp/index-search-project.txt" <<'CFG'
+[IndexSearch.files.include]
+*.txt
+CFG
+printf 'offline_old\n' > "$offline_watch_tmp/a.txt"
+"$bin" index "$offline_watch_tmp" >/dev/null
+printf 'offline_new\n' > "$offline_watch_tmp/a.txt"
+printf 'offline_added\n' > "$offline_watch_tmp/added.txt"
+"$bin" watch --idle-seconds 1 --compact-delta-count 100 "$offline_watch_tmp" >/dev/null
+"$bin" -q -F offline_new "$offline_watch_tmp"
+"$bin" -q -F offline_added "$offline_watch_tmp"
+! "$bin" -q -F offline_old "$offline_watch_tmp"
+offline_watch_log="$("$bin" watch-log "$offline_watch_tmp")"
+grep -q 'startup-update' <<<"$offline_watch_log"
+"$bin" unwatch "$offline_watch_tmp" >/dev/null
+
 install_tmp="$(mktemp -d)"
 skills_home="$(mktemp -d)"
 skills_project="$(mktemp -d)"
-trap 'rm -rf "$tmp" "$git_tmp" "$watch_tmp" "$install_tmp" "$skills_home" "$skills_project"' EXIT
+trap 'rm -rf "$tmp" "$git_tmp" "$watch_tmp" "$offline_watch_tmp" "$install_tmp" "$skills_home" "$skills_project"' EXIT
 "$bin" install --dir "$install_tmp" >/dev/null
 install_exe="$install_tmp/indexsearch"
 install_alias="$install_tmp/is"

@@ -1405,38 +1405,7 @@ fn command_watch(args: &[String]) -> Result<i32> {
         let _ = fs::remove_file(&record_path);
     }
 
-    if !index_path(&cfg.root).exists() {
-        let _lock = acquire_exclusive_lock(&cfg.root)?;
-        let timer = Instant::now();
-        let mut timings = Timings::default();
-        let mut scanned = 0;
-        let mut skipped = 0;
-        let index = build_index(
-            &cfg,
-            &Options {
-                max_filesize: DEFAULT_MAX_FILE_SIZE,
-                ..Options::default()
-            },
-            &mut scanned,
-            &mut skipped,
-            Some(&mut timings),
-        )?;
-        let write_timer = Instant::now();
-        save_index(&index, &index_path(&cfg.root))?;
-        save_index_state(&cfg.root)?;
-        timings.write += write_timer.elapsed().as_secs_f64();
-        append_watch_log(
-            &cfg.root,
-            &format!(
-                "initial-index files={} skipped={} scanned={} elapsed={:.3}s {}",
-                index.files.len(),
-                skipped,
-                scanned,
-                timer.elapsed().as_secs_f64(),
-                timing_summary(&timings)
-            ),
-        )?;
-    }
+    sync_index_before_watch(&cfg)?;
 
     let exe = env::current_exe()?;
     let mut command = Command::new(exe);
@@ -1477,6 +1446,108 @@ fn command_watch(args: &[String]) -> Result<i32> {
         record.id
     );
     Ok(0)
+}
+
+fn sync_index_before_watch(cfg: &ProjectConfig) -> Result<()> {
+    let _lock = acquire_exclusive_lock(&cfg.root)?;
+    let options = Options {
+        max_filesize: DEFAULT_MAX_FILE_SIZE,
+        ..Options::default()
+    };
+    let path = index_path(&cfg.root);
+    let timer = Instant::now();
+    let mut timings = Timings::default();
+    let mut scanned = 0;
+    let mut skipped = 0;
+    let loaded = MappedIndex::open(&path);
+    if loaded
+        .as_ref()
+        .map(|index| index.config_hash != cfg.hash)
+        .unwrap_or(true)
+    {
+        drop(loaded);
+        let index = build_index(
+            cfg,
+            &options,
+            &mut scanned,
+            &mut skipped,
+            Some(&mut timings),
+        )?;
+        let write_timer = Instant::now();
+        save_index(&index, &path)?;
+        remove_delta_dir(&cfg.root)?;
+        save_index_state(&cfg.root)?;
+        timings.write += write_timer.elapsed().as_secs_f64();
+        append_watch_log(
+            &cfg.root,
+            &format!(
+                "startup-index files={} skipped={} scanned={} elapsed={:.3}s {}",
+                index.files.len(),
+                skipped,
+                scanned,
+                timer.elapsed().as_secs_f64(),
+                timing_summary(&timings)
+            ),
+        )?;
+        return Ok(());
+    }
+    drop(loaded);
+
+    let (changes, visible_before) =
+        collect_filesystem_changes(cfg, &options, &mut scanned, &mut skipped, &mut timings)?;
+    if changes.is_empty() {
+        save_index_state(&cfg.root)?;
+        append_watch_log(
+            &cfg.root,
+            &format!(
+                "startup-update files={} reused={} added=0 modified=0 removed=0 skipped={} scanned={} elapsed={:.3}s {}",
+                visible_before,
+                visible_before,
+                skipped,
+                scanned,
+                timer.elapsed().as_secs_f64(),
+                timing_summary(&timings)
+            ),
+        )?;
+        return Ok(());
+    }
+
+    let process_timer = Instant::now();
+    let mut changed_scanned = 0;
+    let mut changed_skipped = 0;
+    let (delta, meta, stats) = build_delta_index(
+        cfg,
+        &options,
+        &changes,
+        &mut changed_scanned,
+        &mut changed_skipped,
+    )?;
+    timings.process += process_timer.elapsed().as_secs_f64();
+    skipped += changed_skipped;
+    if stats.added == 0 && stats.updated == 0 && stats.removed == 0 {
+        save_index_state(&cfg.root)?;
+    } else {
+        let write_timer = Instant::now();
+        save_delta(&cfg.root, &delta, &meta)?;
+        save_index_state(&cfg.root)?;
+        timings.write += write_timer.elapsed().as_secs_f64();
+    }
+    append_watch_log(
+        &cfg.root,
+        &format!(
+            "startup-update files={} reused={} added={} modified={} removed={} skipped={} scanned={} elapsed={:.3}s {}",
+            stats.reused + stats.updated + stats.added,
+            stats.reused,
+            stats.added,
+            stats.updated,
+            stats.removed,
+            skipped,
+            scanned,
+            timer.elapsed().as_secs_f64(),
+            timing_summary(&timings)
+        ),
+    )?;
+    Ok(())
 }
 
 fn command_watch_daemon(args: &[String]) -> Result<i32> {
