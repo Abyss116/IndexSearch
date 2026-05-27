@@ -41,6 +41,7 @@ type StdoutFd = i32;
 
 const PROJECT_FILE: &str = "index-search-project.txt";
 const INDEX_DIR: &str = ".indexsearch";
+const LEGACY_INDEX_DIR: &str = ".codeindex";
 const INDEX_FILE: &str = "index.bin";
 const DELTA_DIR: &str = "deltas";
 const WATCH_DIR: &str = "watches";
@@ -473,6 +474,13 @@ fn run() -> Result<()> {
             }
             std::process::exit(command_compact(&args)?);
         }
+        "clean" => {
+            args.remove(0);
+            if maybe_print_command_help("clean", &args) {
+                std::process::exit(0);
+            }
+            std::process::exit(command_clean(&args)?);
+        }
         "watch" => {
             args.remove(0);
             if maybe_print_command_help("watch", &args) {
@@ -581,6 +589,11 @@ fn print_help() {
         &style,
         "compact [PATH]",
         "fold delta indexes into the base index",
+    );
+    help_command(
+        &style,
+        "clean [PATH]",
+        "stop project services and remove index state",
     );
     help_command(
         &style,
@@ -722,6 +735,7 @@ fn print_command_help(command: &str) {
         "index" => print_index_help(),
         "update" => print_update_help(),
         "compact" => print_compact_help(),
+        "clean" => print_clean_help(),
         "watch" => print_watch_help(),
         "list-watches" | "watch-list" => print_list_watches_help(),
         "unwatch" => print_unwatch_help(),
@@ -788,6 +802,23 @@ fn print_compact_help() {
         "[PATH]",
         "fold delta indexes into the base index",
     );
+}
+
+fn print_clean_help() {
+    let style = HelpStyle::new();
+    command_usage(
+        &style,
+        "clean",
+        "[OPTIONS] [PATH]",
+        "stop project services and remove index state found in parent paths",
+    );
+    help_section(&style, "Options");
+    help_option(
+        &style,
+        "-y, --yes",
+        "run without an interactive confirmation",
+    );
+    help_option(&style, "--dry-run", "print what would be removed");
 }
 
 fn print_watch_help() {
@@ -2443,6 +2474,140 @@ fn command_compact(args: &[String]) -> Result<i32> {
     println!("root: {}", display_path(&cfg.root));
     println!("index: {}", display_path(&path));
     Ok(0)
+}
+
+struct CleanOptions {
+    start: PathBuf,
+    yes: bool,
+    dry_run: bool,
+}
+
+fn parse_clean_args(args: &[String]) -> Result<CleanOptions> {
+    let mut start = env::current_dir()?;
+    let mut yes = false;
+    let mut dry_run = false;
+    for arg in args {
+        match arg.as_str() {
+            "-y" | "--yes" => yes = true,
+            "--dry-run" => dry_run = true,
+            value => start = PathBuf::from(value),
+        }
+    }
+    Ok(CleanOptions {
+        start,
+        yes,
+        dry_run,
+    })
+}
+
+fn command_clean(args: &[String]) -> Result<i32> {
+    let options = parse_clean_args(args)?;
+    let roots = discover_clean_roots(&options.start);
+    if roots.is_empty() {
+        println!(
+            "cleaned 0 index directories; none found above {}",
+            display_path(&options.start)
+        );
+        return Ok(0);
+    }
+    if options.dry_run {
+        for root in &roots {
+            println!("would clean {}", display_path(root));
+            for dir in index_state_dirs(root) {
+                if dir.exists() {
+                    println!("would remove {}", display_path(&dir));
+                }
+            }
+        }
+        return Ok(0);
+    }
+    if !options.yes && !confirm_clean(&roots)? {
+        println!("clean cancelled");
+        return Ok(1);
+    }
+
+    let mut removed_dirs = 0usize;
+    let mut stopped = 0usize;
+    for root in roots {
+        stopped += stop_services_for_root(&root)?;
+        for dir in index_state_dirs(&root) {
+            if dir.exists() {
+                fs::remove_dir_all(&dir)?;
+                removed_dirs += 1;
+                println!("removed {}", display_path(&dir));
+            }
+        }
+    }
+    println!("cleaned {removed_dirs} index directories; stopped {stopped} services");
+    Ok(0)
+}
+
+fn discover_clean_roots(start: &Path) -> Vec<PathBuf> {
+    let mut path = fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+    if path.is_file() {
+        path = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    }
+    let mut roots = Vec::new();
+    for ancestor in path.ancestors() {
+        if ancestor.join(INDEX_DIR).is_dir() || ancestor.join(LEGACY_INDEX_DIR).is_dir() {
+            roots.push(ancestor.to_path_buf());
+        }
+    }
+    roots
+}
+
+fn index_state_dirs(root: &Path) -> [PathBuf; 2] {
+    [root.join(INDEX_DIR), root.join(LEGACY_INDEX_DIR)]
+}
+
+fn confirm_clean(roots: &[PathBuf]) -> Result<bool> {
+    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+        eprintln!("indexsearch: clean is destructive; pass --yes to run non-interactively");
+        return Ok(false);
+    }
+    eprintln!("indexsearch: clean will stop services and remove index state:");
+    for root in roots {
+        eprintln!("  {}", display_path(root));
+    }
+    eprint!("Continue? [y/N] ");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES"))
+}
+
+fn stop_services_for_root(root: &Path) -> Result<usize> {
+    let mut stopped = HashSet::default();
+    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if let Ok(record) = read_search_daemon_record(&search_daemon_record_path(&root)) {
+        if same_clean_root(&record.root, &root) && stopped.insert(record.pid) {
+            stop_process(record.pid);
+        }
+        let _ = fs::remove_file(search_daemon_record_path(&root));
+    }
+    fs::create_dir_all(watch_registry_dir())?;
+    for entry in fs::read_dir(watch_registry_dir())?.flatten() {
+        let path = entry.path();
+        if !path.extension().is_some_and(|ext| ext == "watch") {
+            continue;
+        }
+        let Ok(record) = read_watch_record(&path) else {
+            let _ = fs::remove_file(path);
+            continue;
+        };
+        if same_clean_root(&record.root, &root) {
+            if stopped.insert(record.pid) {
+                stop_process(record.pid);
+            }
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(stopped.len())
+}
+
+fn same_clean_root(left: &Path, right: &Path) -> bool {
+    fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf())
+        == fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf())
 }
 
 fn command_status(args: &[String]) -> Result<i32> {

@@ -97,7 +97,7 @@ Get-Process is-daemon -ErrorAction SilentlyContinue | Stop-Process -Force
 ```
 
 Newer releases also write a versioned backend such as
-`is-daemon-0.3.18.exe`, so a locked old backend no longer prevents installing
+`is-daemon-0.3.19.exe`, so a locked old backend no longer prevents installing
 the new frontend.
 
 ## Quick Start
@@ -441,6 +441,7 @@ for PCRE-specific behavior or unsupported flags.
 is index [PATH]
 is update [--git] [--git-untracked] [PATH]
 is compact [PATH]
+is clean [--yes] [PATH]
 is watch [PATH]
 is list-watches
 is watch-log [PATH]
@@ -459,6 +460,11 @@ The explicit `search` subcommand is optional. `is PATTERN` searches directly,
 like `rg PATTERN`. If the pattern is also an IndexSearch command name such as
 `index`, `status`, or `watch`, use `is -- PATTERN [PATH ...]` or
 `is search PATTERN [PATH ...]`.
+
+`is clean [PATH]` stops any matching project service found on the parent path
+chain and removes `.indexsearch/` plus legacy `.codeindex/` state directories,
+including deltas and logs. It keeps `index-search-project.txt`. Pass `--yes`
+for non-interactive cleanup.
 
 ## License
 

@@ -93,6 +93,7 @@ fn should_delegate(args: &[String]) -> bool {
         "index"
             | "update"
             | "compact"
+            | "clean"
             | "watch"
             | "watch-daemon"
             | "search-daemon"

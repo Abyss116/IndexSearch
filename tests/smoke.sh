@@ -265,10 +265,27 @@ done
 "$bin" -q -F implicit_second "$implicit_watch_tmp"
 "$bin" unwatch "$implicit_watch_tmp" >/dev/null
 
+clean_tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp" "$git_tmp" "$watch_tmp" "$offline_watch_tmp" "$implicit_watch_tmp" "$clean_tmp"' EXIT
+cat > "$clean_tmp/index-search-project.txt" <<'CFG'
+[IndexSearch.files.include]
+*.txt
+CFG
+printf 'clean_symbol\n' > "$clean_tmp/a.txt"
+"$bin" watch --idle-seconds 1 "$clean_tmp" >/dev/null
+mkdir -p "$clean_tmp/.codeindex"
+clean_dry="$("$bin" clean --dry-run "$clean_tmp")"
+grep -q 'would remove' <<<"$clean_dry"
+"$bin" clean --yes "$clean_tmp" >/dev/null
+[[ ! -d "$clean_tmp/.indexsearch" ]]
+[[ ! -d "$clean_tmp/.codeindex" ]]
+[[ -f "$clean_tmp/index-search-project.txt" ]]
+! "$bin" list-watches | grep -q "$clean_tmp"
+
 install_tmp="$(mktemp -d)"
 skills_home="$(mktemp -d)"
 skills_project="$(mktemp -d)"
-trap 'rm -rf "$tmp" "$git_tmp" "$watch_tmp" "$offline_watch_tmp" "$implicit_watch_tmp" "$install_tmp" "$skills_home" "$skills_project"' EXIT
+trap 'rm -rf "$tmp" "$git_tmp" "$watch_tmp" "$offline_watch_tmp" "$implicit_watch_tmp" "$clean_tmp" "$install_tmp" "$skills_home" "$skills_project"' EXIT
 "$bin" install --dir "$install_tmp" >/dev/null
 install_exe="$install_tmp/indexsearch"
 install_alias="$install_tmp/is"
