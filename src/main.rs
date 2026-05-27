@@ -8812,11 +8812,7 @@ fn search_daemon_socket_path(root: &Path) -> PathBuf {
 }
 
 fn watch_registry_dir() -> PathBuf {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".indexsearch")
-        .join(WATCH_DIR)
+    home_dir().join(".indexsearch").join(WATCH_DIR)
 }
 
 fn home_dir() -> PathBuf {

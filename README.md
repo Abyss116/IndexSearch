@@ -80,7 +80,7 @@ Get-Process is-daemon -ErrorAction SilentlyContinue | Stop-Process -Force
 ```
 
 Newer releases also write a versioned backend such as
-`is-daemon-0.3.16.exe`, so a locked old backend no longer prevents installing
+`is-daemon-0.3.17.exe`, so a locked old backend no longer prevents installing
 the new frontend.
 
 ## Quick Start
@@ -94,7 +94,7 @@ is --files .
 ```
 
 If `index-search-project.txt` does not exist, `index`, `update`, `watch`, and
-search-time auto-indexing create a default config before building the index.
+interactive first search can create a default config before building the index.
 Edit that file and rerun `is index .` or `is update .` to rebuild with new
 rules.
 
@@ -185,6 +185,11 @@ was stopped are included. Overlapping watches are normalized so a parent watch
 covers child directories. `watch-log` records real index/update/compact
 activity and omits no-op filesystem events.
 
+Ordinary searches also try to make this seamless. When `is PATTERN` runs inside
+an existing project, the lightweight frontend checks whether an active parent
+watch already covers that root. If not, it silently starts `is watch` first,
+which creates or refreshes the index before the search daemon serves the query.
+
 Useful watcher knobs:
 
 ```bash
@@ -193,12 +198,14 @@ is watch . --idle-seconds 5 --compact-delta-count 16 --compact-delta-bytes 256mb
 
 ## Search Daemon
 
-Hot searches automatically try a per-project search daemon when an existing
-index is present. The daemon keeps the mmap-backed index open and serves
-requests over localhost. `indexsearch` and `is` are intentionally much smaller
-than the full backend and do only enough client-side work to locate the index,
-validate or start `is-daemon`, pass through arguments, and stream response
-frames to stdout/stderr.
+Hot searches automatically try a per-project search daemon. The frontend first
+resolves the project root from the current path, ancestor `.indexsearch`
+directories, or `index-search-project.txt`, ensures the matching watcher is
+running, and then connects to or starts the search daemon. The daemon keeps the
+mmap-backed index open and serves requests over localhost. `indexsearch` and
+`is` are intentionally much smaller than the full backend and do only enough
+client-side work to locate the project, validate or start `is-daemon`, pass
+through arguments, and stream response frames to stdout/stderr.
 
 Use either form to bypass the daemon:
 
@@ -210,9 +217,10 @@ INDEXSEARCH_NO_DAEMON=1 is -F "SomeSymbol" .
 Daemon records live in `.indexsearch/search-daemon.txt`. If `indexsearch
 install` replaces `is-daemon`, or if the base index is
 rebuilt/compacted, the next search detects the fingerprint mismatch and starts a
-fresh daemon. If no index exists above the current directory, interactive `is`
-asks whether to create one in the current directory; non-interactive use prints
-the explicit `indexsearch index .` / `is watch .` hint instead.
+fresh daemon. If no project exists above the current directory, interactive
+`is` asks whether to create one in the current directory, defaulting to yes;
+non-interactive use prints the explicit `indexsearch index .` / `is watch .`
+hint instead.
 
 ## Unreal Engine
 

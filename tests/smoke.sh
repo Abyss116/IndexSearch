@@ -242,10 +242,30 @@ offline_watch_log="$("$bin" watch-log "$offline_watch_tmp")"
 grep -q 'startup-update' <<<"$offline_watch_log"
 "$bin" unwatch "$offline_watch_tmp" >/dev/null
 
+implicit_watch_tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp" "$git_tmp" "$watch_tmp" "$offline_watch_tmp" "$implicit_watch_tmp"' EXIT
+cat > "$implicit_watch_tmp/index-search-project.txt" <<'CFG'
+[IndexSearch.files.include]
+*.txt
+CFG
+printf 'implicit_first\n' > "$implicit_watch_tmp/a.txt"
+"$bin" -q -F implicit_first "$implicit_watch_tmp"
+implicit_watch_log="$("$bin" watch-log "$implicit_watch_tmp")"
+grep -q 'startup-index' <<<"$implicit_watch_log"
+printf 'implicit_second\n' > "$implicit_watch_tmp/a.txt"
+for _ in 1 2 3 4 5; do
+  sleep 1
+  if "$bin" -q -F implicit_second "$implicit_watch_tmp"; then
+    break
+  fi
+done
+"$bin" -q -F implicit_second "$implicit_watch_tmp"
+"$bin" unwatch "$implicit_watch_tmp" >/dev/null
+
 install_tmp="$(mktemp -d)"
 skills_home="$(mktemp -d)"
 skills_project="$(mktemp -d)"
-trap 'rm -rf "$tmp" "$git_tmp" "$watch_tmp" "$offline_watch_tmp" "$install_tmp" "$skills_home" "$skills_project"' EXIT
+trap 'rm -rf "$tmp" "$git_tmp" "$watch_tmp" "$offline_watch_tmp" "$implicit_watch_tmp" "$install_tmp" "$skills_home" "$skills_project"' EXIT
 "$bin" install --dir "$install_tmp" >/dev/null
 install_exe="$install_tmp/indexsearch"
 install_alias="$install_tmp/is"
@@ -270,3 +290,7 @@ grep -q 'IndexSearch Agent Instructions' "$skills_home/.config/opencode/AGENTS.m
 [[ -f "$skills_project/.claude/skills/indexsearch/SKILL.md" ]]
 [[ -f "$skills_project/.cursor/rules/indexsearch.mdc" ]]
 [[ -f "$skills_project/index-search-project.txt" ]]
+
+"$bin" unwatch "$no_cfg_tmp" >/dev/null 2>&1 || true
+"$bin" unwatch "$tmp" >/dev/null 2>&1 || true
+"$bin" unwatch "$git_tmp" >/dev/null 2>&1 || true

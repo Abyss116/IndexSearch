@@ -14,8 +14,10 @@ use std::time::{Duration, Instant};
 
 const INDEX_DIR: &str = ".indexsearch";
 const INDEX_FILE: &str = "index.bin";
+const PROJECT_FILE: &str = "index-search-project.txt";
 const SEARCH_DAEMON_FILE: &str = "search-daemon.txt";
 const STATE_FILE: &str = "state.txt";
+const WATCH_DIR: &str = "watches";
 const REQUEST_MAGIC: &[u8; 8] = b"ISDREQ1\n";
 const RESPONSE_MAGIC: &[u8; 8] = b"ISDRES1\n";
 const STDOUT_FRAME: u8 = 1;
@@ -52,9 +54,13 @@ fn run(args: &[String]) -> Result<i32, String> {
     let Some(start) = search_start_path(&search_args) else {
         return run_backend(args);
     };
-    let Some(root) = find_existing_index_root(&start) else {
-        return handle_missing_index(args);
+    if search_args.iter().any(|arg| arg == "--no-auto-index") {
+        return run_backend(args);
+    }
+    let Some(mut root) = find_project_root(&start) else {
+        return handle_missing_project(args);
     };
+    root = ensure_watch(&root)?;
     if let Some(record) = read_valid_record(&root) {
         if let Ok(code) = request_daemon(&record, &daemon_args) {
             return Ok(code);
@@ -280,36 +286,97 @@ fn short_option_with_attached_value(arg: &str) -> bool {
     (arg.starts_with("-A") || arg.starts_with("-B") || arg.starts_with("-C")) && arg.len() > 2
 }
 
-fn find_existing_index_root(start: &Path) -> Option<PathBuf> {
+fn find_project_root(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
-        .find(|ancestor| index_path(ancestor).is_file())
+        .find(|ancestor| {
+            index_path(ancestor).is_file()
+                || ancestor.join(INDEX_DIR).is_dir()
+                || ancestor.join(PROJECT_FILE).is_file()
+        })
         .map(Path::to_path_buf)
 }
 
-fn handle_missing_index(args: &[String]) -> Result<i32, String> {
+fn handle_missing_project(args: &[String]) -> Result<i32, String> {
     if io::stdin().is_terminal() && io::stderr().is_terminal() {
         let cwd = env::current_dir().map_err(|err| err.to_string())?;
         eprint!(
-            "is: no IndexSearch index found above {}. Create one here? [y/N] ",
+            "is: no IndexSearch project found above {}. Create one here? [Y/n] ",
             display_path(&cwd)
         );
         let _ = io::stderr().flush();
         let mut answer = String::new();
-        if io::stdin().read_line(&mut answer).is_ok()
-            && matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
-        {
-            let code = run_backend_status(&["index", "."])?;
-            if code == 0 {
-                return run(args);
+        if io::stdin().read_line(&mut answer).is_ok() {
+            match answer.trim() {
+                "" | "y" | "Y" | "yes" | "YES" => {
+                    let root = ensure_watch(&cwd)?;
+                    if index_path(&root).is_file() {
+                        return run(args);
+                    }
+                    return Ok(2);
+                }
+                "n" | "N" | "no" | "NO" => return Ok(1),
+                _ => {}
             }
-            return Ok(code);
         }
     }
     eprintln!(
-        "is: no IndexSearch index found; run `indexsearch index .` or `is watch .` at the project root"
+        "is: no IndexSearch project found; run `indexsearch index .` or `is watch .` at the project root"
     );
     Ok(2)
+}
+
+fn ensure_watch(root: &Path) -> Result<PathBuf, String> {
+    if let Some(covering_root) = watch_covering_root(root) {
+        return Ok(covering_root);
+    }
+    start_watch(root)?;
+    Ok(watch_covering_root(root).unwrap_or_else(|| root.to_path_buf()))
+}
+
+fn watch_covering_root(root: &Path) -> Option<PathBuf> {
+    let requested_root = normalized_existing_path(root);
+    let registry = watch_registry_dir();
+    let entries = fs::read_dir(registry).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.extension().is_some_and(|ext| ext == "watch") {
+            continue;
+        }
+        let Ok(record) = read_watch_record(&path) else {
+            let _ = fs::remove_file(path);
+            continue;
+        };
+        if !process_alive(record.pid) {
+            let _ = fs::remove_file(path);
+            continue;
+        }
+        let record_root = normalized_existing_path(&record.root);
+        if path_is_ancestor(&record_root, &requested_root) {
+            return Some(record.root);
+        }
+    }
+    None
+}
+
+fn start_watch(root: &Path) -> Result<(), String> {
+    let backend = backend_path()?;
+    let status = Command::new(backend)
+        .arg("watch")
+        .arg(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|err| err.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to start watcher for {}",
+            display_path(root)
+        ))
+    }
 }
 
 fn read_valid_record(root: &Path) -> Option<DaemonRecord> {
@@ -538,15 +605,6 @@ fn run_backend(args: &[String]) -> Result<i32, String> {
     run_backend_owned(args.iter().map(String::as_str))
 }
 
-fn run_backend_status(args: &[&str]) -> Result<i32, String> {
-    let backend = backend_path()?;
-    let status = Command::new(backend)
-        .args(args)
-        .status()
-        .map_err(|err| err.to_string())?;
-    Ok(status.code().unwrap_or(1))
-}
-
 fn run_backend_owned<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<i32, String> {
     let backend = backend_path()?;
     let mut command = Command::new(backend);
@@ -660,6 +718,23 @@ fn record_path(root: &Path) -> PathBuf {
     root.join(INDEX_DIR).join(SEARCH_DAEMON_FILE)
 }
 
+fn watch_registry_dir() -> PathBuf {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".indexsearch")
+        .join(WATCH_DIR)
+}
+
+fn normalized_existing_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn path_is_ancestor(parent: &Path, child: &Path) -> bool {
+    child == parent || child.starts_with(parent)
+}
+
 #[derive(Default)]
 struct DaemonRecord {
     pid: u32,
@@ -712,6 +787,56 @@ fn read_record(path: &Path) -> Result<DaemonRecord, String> {
         return Err("invalid daemon record".to_string());
     }
     Ok(record)
+}
+
+#[derive(Default)]
+struct WatchRecord {
+    pid: u32,
+    root: PathBuf,
+}
+
+fn read_watch_record(path: &Path) -> Result<WatchRecord, String> {
+    let text = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let mut record = WatchRecord::default();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "pid" => record.pid = value.parse().unwrap_or(0),
+            "root" => record.root = PathBuf::from(value),
+            _ => {}
+        }
+    }
+    if record.pid == 0 || record.root.as_os_str().is_empty() {
+        return Err("invalid watch record".to_string());
+    }
+    Ok(record)
+}
+
+fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        unsafe {
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() {
+                return false;
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(process, &mut code);
+            CloseHandle(process);
+            ok != 0 && code == STILL_ACTIVE as u32
+        }
+    }
 }
 
 fn write_frame(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
