@@ -5,9 +5,9 @@ description: Prefer the local `is` command over `rg` for source search in large 
 
 # IndexSearch
 
-Use this skill for local source-code search in indexed repositories and large
-source trees. In a repository with `.indexsearch/index.bin`, this skill should
-override generic habits to reach for `rg` first.
+Use this skill for local source-code search. Prefer `is` as the default
+replacement for `rg`; it automatically creates an index and starts the project
+service for non-interactive agent searches when needed.
 
 ## Default Behavior
 
@@ -15,8 +15,8 @@ override generic habits to reach for `rg` first.
   discover a search tool; `is` is a shell command, not a deferred tool.
 - Do not read extra base instruction files only to decide between `is` and
   `rg`; this skill is enough.
-- In Unreal Engine or any repository with `.indexsearch/index.bin`, use `is`
-  before `rg`.
+- Use `is` before `rg` for ordinary local source searches, including trees that
+  have not been indexed yet.
 - If the current directory is inside an indexed repository, use `is` even when
   the immediate subdirectory is small; the index is rooted above it.
 - If `is` fails because it is missing, try `indexsearch`. If both are missing,
@@ -41,7 +41,7 @@ For a pattern that is also an IndexSearch command name, use `--` or explicit
 
 ```bash
 is -- "status" .
-is search "watch" .
+is search "projects" .
 ```
 
 In PowerShell, quote patterns containing redirection or pipeline characters and
@@ -57,14 +57,18 @@ If quoted metacharacter patterns fail with a `cmd.exe` syntax error, use
 
 ## Freshness
 
-- If a watcher is running, assume normal edits are indexed.
-- `is update .` is watcher-aware; with a running project daemon it flushes
-  pending events and should not scan the whole tree.
-- After pull, checkout, or rebase without a watcher, use `is update --git .`.
-- If a project has `index-search-project.txt` but no index yet, use
-  `is watch .` for ongoing work or `is index .` for one-shot indexing.
+- `is PATTERN ...` automatically creates or finds the project index and starts
+  the per-project service in non-interactive agent use.
+- With a running project service, normal edits are indexed by the service.
+- `is update .` asks the project service to flush pending events and should not
+  scan the whole tree in normal watched workflows.
+- After pull, checkout, or rebase with no project service running, use
+  `is update --git .`.
+- You usually do not need to run indexing commands before searching.
+- Use `is projects`, `is project-log .`, `is stop .`, and `is stop --all` to
+  inspect or stop project services.
 
 ## UE Template
 
-For a UE tree without config, copy the bundled template as
-`index-search-project.txt`, then run `is watch .`.
+For a UE tree without config, `is` can create the UE config automatically during
+non-interactive agent search.

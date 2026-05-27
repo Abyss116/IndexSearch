@@ -2,7 +2,6 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::env;
-#[cfg(windows)]
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, IsTerminal, Read, Write};
@@ -53,10 +52,10 @@ const PROJECT_FILE: &str = "index-search-project.txt";
 const INDEX_DIR: &str = ".indexsearch";
 const INDEX_FILE: &str = "index.bin";
 const DELTA_DIR: &str = "deltas";
-const WATCH_DIR: &str = "watches";
+const PROJECTS_DIR: &str = "projects";
 const LOCK_FILE: &str = "index.lock";
 const STATE_FILE: &str = "state.txt";
-const WATCH_LOG_FILE: &str = "watch.log";
+const PROJECT_LOG_FILE: &str = "project.log";
 const SEARCH_DAEMON_FILE: &str = "search-daemon.txt";
 const SEARCH_DAEMON_REQUEST_MAGIC: &[u8; 8] = b"ISDREQ1\n";
 const SEARCH_DAEMON_RESPONSE_MAGIC: &[u8; 8] = b"ISDRES1\n";
@@ -275,7 +274,7 @@ impl Drop for IndexLock {
     }
 }
 
-struct WatchRecord {
+struct ProjectRecord {
     id: String,
     root: PathBuf,
     pid: u32,
@@ -532,41 +531,30 @@ fn run() -> Result<()> {
             }
             std::process::exit(command_clean(&args)?);
         }
-        "watch" => {
-            args.remove(0);
-            if maybe_print_command_help("watch", &args) {
-                std::process::exit(0);
-            }
-            std::process::exit(command_watch(&args)?);
-        }
-        "watch-daemon" => {
-            args.remove(0);
-            std::process::exit(command_watch_daemon(&args)?);
-        }
         "search-daemon" => {
             args.remove(0);
             std::process::exit(command_search_daemon(&args)?);
         }
-        "list-watches" | "watch-list" => {
-            let command = args.remove(0);
-            if maybe_print_command_help(&command, &args) {
-                std::process::exit(0);
-            }
-            std::process::exit(command_list_watches(&args)?);
-        }
-        "unwatch" => {
+        "projects" => {
             args.remove(0);
-            if maybe_print_command_help("unwatch", &args) {
+            if maybe_print_command_help("projects", &args) {
                 std::process::exit(0);
             }
-            std::process::exit(command_unwatch(&args)?);
+            std::process::exit(command_list_projects(&args)?);
         }
-        "watch-log" => {
+        "stop" => {
             args.remove(0);
-            if maybe_print_command_help("watch-log", &args) {
+            if maybe_print_command_help("stop", &args) {
                 std::process::exit(0);
             }
-            std::process::exit(command_watch_log(&args)?);
+            std::process::exit(command_stop_projects(&args)?);
+        }
+        "project-log" => {
+            args.remove(0);
+            if maybe_print_command_help("project-log", &args) {
+                std::process::exit(0);
+            }
+            std::process::exit(command_project_log(&args)?);
         }
         "install" => {
             args.remove(0);
@@ -575,9 +563,9 @@ fn run() -> Result<()> {
             }
             std::process::exit(command_install(&args)?);
         }
-        "install-skills" | "install-agents" => {
-            let command = args.remove(0);
-            if maybe_print_command_help(&command, &args) {
+        "install-skills" => {
+            args.remove(0);
+            if maybe_print_command_help("install-skills", &args) {
                 std::process::exit(0);
             }
             std::process::exit(command_install_skills(&args)?);
@@ -611,6 +599,9 @@ fn run() -> Result<()> {
 #[derive(Default)]
 struct WatchState {
     pending: Mutex<HashSet<String>>,
+    index_io: Mutex<()>,
+    reload_index: AtomicBool,
+    restart_required: AtomicBool,
 }
 
 struct WatchFlushOutcome {
@@ -639,16 +630,12 @@ fn is_command_name(arg: &str) -> bool {
             | "update"
             | "compact"
             | "clean"
-            | "watch"
-            | "watch-daemon"
             | "search-daemon"
-            | "list-watches"
-            | "watch-list"
-            | "unwatch"
-            | "watch-log"
+            | "projects"
+            | "stop"
+            | "project-log"
             | "install"
             | "install-skills"
-            | "install-agents"
             | "status"
             | "search"
     )
@@ -692,17 +679,12 @@ fn print_help() {
         "clean [PATH]",
         "stop project services and remove index state",
     );
+    help_command(&style, "projects", "list active project services");
+    help_command(&style, "stop [--all] [ID|PATH]", "stop project services");
     help_command(
         &style,
-        "watch [PATH]",
-        "start the project daemon service for a root",
-    );
-    help_command(&style, "list-watches", "list active project services");
-    help_command(&style, "unwatch [--all] <ID|PATH>", "stop project services");
-    help_command(
-        &style,
-        "watch-log [PATH]",
-        "print watcher activity for a root",
+        "project-log [PATH]",
+        "print project service activity",
     );
     help_command(
         &style,
@@ -799,7 +781,7 @@ fn print_help() {
     help_option(
         &style,
         "--force-scan",
-        "bypass a running watcher and reconcile by scanning the filesystem",
+        "bypass a running project service and reconcile by scanning the filesystem",
     );
     help_option(
         &style,
@@ -843,12 +825,11 @@ fn print_command_help(command: &str) {
         "update" => print_update_help(),
         "compact" => print_compact_help(),
         "clean" => print_clean_help(),
-        "watch" => print_watch_help(),
-        "list-watches" | "watch-list" => print_list_watches_help(),
-        "unwatch" => print_unwatch_help(),
-        "watch-log" => print_watch_log_help(),
+        "projects" => print_projects_help(),
+        "stop" => print_stop_help(),
+        "project-log" => print_project_log_help(),
         "install" => print_install_help(),
-        "install-skills" | "install-agents" => print_install_skills_help(),
+        "install-skills" => print_install_skills_help(),
         "status" => print_status_help(),
         "search" => print_search_help(),
         _ => print_help(),
@@ -902,7 +883,7 @@ fn print_update_help() {
     help_option(
         &style,
         "--force-scan",
-        "bypass a running watcher and reconcile by scanning the filesystem",
+        "bypass a running project service and reconcile by scanning the filesystem",
     );
     help_option(
         &style,
@@ -944,55 +925,28 @@ fn print_clean_help() {
     help_option(&style, "--dry-run", "print what would be removed");
 }
 
-fn print_watch_help() {
+fn print_projects_help() {
     let style = HelpStyle::new();
-    command_usage(
-        &style,
-        "watch",
-        "[OPTIONS] [PATH]",
-        "start the project daemon service for a root",
-    );
-    help_section(&style, "Options");
+    command_usage(&style, "projects", "", "list active project services");
+}
+
+fn print_stop_help() {
+    let style = HelpStyle::new();
+    command_usage(&style, "stop", "[--all] [ID|PATH]", "stop project services");
     help_option(
         &style,
-        "--idle-seconds NUM",
-        "idle seconds before checking auto compact (default: 5)",
-    );
-    help_option(
-        &style,
-        "--compact-delta-count NUM",
-        "compact after this many delta segments (default: 16)",
-    );
-    help_option(
-        &style,
-        "--compact-delta-bytes SIZE",
-        "compact after this total delta size (default: 256mb)",
+        "--all",
+        "stop every registered service and best-effort stale daemon process",
     );
 }
 
-fn print_list_watches_help() {
-    let style = HelpStyle::new();
-    command_usage(&style, "list-watches", "", "list active project services");
-}
-
-fn print_unwatch_help() {
+fn print_project_log_help() {
     let style = HelpStyle::new();
     command_usage(
         &style,
-        "unwatch",
-        "[--all] <ID|PATH>",
-        "stop project services",
-    );
-    help_option(&style, "--all", "stop every registered project service");
-}
-
-fn print_watch_log_help() {
-    let style = HelpStyle::new();
-    command_usage(
-        &style,
-        "watch-log",
+        "project-log",
         "[PATH]",
-        "print watcher activity for a root",
+        "print project service activity for a root",
     );
 }
 
@@ -1912,142 +1866,7 @@ fn parse_index_args(args: &[String]) -> Result<(Options, PathBuf)> {
     Ok((options, start))
 }
 
-fn command_watch(args: &[String]) -> Result<i32> {
-    let (watch_options, start) = parse_watch_args(args)?;
-    let cfg = load_or_create_config(&start)?;
-    let flow = ConsoleFlow::start();
-    flow.step_done(format!("Resolved project {}", display_path(&cfg.root)));
-    fs::create_dir_all(watch_registry_dir())?;
-    let id = watch_id(&cfg.root);
-    let record_path = watch_record_path(&id);
-    let requested_root = fs::canonicalize(&cfg.root).unwrap_or_else(|_| cfg.root.clone());
-    let mut child_watches = Vec::new();
-    for entry in fs::read_dir(watch_registry_dir())?.flatten() {
-        let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "watch") {
-            continue;
-        }
-        let Ok(record) = read_watch_record(&path) else {
-            let _ = fs::remove_file(path);
-            continue;
-        };
-        if !process_alive(record.pid) {
-            let _ = fs::remove_file(path);
-            continue;
-        }
-        let record_root = fs::canonicalize(&record.root).unwrap_or_else(|_| record.root.clone());
-        if path_is_ancestor(&record_root, &requested_root) {
-            println!(
-                "watch already covered: {} pid={} covers {}",
-                display_path(&record.root),
-                record.pid,
-                display_path(&cfg.root)
-            );
-            return Ok(0);
-        }
-        if path_is_ancestor(&requested_root, &record_root) {
-            child_watches.push((path, record));
-        }
-    }
-    for (path, record) in child_watches {
-        stop_process(record.pid);
-        let _ = fs::remove_file(path);
-        let _ = fs::remove_file(search_daemon_record_path(&record.root));
-        let _ = append_watch_log(
-            &record.root,
-            &format!(
-                "watch-stop pid={} superseded_by={}",
-                record.pid,
-                display_path(&cfg.root)
-            ),
-        );
-        println!(
-            "stopped child watch {} pid={} {}",
-            record.id,
-            record.pid,
-            display_path(&record.root)
-        );
-    }
-    if record_path.exists() {
-        let _ = fs::remove_file(&record_path);
-    }
-
-    sync_index_before_watch(&cfg, &flow)?;
-
-    let exe = env::current_exe()?;
-    let progress = ProgressLine::start("Starting service");
-    #[cfg(windows)]
-    let child_pid = {
-        let args = vec![
-            std::ffi::OsString::from("search-daemon"),
-            std::ffi::OsString::from("--watch"),
-            cfg.root.as_os_str().to_os_string(),
-            std::ffi::OsString::from("--idle-seconds"),
-            std::ffi::OsString::from(watch_options.idle_seconds.to_string()),
-            std::ffi::OsString::from("--compact-delta-count"),
-            std::ffi::OsString::from(watch_options.compact_delta_count.to_string()),
-            std::ffi::OsString::from("--compact-delta-bytes"),
-            std::ffi::OsString::from(watch_options.compact_delta_bytes.to_string()),
-        ];
-        spawn_detached_no_inherit(&exe, &args)?
-    };
-    #[cfg(not(windows))]
-    let child_pid = {
-        let mut command = Command::new(exe);
-        command
-            .arg("search-daemon")
-            .arg("--watch")
-            .arg(&cfg.root)
-            .arg("--idle-seconds")
-            .arg(watch_options.idle_seconds.to_string())
-            .arg("--compact-delta-count")
-            .arg(watch_options.compact_delta_count.to_string())
-            .arg("--compact-delta-bytes")
-            .arg(watch_options.compact_delta_bytes.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        detach_background_command(&mut command);
-        let child = command.spawn()?;
-        child.id()
-    };
-    let record = WatchRecord {
-        id,
-        root: cfg.root.clone(),
-        pid: child_pid,
-    };
-    write_watch_record(&record)?;
-    let start = Instant::now();
-    while start.elapsed() < SEARCH_DAEMON_START_TIMEOUT {
-        if read_valid_search_daemon_record(&cfg.root, None)?.is_some() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    append_watch_log(
-        &cfg.root,
-        &format!(
-            "project-service-start pid={} idle_seconds={} compact_delta_count={} compact_delta_bytes={}",
-            record.pid,
-            watch_options.idle_seconds,
-            watch_options.compact_delta_count,
-            watch_options.compact_delta_bytes
-        ),
-    )?;
-    progress.finish("Project service started");
-    flow.summary(format!("Watching {}", display_path(&cfg.root)));
-    flow.detail(format!("pid={} id={}", record.pid, record.id));
-    flow.done();
-    println!(
-        "watching {} pid={} id={}",
-        display_path(&cfg.root),
-        record.pid,
-        record.id
-    );
-    Ok(0)
-}
-
-fn sync_index_before_watch(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<()> {
+fn sync_index_before_service(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<()> {
     let _lock = acquire_exclusive_lock(&cfg.root)?;
     let options = Options {
         max_filesize: DEFAULT_MAX_FILE_SIZE,
@@ -2078,7 +1897,7 @@ fn sync_index_before_watch(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<()
         remove_delta_dir(&cfg.root)?;
         save_index_state(&cfg.root)?;
         timings.write += write_timer.elapsed().as_secs_f64();
-        append_watch_log(
+        append_project_log(
             &cfg.root,
             &format!(
                 "startup-index files={} skipped={} scanned={} elapsed={:.3}s {}",
@@ -2111,7 +1930,7 @@ fn sync_index_before_watch(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<()
         collect_filesystem_changes(cfg, &options, &mut scanned, &mut skipped, &mut timings)?;
     if changes.is_empty() {
         save_index_state(&cfg.root)?;
-        append_watch_log(
+        append_project_log(
             &cfg.root,
             &format!(
                 "startup-update files={} reused={} added=0 modified=0 removed=0 skipped={} scanned={} elapsed={:.3}s {}",
@@ -2160,7 +1979,7 @@ fn sync_index_before_watch(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<()
         save_index_state(&cfg.root)?;
         timings.write += write_timer.elapsed().as_secs_f64();
     }
-    append_watch_log(
+    append_project_log(
         &cfg.root,
         &format!(
             "startup-update files={} reused={} added={} modified={} removed={} skipped={} scanned={} elapsed={:.3}s {}",
@@ -2191,19 +2010,13 @@ fn sync_index_before_watch(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<()
     Ok(())
 }
 
-fn command_watch_daemon(args: &[String]) -> Result<i32> {
-    let (watch_options, start) = parse_watch_args(args)?;
-    let cfg = load_config(&start)?;
-    run_watch_daemon(&cfg, watch_options)
-}
-
-fn command_list_watches(_args: &[String]) -> Result<i32> {
-    fs::create_dir_all(watch_registry_dir())?;
+fn command_list_projects(_args: &[String]) -> Result<i32> {
+    fs::create_dir_all(project_registry_dir())?;
     let mut records = Vec::new();
-    for entry in fs::read_dir(watch_registry_dir())?.flatten() {
+    for entry in fs::read_dir(project_registry_dir())?.flatten() {
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "watch") {
-            if let Ok(record) = read_watch_record(&path) {
+        if path.extension().is_some_and(|ext| ext == "project") {
+            if let Ok(record) = read_project_record(&path) {
                 records.push((path, record));
             }
         }
@@ -2225,25 +2038,59 @@ fn command_list_watches(_args: &[String]) -> Result<i32> {
     Ok(0)
 }
 
-fn command_unwatch(args: &[String]) -> Result<i32> {
+fn stop_child_project_services(root: &Path) -> Result<()> {
+    fs::create_dir_all(project_registry_dir())?;
+    let requested_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    for entry in fs::read_dir(project_registry_dir())?.flatten() {
+        let path = entry.path();
+        if !path.extension().is_some_and(|ext| ext == "project") {
+            continue;
+        }
+        let Ok(record) = read_project_record(&path) else {
+            let _ = fs::remove_file(path);
+            continue;
+        };
+        if !process_alive(record.pid) {
+            let _ = fs::remove_file(path);
+            continue;
+        }
+        let record_root = fs::canonicalize(&record.root).unwrap_or_else(|_| record.root.clone());
+        if record_root != requested_root && path_is_ancestor(&requested_root, &record_root) {
+            stop_process(record.pid);
+            let _ = fs::remove_file(path);
+            let _ = fs::remove_file(search_daemon_record_path(&record.root));
+            let _ = append_project_log(
+                &record.root,
+                &format!(
+                    "project-service-stop pid={} superseded_by={}",
+                    record.pid,
+                    display_path(root)
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn command_stop_projects(args: &[String]) -> Result<i32> {
     let all = args.iter().any(|arg| arg == "--all");
     let targets: Vec<&String> = args.iter().filter(|arg| arg.as_str() != "--all").collect();
     if all && !targets.is_empty() {
-        bail!("unwatch --all does not accept an id or path");
+        bail!("stop --all does not accept an id or path");
     }
     if !all && targets.len() != 1 {
-        bail!("unwatch requires an id or path");
+        bail!("stop requires an id or path; use --all to stop every project service");
     }
     let target = targets.first().copied();
     let target_roots = target
-        .map(|target| unwatch_target_roots(Path::new(target)))
+        .map(|target| stop_target_roots(Path::new(target)))
         .unwrap_or_default();
     let mut matched = Vec::new();
-    fs::create_dir_all(watch_registry_dir())?;
-    for entry in fs::read_dir(watch_registry_dir())?.flatten() {
+    fs::create_dir_all(project_registry_dir())?;
+    for entry in fs::read_dir(project_registry_dir())?.flatten() {
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "watch") {
-            if let Ok(record) = read_watch_record(&path) {
+        if path.extension().is_some_and(|ext| ext == "project") {
+            if let Ok(record) = read_project_record(&path) {
                 let by_id = target.is_some_and(|target| record.id == *target);
                 let by_path = target_roots
                     .iter()
@@ -2256,19 +2103,28 @@ fn command_unwatch(args: &[String]) -> Result<i32> {
     }
     let mut stopped = HashSet::default();
     if matched.is_empty() {
+        let stale_count = if all {
+            stop_stale_daemon_processes(&mut stopped)
+        } else {
+            0
+        };
         if !all {
             if let Some(root) = target_roots.first() {
                 if stop_search_daemon_for_root(root, &mut stopped) {
-                    println!("stopped daemon {}", display_path(root));
+                    println!("stopped project service {}", display_path(root));
                     return Ok(0);
                 }
             }
         }
+        if stale_count != 0 {
+            println!("stopped {stale_count} stale daemon processes");
+            return Ok(0);
+        }
         if let Some(target) = target {
-            eprintln!("indexsearch: no watch matched {target}");
+            eprintln!("indexsearch: no project service matched {target}");
             return Ok(1);
         } else {
-            eprintln!("indexsearch: no watches registered");
+            eprintln!("indexsearch: no project services registered or running");
             return Ok(0);
         }
     }
@@ -2278,18 +2134,27 @@ fn command_unwatch(args: &[String]) -> Result<i32> {
         }
         let _ = fs::remove_file(path);
         let _ = stop_search_daemon_for_root(&record.root, &mut stopped);
-        let _ = append_watch_log(&record.root, &format!("watch-stop pid={}", record.pid));
+        let _ = append_project_log(
+            &record.root,
+            &format!("project-service-stop pid={}", record.pid),
+        );
         println!(
-            "unwatched {} pid={} {}",
+            "stopped {} pid={} {}",
             record.id,
             record.pid,
             display_path(&record.root)
         );
     }
+    if all {
+        let stale_count = stop_stale_daemon_processes(&mut stopped);
+        if stale_count != 0 {
+            println!("stopped {stale_count} stale daemon processes");
+        }
+    }
     Ok(0)
 }
 
-fn unwatch_target_roots(target: &Path) -> Vec<PathBuf> {
+fn stop_target_roots(target: &Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Ok(path) = fs::canonicalize(target) {
         roots.push(path);
@@ -2315,16 +2180,66 @@ fn stop_search_daemon_for_root(root: &Path, stopped: &mut HashSet<u32>) -> bool 
     true
 }
 
-fn command_watch_log(args: &[String]) -> Result<i32> {
+fn stop_stale_daemon_processes(stopped: &mut HashSet<u32>) -> usize {
+    if env::var_os("INDEXSEARCH_SKIP_STALE_DAEMON_KILL").is_some() {
+        return 0;
+    }
+    let mut count = 0usize;
+    for pid in discover_daemon_pids() {
+        if pid == std::process::id() || !stopped.insert(pid) {
+            continue;
+        }
+        stop_process(pid);
+        count += 1;
+    }
+    count
+}
+
+fn discover_daemon_pids() -> Vec<u32> {
+    let mut pids = HashSet::default();
+    #[cfg(unix)]
+    {
+        for pattern in ["is-daemon", "search-daemon"] {
+            if let Ok(output) = Command::new("pgrep").args(["-f", pattern]).output() {
+                for line in String::from_utf8_lossy(&output.stdout).lines() {
+                    if let Ok(pid) = line.trim().parse::<u32>() {
+                        pids.insert(pid);
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let script = concat!(
+            "Get-CimInstance Win32_Process | ",
+            "Where-Object { $_.Name -like 'is-daemon*' -or $_.CommandLine -match 'search-daemon' } | ",
+            "ForEach-Object { $_.ProcessId }"
+        );
+        if let Ok(output) = Command::new("powershell")
+            .args(["-NoProfile", "-Command", script])
+            .output()
+        {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                if let Ok(pid) = line.trim().parse::<u32>() {
+                    pids.insert(pid);
+                }
+            }
+        }
+    }
+    pids.into_iter().collect()
+}
+
+fn command_project_log(args: &[String]) -> Result<i32> {
     let start = args
         .first()
         .map(PathBuf::from)
         .unwrap_or(env::current_dir()?);
     let cfg = load_config(&start)?;
-    let path = watch_log_path(&cfg.root);
+    let path = project_log_path(&cfg.root);
     let lines = fs::read_to_string(&path).unwrap_or_default();
     if lines.is_empty() {
-        println!("watch log is empty: {}", display_path(&path));
+        println!("project log is empty: {}", display_path(&path));
     } else {
         print!("{lines}");
     }
@@ -2791,63 +2706,6 @@ fn append_marked_block(existing: String, wrapped: &str) -> String {
     format!("{existing}{sep}\n{wrapped}")
 }
 
-fn parse_watch_args(args: &[String]) -> Result<(WatchOptions, PathBuf)> {
-    let mut options = WatchOptions::default();
-    let mut start = env::current_dir()?;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--idle-seconds" => {
-                i += 1;
-                options.idle_seconds = args
-                    .get(i)
-                    .context("missing --idle-seconds value")?
-                    .parse()?;
-            }
-            "--compact-delta-count" => {
-                i += 1;
-                options.compact_delta_count = args
-                    .get(i)
-                    .context("missing --compact-delta-count value")?
-                    .parse()?;
-            }
-            "--compact-delta-bytes" => {
-                i += 1;
-                options.compact_delta_bytes =
-                    parse_size(args.get(i).context("missing --compact-delta-bytes value")?)?;
-            }
-            value => start = PathBuf::from(value),
-        }
-        i += 1;
-    }
-    Ok((options, start))
-}
-
-fn run_watch_daemon(cfg: &ProjectConfig, watch_options: WatchOptions) -> Result<i32> {
-    fs::create_dir_all(watch_registry_dir())?;
-    append_watch_log(
-        &cfg.root,
-        &format!("watch-daemon-start pid={}", std::process::id()),
-    )?;
-    write_watch_record(&WatchRecord {
-        id: watch_id(&cfg.root),
-        root: cfg.root.clone(),
-        pid: std::process::id(),
-    })?;
-    run_watch_loop(
-        cfg,
-        watch_options,
-        None,
-        None,
-        Arc::new(WatchState::default()),
-    )?;
-    append_watch_log(
-        &cfg.root,
-        &format!("watch-daemon-stop pid={}", std::process::id()),
-    )?;
-    Ok(0)
-}
-
 fn start_embedded_watch_thread(
     cfg: ProjectConfig,
     watch_options: WatchOptions,
@@ -2857,15 +2715,15 @@ fn start_embedded_watch_thread(
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let result = (|| -> Result<()> {
-            fs::create_dir_all(watch_registry_dir())?;
-            write_watch_record(&WatchRecord {
-                id: watch_id(&cfg.root),
+            fs::create_dir_all(project_registry_dir())?;
+            write_project_record(&ProjectRecord {
+                id: project_id(&cfg.root),
                 root: cfg.root.clone(),
                 pid: std::process::id(),
             })?;
-            append_watch_log(
+            append_project_log(
                 &cfg.root,
-                &format!("project-service-watch-start pid={}", std::process::id()),
+                &format!("project-service-start pid={}", std::process::id()),
             )?;
             run_watch_loop(
                 &cfg,
@@ -2874,14 +2732,14 @@ fn start_embedded_watch_thread(
                 Some(&shutdown),
                 watch_state,
             )?;
-            append_watch_log(
+            append_project_log(
                 &cfg.root,
-                &format!("project-service-watch-stop pid={}", std::process::id()),
+                &format!("project-service-stop pid={}", std::process::id()),
             )?;
             Ok(())
         })();
         if let Err(err) = result {
-            let _ = append_watch_log(&cfg.root, &format!("project-service-watch-error {err:#}"));
+            let _ = append_project_log(&cfg.root, &format!("project-service-error {err:#}"));
             shutdown.store(true, AtomicOrdering::Relaxed);
         }
     })
@@ -2911,25 +2769,41 @@ fn run_watch_loop(
         match rx.recv_timeout(idle) {
             Ok(Ok(event)) => {
                 let mut pending = watch_state.pending.lock().unwrap();
-                collect_event_paths(cfg, event, &mut pending);
+                collect_event_paths(cfg, event, &mut pending, watch_state.as_ref());
             }
             Ok(Err(_)) => {}
             Err(RecvTimeoutError::Timeout) => {
-                let outcome = flush_watch_state(cfg, &watch_state)?;
+                if watch_state.restart_required.load(AtomicOrdering::Relaxed) {
+                    if let Some(flag) = shutdown {
+                        let _ = append_project_log(
+                            &cfg.root,
+                            "project-service-restart-required reason=config",
+                        );
+                        flag.store(true, AtomicOrdering::Relaxed);
+                        break;
+                    }
+                }
+                let outcome = {
+                    let _io = watch_state.index_io.lock().unwrap();
+                    flush_watch_state(cfg, &watch_state)?
+                };
                 if outcome.changed {
                     if let Some(record) = search_record {
                         let _ = refresh_search_daemon_record(record);
                     }
                 }
-                if maybe_compact_idle(cfg, watch_options)? {
-                    if let Some(flag) = shutdown {
-                        let _ = append_watch_log(
-                            &cfg.root,
-                            "project-service-restart-required reason=compact",
-                        );
-                        flag.store(true, AtomicOrdering::Relaxed);
-                        break;
+                let compacted = {
+                    let _io = watch_state.index_io.lock().unwrap();
+                    maybe_compact_idle(cfg, watch_options)?
+                };
+                if compacted {
+                    watch_state
+                        .reload_index
+                        .store(true, AtomicOrdering::Relaxed);
+                    if let Some(record) = search_record {
+                        let _ = refresh_search_daemon_record(record);
                     }
+                    let _ = append_project_log(&cfg.root, "project-service-reload reason=compact");
                 } else if let Some(record) = search_record {
                     let _ = refresh_search_daemon_record(record);
                 }
@@ -2940,7 +2814,12 @@ fn run_watch_loop(
     Ok(())
 }
 
-fn collect_event_paths(cfg: &ProjectConfig, event: Event, pending: &mut HashSet<String>) {
+fn collect_event_paths(
+    cfg: &ProjectConfig,
+    event: Event,
+    pending: &mut HashSet<String>,
+    watch_state: &WatchState,
+) {
     if !watch_event_can_change_index(&event.kind) {
         return;
     }
@@ -2949,6 +2828,12 @@ fn collect_event_paths(cfg: &ProjectConfig, event: Event, pending: &mut HashSet<
             continue;
         }
         if let Some(rel) = rel_path(&cfg.root, &path) {
+            if rel == PROJECT_FILE {
+                watch_state
+                    .restart_required
+                    .store(true, AtomicOrdering::Relaxed);
+                continue;
+            }
             if path.exists() && (is_hidden(&rel) || !is_searchable(cfg, &rel)) {
                 continue;
             }
@@ -3022,7 +2907,7 @@ fn flush_watch_batch(cfg: &ProjectConfig, paths: &HashSet<String>) -> Result<boo
         save_index(&index, &index_path(&cfg.root))?;
         save_index_state(&cfg.root)?;
         timings.write += write_timer.elapsed().as_secs_f64();
-        append_watch_log(
+        append_project_log(
             &cfg.root,
             &format!(
                 "auto-index files={} skipped={} scanned={} events={} elapsed={:.3}s {}",
@@ -3049,7 +2934,7 @@ fn flush_watch_batch(cfg: &ProjectConfig, paths: &HashSet<String>) -> Result<boo
     save_delta(&cfg.root, &delta, &meta)?;
     save_index_state(&cfg.root)?;
     let write_elapsed = write_timer.elapsed().as_secs_f64();
-    append_watch_log(
+    append_project_log(
         &cfg.root,
         &format!(
             "auto-update files={} reused={} added={} modified={} removed={} skipped={} scanned={} events={} elapsed={:.3}s process={:.3}s write={:.3}s",
@@ -3118,7 +3003,7 @@ fn compact_root(cfg: &ProjectConfig) -> Result<()> {
     retire_delta_dir(&cfg.root)?;
     save_index_state(&cfg.root)?;
     let write_elapsed = write_timer.elapsed().as_secs_f64();
-    append_watch_log(
+    append_project_log(
         &cfg.root,
         &format!(
             "auto-compact files={} deltas={} elapsed={:.3}s process={:.3}s write={:.3}s",
@@ -3321,13 +3206,13 @@ fn stop_services_for_root(root: &Path) -> Result<usize> {
         }
         let _ = fs::remove_file(search_daemon_record_path(&root));
     }
-    fs::create_dir_all(watch_registry_dir())?;
-    for entry in fs::read_dir(watch_registry_dir())?.flatten() {
+    fs::create_dir_all(project_registry_dir())?;
+    for entry in fs::read_dir(project_registry_dir())?.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "watch") {
+        if !path.extension().is_some_and(|ext| ext == "project") {
             continue;
         }
-        let Ok(record) = read_watch_record(&path) else {
+        let Ok(record) = read_project_record(&path) else {
             let _ = fs::remove_file(path);
             continue;
         };
@@ -3561,7 +3446,7 @@ fn try_search_multiple_roots(
     for path in &path_args {
         let Some(root) = find_existing_index_root(&path.abs) else {
             bail!(
-                "no IndexSearch project found above {}; run `indexsearch index` or `is watch` in that project first",
+                "no IndexSearch project found above {}; run `is index` in that project first",
                 display_path(&path.abs)
             );
         };
@@ -3986,19 +3871,19 @@ fn find_existing_project_root(start: &Path) -> Option<PathBuf> {
         std::env::current_dir().ok()?.join(start)
     };
     path.ancestors()
-        .find(|ancestor| {
-            index_path(ancestor).is_file()
-                || ancestor.join(INDEX_DIR).is_dir()
-                || ancestor.join(PROJECT_FILE).is_file()
-        })
+        .find(|ancestor| index_path(ancestor).is_file() || ancestor.join(PROJECT_FILE).is_file())
         .map(Path::to_path_buf)
 }
 
 fn confirm_create_project_for_search(start: &Path) -> Result<bool> {
     let root = discover_root_for_create(start)?;
+    if agent_auto_project_mode() {
+        let _ = load_or_create_config(&root)?;
+        return Ok(true);
+    }
     if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
         eprintln!(
-            "indexsearch: no IndexSearch project found above {}; run `indexsearch index .` or `is watch .` at the project root",
+            "indexsearch: no IndexSearch project found above {}; run `is index .` at the project root",
             display_path(start)
         );
         return Ok(false);
@@ -4021,6 +3906,14 @@ fn confirm_create_project_for_search(start: &Path) -> Result<bool> {
         "n" | "N" | "no" | "NO" => Ok(false),
         _ => Ok(false),
     }
+}
+
+fn agent_auto_project_mode() -> bool {
+    if env::var_os("INDEXSEARCH_NO_AGENT_AUTO_PROJECT").is_some() {
+        return false;
+    }
+    env::var_os("INDEXSEARCH_AGENT_AUTO_PROJECT").is_some()
+        || !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal())
 }
 
 fn try_search_daemon(
@@ -4107,7 +4000,8 @@ fn start_search_daemon(root: &Path) -> Result<()> {
     let exe = env::current_exe()?;
     let mut command = Command::new(exe);
     command
-        .arg("watch")
+        .arg("search-daemon")
+        .arg("--detach")
         .arg(root)
         .env("INDEXSEARCH_NO_PROGRESS", "1")
         .stdin(Stdio::null())
@@ -4122,44 +4016,94 @@ fn start_search_daemon(root: &Path) -> Result<()> {
 
 fn command_search_daemon(args: &[String]) -> Result<i32> {
     let mut detach = false;
-    let mut watch_options = None;
+    let mut watch_options = WatchOptions::default();
     let mut root = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--detach" => detach = true,
-            "--watch" => watch_options = Some(WatchOptions::default()),
             "--idle-seconds" => {
                 i += 1;
                 let value = args.get(i).context("missing --idle-seconds value")?;
-                watch_options
-                    .get_or_insert_with(WatchOptions::default)
-                    .idle_seconds = value.parse()?;
+                watch_options.idle_seconds = value.parse()?;
             }
             "--compact-delta-count" => {
                 i += 1;
                 let value = args.get(i).context("missing --compact-delta-count value")?;
-                watch_options
-                    .get_or_insert_with(WatchOptions::default)
-                    .compact_delta_count = value.parse()?;
+                watch_options.compact_delta_count = value.parse()?;
             }
             "--compact-delta-bytes" => {
                 i += 1;
                 let value = args.get(i).context("missing --compact-delta-bytes value")?;
-                watch_options
-                    .get_or_insert_with(WatchOptions::default)
-                    .compact_delta_bytes = parse_size(value)?;
+                watch_options.compact_delta_bytes = parse_size(value)?;
             }
             value => root = Some(PathBuf::from(value)),
         }
         i += 1;
     }
     let root = root.context("search-daemon requires a root")?;
+    let cfg = load_or_create_config(&root)?;
+    stop_child_project_services(&cfg.root)?;
+    let flow = ConsoleFlow::start();
+    flow.step_done(format!("Resolved project {}", display_path(&cfg.root)));
+    sync_index_before_service(&cfg, &flow)?;
+    flow.done();
     if detach {
-        daemonize_current_process()?;
+        spawn_search_daemon_detached(&cfg.root, watch_options)?;
+        return Ok(0);
     }
-    run_search_daemon(&root, watch_options)
+    run_search_daemon(&cfg.root, watch_options)
 }
+
+fn search_daemon_child_args(root: &Path, options: WatchOptions) -> Vec<OsString> {
+    vec![
+        OsString::from("search-daemon"),
+        root.as_os_str().to_os_string(),
+        OsString::from("--idle-seconds"),
+        OsString::from(options.idle_seconds.to_string()),
+        OsString::from("--compact-delta-count"),
+        OsString::from(options.compact_delta_count.to_string()),
+        OsString::from("--compact-delta-bytes"),
+        OsString::from(options.compact_delta_bytes.to_string()),
+    ]
+}
+
+fn spawn_search_daemon_detached(root: &Path, options: WatchOptions) -> Result<()> {
+    let exe = env::current_exe()?;
+    let args = search_daemon_child_args(root, options);
+    #[cfg(windows)]
+    {
+        spawn_detached_no_inherit(&exe, &args)?;
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = Command::new(exe);
+        command
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        detach_background(&mut command);
+        command.spawn()?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn detach_background(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn detach_background(_command: &mut Command) {}
 
 enum SearchDaemonListener {
     #[cfg(not(unix))]
@@ -4459,11 +4403,10 @@ fn windows_direct_stdout_enabled() -> bool {
     )
 }
 
-fn run_search_daemon(root: &Path, watch_options: Option<WatchOptions>) -> Result<i32> {
+fn run_search_daemon(root: &Path, watch_options: WatchOptions) -> Result<i32> {
     let index_meta = fs::metadata(index_path(root))?;
     let exe = env::current_exe()?;
     let exe_meta = fs::metadata(&exe)?;
-    let has_watch = watch_options.is_some();
     let listener = SearchDaemonListener::bind(root)?;
     let port = listener.port();
     let socket_path = listener.socket_path();
@@ -4481,46 +4424,37 @@ fn run_search_daemon(root: &Path, watch_options: Option<WatchOptions>) -> Result
         index_mtime: mtime_ns(&index_meta),
     };
     write_search_daemon_record(&record)?;
-    if has_watch {
-        let watch = WatchRecord {
-            id: watch_id(&record.root),
-            root: record.root.clone(),
-            pid: record.pid,
-        };
-        write_watch_record(&watch)?;
-    }
-    let index = {
+    let project = ProjectRecord {
+        id: project_id(&record.root),
+        root: record.root.clone(),
+        pid: record.pid,
+    };
+    write_project_record(&project)?;
+    let mut index = {
         let _lock = acquire_shared_lock(root)?;
         MappedIndex::open(&index_path(record.root.as_path()))?
     };
     let shutdown = Arc::new(AtomicBool::new(false));
-    let watch_state = watch_options
-        .as_ref()
-        .map(|_| Arc::new(WatchState::default()));
-    let _watch_thread = if let Some(watch_options) = watch_options {
-        let cfg = load_config(root)?;
-        Some(start_embedded_watch_thread(
-            cfg,
-            watch_options,
-            record.clone(),
-            Arc::clone(&shutdown),
-            watch_state
-                .as_ref()
-                .expect("watch state exists when watch options are set")
-                .clone(),
-        ))
-    } else {
-        None
-    };
+    let watch_state = Arc::new(WatchState::default());
+    let cfg = load_config(root)?;
+    let watch_thread = start_embedded_watch_thread(
+        cfg,
+        watch_options,
+        record.clone(),
+        Arc::clone(&shutdown),
+        Arc::clone(&watch_state),
+    );
     listener.set_nonblocking(true)?;
-    while !shutdown.load(AtomicOrdering::Relaxed) {
+    while !shutdown.load(AtomicOrdering::Relaxed)
+        && !watch_state.restart_required.load(AtomicOrdering::Relaxed)
+    {
         match listener.accept() {
             Ok(mut stream) => {
                 let _ = handle_search_daemon_client(
                     &mut stream,
                     &record,
-                    &index,
-                    watch_state.as_deref(),
+                    &mut index,
+                    watch_state.as_ref(),
                 );
             }
             Err(err) => {
@@ -4535,16 +4469,28 @@ fn run_search_daemon(root: &Path, watch_options: Option<WatchOptions>) -> Result
             }
         }
     }
+    let restart = watch_state.restart_required.load(AtomicOrdering::Relaxed);
+    shutdown.store(true, AtomicOrdering::Relaxed);
+    drop(listener);
+    let _ = watch_thread.join();
     let _ = fs::remove_file(search_daemon_record_path(root));
-    let _ = fs::remove_file(watch_record_path(&watch_id(root)));
+    let _ = fs::remove_file(project_record_path(&project_id(root)));
+    if restart {
+        let cfg = load_or_create_config(root)?;
+        let flow = ConsoleFlow::start();
+        flow.step_done(format!("Resolved project {}", display_path(&cfg.root)));
+        sync_index_before_service(&cfg, &flow)?;
+        flow.done();
+        return run_search_daemon(root, watch_options);
+    }
     Ok(0)
 }
 
 fn handle_search_daemon_client(
     stream: &mut SearchDaemonStream,
     record: &SearchDaemonRecord,
-    index: &MappedIndex,
-    watch_state: Option<&WatchState>,
+    index: &mut MappedIndex,
+    watch_state: &WatchState,
 ) -> Result<()> {
     let mut profile = SearchProfile::default();
     let read_timer = Instant::now();
@@ -4573,6 +4519,7 @@ fn handle_search_daemon_client(
     }
     if is_daemon_update_request(&cwd.args) {
         close_stdout_fd(stdout_fd.take());
+        let _io = watch_state.index_io.lock().unwrap();
         let result = handle_search_daemon_update_client(stream, record, index, watch_state);
         if let Some(dir) = current_dir {
             let _ = env::set_current_dir(dir);
@@ -4586,6 +4533,16 @@ fn handle_search_daemon_client(
         }
         if options.profile {
             profile.record("daemon_parse_args", parse_timer.elapsed());
+        }
+        let _io = watch_state.index_io.lock().unwrap();
+        let sync_timer = if options.profile {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        sync_daemon_index_before_search(record, index, watch_state)?;
+        if let Some(sync_timer) = sync_timer {
+            profile.record("daemon_sync_before_search", sync_timer.elapsed());
         }
         let search_timer = Instant::now();
         let code = search_daemon_output_to_stream(
@@ -4606,7 +4563,13 @@ fn handle_search_daemon_client(
     });
     if let Err(err) = result {
         close_stdout_fd(stdout_fd.take());
-        write_search_daemon_error(stream, &format!("indexsearch: {err:#}\n"))?;
+        let message = format!("{err:#}");
+        if message.contains("project configuration changed") {
+            write_search_daemon_response_begin(stream)?;
+            write_search_daemon_done(stream, SEARCH_DAEMON_CONTROL_FALLBACK_CODE)?;
+        } else {
+            write_search_daemon_error(stream, &format!("indexsearch: {message}\n"))?;
+        }
     };
     if let Some(dir) = current_dir {
         let _ = env::set_current_dir(dir);
@@ -4620,19 +4583,56 @@ fn is_daemon_update_request(args: &[String]) -> bool {
         && args[1] == SEARCH_DAEMON_CONTROL_UPDATE
 }
 
+fn sync_daemon_index_before_search(
+    record: &SearchDaemonRecord,
+    index: &mut MappedIndex,
+    watch_state: &WatchState,
+) -> Result<()> {
+    if watch_state.restart_required.load(AtomicOrdering::Relaxed) {
+        bail!("project configuration changed; project service is restarting");
+    }
+    if watch_state
+        .reload_index
+        .swap(false, AtomicOrdering::Relaxed)
+    {
+        let _lock = acquire_shared_lock(&record.root)?;
+        *index = MappedIndex::open(&index_path(&record.root))?;
+        let _ = refresh_search_daemon_record(record);
+    }
+    let cfg = load_config(&record.root)?;
+    if cfg.hash != index.config_hash {
+        watch_state
+            .restart_required
+            .store(true, AtomicOrdering::Relaxed);
+        bail!("project configuration changed; project service is restarting");
+    }
+    let outcome = flush_watch_state(&cfg, watch_state)?;
+    if outcome.changed {
+        let _ = refresh_search_daemon_record(record);
+    }
+    Ok(())
+}
+
 fn handle_search_daemon_update_client(
     stream: &mut SearchDaemonStream,
     record: &SearchDaemonRecord,
-    index: &MappedIndex,
-    watch_state: Option<&WatchState>,
+    index: &mut MappedIndex,
+    watch_state: &WatchState,
 ) -> Result<()> {
     write_search_daemon_response_begin(stream)?;
-    let Some(watch_state) = watch_state else {
-        write_search_daemon_done(stream, SEARCH_DAEMON_CONTROL_FALLBACK_CODE)?;
-        return Ok(());
-    };
+    if watch_state
+        .reload_index
+        .swap(false, AtomicOrdering::Relaxed)
+    {
+        let _lock = acquire_shared_lock(&record.root)?;
+        *index = MappedIndex::open(&index_path(&record.root))?;
+        let _ = refresh_search_daemon_record(record);
+    }
     let cfg = load_config(&record.root)?;
     if cfg.hash != index.config_hash {
+        watch_state
+            .restart_required
+            .store(true, AtomicOrdering::Relaxed);
         write_search_daemon_done(stream, SEARCH_DAEMON_CONTROL_FALLBACK_CODE)?;
         return Ok(());
     }
@@ -4644,14 +4644,14 @@ fn handle_search_daemon_update_client(
     let elapsed = timer.elapsed().as_secs_f64();
     let message = if outcome.events == 0 {
         format!(
-            "updated index (watcher current, 0 pending events) in {:.3}s\nroot: {}\nindex: {}\n",
+            "updated index (project service current, 0 pending events) in {:.3}s\nroot: {}\nindex: {}\n",
             elapsed,
             display_path(&record.root),
             display_path(&index_path(&record.root))
         )
     } else if outcome.changed {
         format!(
-            "updated index from watcher ({} pending events flushed) in {:.3}s\nroot: {}\nindex: {}\n",
+            "updated index from project service ({} pending events flushed) in {:.3}s\nroot: {}\nindex: {}\n",
             outcome.events,
             elapsed,
             display_path(&record.root),
@@ -4659,14 +4659,14 @@ fn handle_search_daemon_update_client(
         )
     } else {
         format!(
-            "updated index (watcher current, {} pending events produced no index changes) in {:.3}s\nroot: {}\nindex: {}\n",
+            "updated index (project service current, {} pending events produced no index changes) in {:.3}s\nroot: {}\nindex: {}\n",
             outcome.events,
             elapsed,
             display_path(&record.root),
             display_path(&index_path(&record.root))
         )
     };
-    append_watch_log(
+    append_project_log(
         &record.root,
         &format!(
             "manual-update events={} changed={} elapsed={:.3}s",
@@ -10722,8 +10722,8 @@ fn search_daemon_socket_path(root: &Path) -> PathBuf {
     root.join(INDEX_DIR).join("search-daemon.sock")
 }
 
-fn watch_registry_dir() -> PathBuf {
-    home_dir().join(".indexsearch").join(WATCH_DIR)
+fn project_registry_dir() -> PathBuf {
+    home_dir().join(".indexsearch").join(PROJECTS_DIR)
 }
 
 fn home_dir() -> PathBuf {
@@ -10733,8 +10733,8 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn watch_record_path(id: &str) -> PathBuf {
-    watch_registry_dir().join(format!("{id}.watch"))
+fn project_record_path(id: &str) -> PathBuf {
+    project_registry_dir().join(format!("{id}.project"))
 }
 
 fn default_install_dir() -> PathBuf {
@@ -10831,11 +10831,11 @@ fn path_contains(dir: &Path) -> bool {
     env::split_paths(&path).any(|p| p == dir)
 }
 
-fn watch_log_path(root: &Path) -> PathBuf {
-    root.join(INDEX_DIR).join(WATCH_LOG_FILE)
+fn project_log_path(root: &Path) -> PathBuf {
+    root.join(INDEX_DIR).join(PROJECT_LOG_FILE)
 }
 
-fn watch_id(root: &Path) -> String {
+fn project_id(root: &Path) -> String {
     let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     format!("{:016x}", fnv1a(canonical.to_string_lossy().as_bytes()))
 }
@@ -10985,12 +10985,12 @@ fn path_is_ancestor(parent: &Path, child: &Path) -> bool {
     child == parent || child.starts_with(parent)
 }
 
-fn append_watch_log(root: &Path, message: &str) -> Result<()> {
+fn append_project_log(root: &Path, message: &str) -> Result<()> {
     fs::create_dir_all(root.join(INDEX_DIR))?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(watch_log_path(root))?;
+        .open(project_log_path(root))?;
     writeln!(file, "{} {}", log_timestamp(), message)?;
     Ok(())
 }
@@ -11027,19 +11027,19 @@ fn acquire_exclusive_lock(root: &Path) -> Result<IndexLock> {
     Ok(IndexLock::Exclusive(file))
 }
 
-fn write_watch_record(record: &WatchRecord) -> Result<()> {
-    fs::create_dir_all(watch_registry_dir())?;
+fn write_project_record(record: &ProjectRecord) -> Result<()> {
+    fs::create_dir_all(project_registry_dir())?;
     let text = format!(
         "id={}\npid={}\nroot={}\n",
         record.id,
         record.pid,
         record.root.display()
     );
-    fs::write(watch_record_path(&record.id), text)?;
+    fs::write(project_record_path(&record.id), text)?;
     Ok(())
 }
 
-fn read_watch_record(path: &Path) -> Result<WatchRecord> {
+fn read_project_record(path: &Path) -> Result<ProjectRecord> {
     let text = fs::read_to_string(path)?;
     let mut id = String::new();
     let mut pid = 0;
@@ -11056,9 +11056,9 @@ fn read_watch_record(path: &Path) -> Result<WatchRecord> {
         }
     }
     if id.is_empty() || pid == 0 || root.as_os_str().is_empty() {
-        bail!("invalid watch record {}", display_path(path));
+        bail!("invalid project record {}", display_path(path));
     }
-    Ok(WatchRecord { id, root, pid })
+    Ok(ProjectRecord { id, root, pid })
 }
 
 fn process_alive(pid: u32) -> bool {
@@ -11103,22 +11103,6 @@ fn stop_process(pid: u32) {
             .status();
     }
 }
-
-#[cfg(unix)]
-fn detach_background_command(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn detach_background_command(_command: &mut Command) {}
 
 #[cfg(windows)]
 fn spawn_detached_no_inherit(exe: &Path, args: &[std::ffi::OsString]) -> std::io::Result<u32> {
@@ -11197,44 +11181,6 @@ fn append_windows_arg(out: &mut Vec<u16>, arg: &std::ffi::OsStr) {
     }
     out.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2));
     out.push(b'"' as u16);
-}
-
-fn daemonize_current_process() -> Result<()> {
-    #[cfg(unix)]
-    {
-        unsafe {
-            let pid = libc::fork();
-            if pid < 0 {
-                return Err(std::io::Error::last_os_error()).context("fork search daemon");
-            }
-            if pid > 0 {
-                libc::_exit(0);
-            }
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error()).context("setsid search daemon");
-            }
-            let pid = libc::fork();
-            if pid < 0 {
-                return Err(std::io::Error::last_os_error()).context("fork search daemon");
-            }
-            if pid > 0 {
-                libc::_exit(0);
-            }
-            let dev_null = std::ffi::CString::new("/dev/null")?;
-            let fd = libc::open(dev_null.as_ptr(), libc::O_RDWR);
-            if fd >= 0 {
-                libc::dup2(fd, libc::STDIN_FILENO);
-                libc::dup2(fd, libc::STDOUT_FILENO);
-                libc::dup2(fd, libc::STDERR_FILENO);
-                if fd > libc::STDERR_FILENO {
-                    libc::close(fd);
-                }
-            }
-        }
-    }
-    #[cfg(windows)]
-    {}
-    Ok(())
 }
 
 fn print_timings(timings: &Timings) {

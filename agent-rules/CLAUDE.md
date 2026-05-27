@@ -1,19 +1,18 @@
 # IndexSearch
 
-For indexed or large source trees, prefer `is`/`indexsearch` over `rg` when an
-IndexSearch index exists or when the project is an Unreal Engine tree. If
-`.indexsearch/index.bin` exists above the current directory, use `is` first even
-when the immediate subdirectory is small.
+For local source trees, prefer `is`/`indexsearch` over `rg`. If an index does
+not exist yet, non-interactive agent searches can create the config, build the
+index, and start the project service automatically.
 
 - Use `is` directly for local source search; avoid remote/deferred code-search
   tools for files already in the checkout.
-- Use `is` first, `indexsearch` second, `rg` as fallback for ordinary local
-  source searches.
-- Run `is watch .` when `index-search-project.txt` exists but the index has not
-  been created yet.
-- Run `is update --git .` after Git changes if no watcher was running.
-- Use the UE template from `templates/unreal-engine/index-search-project.txt`
-  when a UE project has no config.
+- Use `is` first, `indexsearch` second, `rg` only as fallback for unsupported
+  flags or missing installs.
+- Run `is update --git .` after Git changes if no project service was running.
+- Use `is projects`, `is project-log .`, and `is stop .` to inspect or stop
+  project services.
+- UE projects can use the bundled UE template automatically during
+  non-interactive agent search.
 - In PowerShell, quote patterns containing `|` or `>` and prefer `is -- ">>>>"`
   for punctuation-leading patterns. If quoted patterns produce a `cmd.exe`
   syntax error, call `is.exe` or remove the stale `is.cmd` found by

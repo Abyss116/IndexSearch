@@ -10,22 +10,21 @@ use std::os::unix::net::UnixStream;
 use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 const INDEX_DIR: &str = ".indexsearch";
 const INDEX_FILE: &str = "index.bin";
 const PROJECT_FILE: &str = "index-search-project.txt";
 const SEARCH_DAEMON_FILE: &str = "search-daemon.txt";
-const WATCH_DIR: &str = "watches";
+const PROJECTS_DIR: &str = "projects";
 const REQUEST_MAGIC: &[u8; 8] = b"ISDREQ1\n";
 const RESPONSE_MAGIC: &[u8; 8] = b"ISDRES1\n";
 const STDOUT_FRAME: u8 = 1;
 const STDERR_FRAME: u8 = 2;
 const DONE_FRAME: u8 = 3;
+const CONTROL_FALLBACK_CODE: i32 = 75;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(20);
-const START_TIMEOUT: Duration = Duration::from_millis(250);
+const START_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 struct FrontendProfile {
@@ -109,6 +108,16 @@ fn run(args: &[String]) -> Result<i32, String> {
     if search_args.iter().any(|arg| arg == "--no-auto-index") {
         return run_backend(args);
     }
+    if agent_auto_project_mode()
+        && search_paths
+            .iter()
+            .any(|path| find_project_root(&path.abs).is_none())
+    {
+        let create_timer = Instant::now();
+        let root = agent_auto_project_root(&search_paths)?;
+        let _ = ensure_project_service(&root, &mut profile)?;
+        profile.record("frontend_agent_auto_project", create_timer);
+    }
     let root_timer = Instant::now();
     if search_paths.len() == 1 {
         let Some(root) = find_project_root(&search_paths[0].abs) else {
@@ -116,7 +125,7 @@ fn run(args: &[String]) -> Result<i32, String> {
                 return handle_missing_project(args);
             }
             return Err(format!(
-                "no IndexSearch project found above {}; run `indexsearch index` or `is watch` in that project first",
+                "no IndexSearch project found above {}; run `is index` in that project first",
                 display_path(&search_paths[0].abs)
             ));
         };
@@ -131,7 +140,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         Err(MissingProject::Single) => return handle_missing_project(args),
         Err(MissingProject::Path(path)) => {
             return Err(format!(
-                "no IndexSearch project found above {}; run `indexsearch index` or `is watch` in that project first",
+                "no IndexSearch project found above {}; run `is index` in that project first",
                 display_path(&path)
             ));
         }
@@ -157,14 +166,18 @@ fn run_search_group(
 ) -> Result<i32, String> {
     let daemon_args = search_daemon_args(group_args);
     let ready_record;
-    let started_watch;
     let ensure_timer = Instant::now();
-    (root, ready_record, started_watch) = ensure_watch(&root, profile)?;
+    (root, ready_record) = ensure_project_service(&root, profile)?;
     profile.record("frontend_ensure_project_service", ensure_timer);
     let record_timer = Instant::now();
     if let Some(record) = ready_record.or_else(|| read_valid_record(&root)) {
         profile.record("frontend_read_daemon_record", record_timer);
         if let Ok(code) = request_daemon(&record, &daemon_args, profile) {
+            if code == CONTROL_FALLBACK_CODE {
+                stop_process(record.pid);
+                let _ = fs::remove_file(record_path(&root));
+                return run_backend_no_daemon(group_args);
+            }
             return Ok(code);
         }
         stop_process(record.pid);
@@ -172,28 +185,7 @@ fn run_search_group(
     } else {
         profile.record("frontend_read_daemon_record", record_timer);
     }
-    if started_watch {
-        return run_backend_no_daemon(group_args);
-    }
-    let start_daemon_timer = Instant::now();
-    start_daemon(&root)?;
-    profile.record("frontend_start_daemon", start_daemon_timer);
-    let deadline = Instant::now() + START_TIMEOUT;
-    while Instant::now() < deadline {
-        let record_timer = Instant::now();
-        if let Some(record) = read_valid_record(&root) {
-            profile.record("frontend_read_daemon_record", record_timer);
-            if let Ok(code) = request_daemon(&record, &daemon_args, profile) {
-                return Ok(code);
-            }
-            stop_process(record.pid);
-            let _ = fs::remove_file(record_path(&root));
-        } else {
-            profile.record("frontend_read_daemon_record", record_timer);
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    run_backend(group_args)
+    run_backend_no_daemon(group_args)
 }
 
 fn should_delegate(args: &[String]) -> bool {
@@ -225,18 +217,14 @@ fn is_command_name(arg: &str) -> bool {
             | "update"
             | "compact"
             | "clean"
-            | "watch"
-            | "watch-daemon"
             | "search-daemon"
-            | "list-watches"
-            | "watch-list"
-            | "unwatch"
-            | "watch-log"
             | "install"
             | "install-skills"
-            | "install-agents"
             | "status"
             | "version"
+            | "projects"
+            | "stop"
+            | "project-log"
     )
 }
 
@@ -514,17 +502,20 @@ fn short_option_with_attached_value(arg: &str) -> bool {
 fn find_project_root(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
-        .find(|ancestor| {
-            index_path(ancestor).is_file()
-                || ancestor.join(INDEX_DIR).is_dir()
-                || ancestor.join(PROJECT_FILE).is_file()
-        })
+        .find(|ancestor| index_path(ancestor).is_file() || ancestor.join(PROJECT_FILE).is_file())
         .map(Path::to_path_buf)
 }
 
 fn handle_missing_project(args: &[String]) -> Result<i32, String> {
+    let cwd = env::current_dir().map_err(|err| err.to_string())?;
+    if agent_auto_project_mode() {
+        eprintln!(
+            "is: no IndexSearch project found above {}; auto-create failed",
+            display_path(&cwd)
+        );
+        return Ok(2);
+    }
     if io::stdin().is_terminal() && io::stderr().is_terminal() {
-        let cwd = env::current_dir().map_err(|err| err.to_string())?;
         eprint!(
             "is: no IndexSearch project found above {}. Create one here? [Y/n] ",
             display_path(&cwd)
@@ -535,7 +526,7 @@ fn handle_missing_project(args: &[String]) -> Result<i32, String> {
             match answer.trim() {
                 "" | "y" | "Y" | "yes" | "YES" => {
                     let mut profile = FrontendProfile::default();
-                    let (root, _, _) = ensure_watch(&cwd, &mut profile)?;
+                    let (root, _) = ensure_project_service(&cwd, &mut profile)?;
                     if index_path(&root).is_file() {
                         return run(args);
                     }
@@ -547,55 +538,72 @@ fn handle_missing_project(args: &[String]) -> Result<i32, String> {
         }
     }
     eprintln!(
-        "is: no IndexSearch project found; run `indexsearch index .` or `is watch .` at the project root"
+        "is: no IndexSearch project found; run `is index .` at the project root"
     );
     Ok(2)
 }
 
-fn ensure_watch(
-    root: &Path,
-    profile: &mut FrontendProfile,
-) -> Result<(PathBuf, Option<DaemonRecord>, bool), String> {
-    let covering_timer = Instant::now();
-    if let Some(covering_root) = watch_covering_root(root) {
-        profile.record("frontend_watch_covering_root", covering_timer);
-        let ready_timer = Instant::now();
-        if let Some(record) = ready_watch_record(&covering_root) {
-            profile.record("frontend_ready_watch_record", ready_timer);
-            return Ok((covering_root, Some(record), false));
-        }
-        profile.record("frontend_ready_watch_record", ready_timer);
-        let stop_timer = Instant::now();
-        stop_watch_for_root(&covering_root);
-        profile.record("frontend_stop_stale_watch", stop_timer);
-    } else {
-        profile.record("frontend_watch_covering_root", covering_timer);
+fn agent_auto_project_mode() -> bool {
+    if env::var_os("INDEXSEARCH_NO_AGENT_AUTO_PROJECT").is_some() {
+        return false;
     }
-    let start_timer = Instant::now();
-    start_watch(root)?;
-    profile.record("frontend_start_watch", start_timer);
-    let covering_root = watch_covering_root(root).unwrap_or_else(|| root.to_path_buf());
-    let wait_timer = Instant::now();
-    let ready_record = wait_for_ready_watch_record(&covering_root, Duration::from_secs(2));
-    profile.record("frontend_wait_watch_record", wait_timer);
-    Ok((
-        covering_root,
-        ready_record,
-        true,
-    ))
+    env::var_os("INDEXSEARCH_AGENT_AUTO_PROJECT").is_some()
+        || !(io::stdin().is_terminal() && io::stderr().is_terminal())
 }
 
-fn ready_watch_record(root: &Path) -> Option<DaemonRecord> {
+fn agent_auto_project_root(paths: &[SearchPathArg]) -> Result<PathBuf, String> {
+    let cwd = env::current_dir().map_err(|err| err.to_string())?;
+    if paths.len() == 1 {
+        let path = &paths[0];
+        if path.arg_index.is_some() && !path.abs.starts_with(&cwd) {
+            if path.abs.is_file() {
+                return Ok(path
+                    .abs
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| path.abs.clone()));
+            }
+            return Ok(path.abs.clone());
+        }
+    }
+    Ok(cwd)
+}
+
+fn ensure_project_service(
+    root: &Path,
+    profile: &mut FrontendProfile,
+) -> Result<(PathBuf, Option<DaemonRecord>), String> {
+    let ready_timer = Instant::now();
+    if let Some(record) = ready_project_record(root) {
+        profile.record("frontend_ready_project_record", ready_timer);
+        return Ok((root.to_path_buf(), Some(record)));
+    }
+    profile.record("frontend_ready_project_record", ready_timer);
+
+    let stop_timer = Instant::now();
+    stop_project_service_for_root(root);
+    profile.record("frontend_stop_stale_project_service", stop_timer);
+
+    let start_timer = Instant::now();
+    start_project_service(root)?;
+    profile.record("frontend_start_project_service", start_timer);
+    let wait_timer = Instant::now();
+    let ready_record = wait_for_ready_project_record(root, START_TIMEOUT);
+    profile.record("frontend_wait_project_record", wait_timer);
+    Ok((root.to_path_buf(), ready_record))
+}
+
+fn ready_project_record(root: &Path) -> Option<DaemonRecord> {
     if !index_path(root).is_file() {
         return None;
     }
     read_valid_record(root)
 }
 
-fn wait_for_ready_watch_record(root: &Path, timeout: Duration) -> Option<DaemonRecord> {
+fn wait_for_ready_project_record(root: &Path, timeout: Duration) -> Option<DaemonRecord> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(record) = ready_watch_record(root) {
+        if let Some(record) = ready_project_record(root) {
             return Some(record);
         }
         if Instant::now() >= deadline {
@@ -605,18 +613,18 @@ fn wait_for_ready_watch_record(root: &Path, timeout: Duration) -> Option<DaemonR
     }
 }
 
-fn stop_watch_for_root(root: &Path) {
+fn stop_project_service_for_root(root: &Path) {
     let requested_root = normalized_existing_path(root);
-    let registry = watch_registry_dir();
+    let registry = project_registry_dir();
     let Ok(entries) = fs::read_dir(registry) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "watch") {
+        if !path.extension().is_some_and(|ext| ext == "project") {
             continue;
         }
-        let Ok(record) = read_watch_record(&path) else {
+        let Ok(record) = read_project_record(&path) else {
             let _ = fs::remove_file(path);
             continue;
         };
@@ -629,166 +637,17 @@ fn stop_watch_for_root(root: &Path) {
     }
 }
 
-fn watch_covering_root(root: &Path) -> Option<PathBuf> {
-    let requested_root = normalized_existing_path(root);
-    let registry = watch_registry_dir();
-    let entries = fs::read_dir(registry).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.extension().is_some_and(|ext| ext == "watch") {
-            continue;
-        }
-        let Ok(record) = read_watch_record(&path) else {
-            let _ = fs::remove_file(path);
-            continue;
-        };
-        if !process_alive(record.pid) {
-            let _ = fs::remove_file(path);
-            continue;
-        }
-        let record_root = normalized_existing_path(&record.root);
-        if path_is_ancestor(&record_root, &requested_root) {
-            return Some(record.root);
-        }
-    }
-    None
-}
-
-struct ProgressLine {
-    done: Arc<AtomicBool>,
-    started: Instant,
-    handle: Option<std::thread::JoinHandle<()>>,
-}
-
-impl ProgressLine {
-    fn start(label: &'static str) -> Self {
-        if !stderr_supports_progress() {
-            return Self {
-                done: Arc::new(AtomicBool::new(true)),
-                started: Instant::now(),
-                handle: None,
-            };
-        }
-        let done = Arc::new(AtomicBool::new(false));
-        let thread_done = Arc::clone(&done);
-        let started = Instant::now();
-        let handle = std::thread::spawn(move || {
-            let frames = ["|", "/", "-", "\\"];
-            let width = 28usize;
-            let mut tick = 0usize;
-            while !thread_done.load(AtomicOrdering::Relaxed) {
-                eprint!(
-                    "\r  {} {:<18} {} {:>5.1}s",
-                    color_progress(frames[tick % frames.len()]),
-                    label,
-                    progress_bar(tick, width),
-                    started.elapsed().as_secs_f32()
-                );
-                let _ = io::stderr().flush();
-                tick = tick.wrapping_add(1);
-                std::thread::sleep(Duration::from_millis(80));
-            }
-            clear_progress_line();
-        });
-        Self {
-            done,
-            started,
-            handle: Some(handle),
-        }
-    }
-
-    fn finish(mut self, label: &str) {
-        self.stop();
-        if stderr_supports_progress() {
-            eprintln!(
-                "│");
-            eprintln!(
-                "{} {} — done ({:.1}s)",
-                color_success("◆"),
-                label,
-                self.started.elapsed().as_secs_f32()
-            );
-        }
-    }
-
-    fn stop(&mut self) {
-        if self.handle.is_some() {
-            self.done.store(true, AtomicOrdering::Relaxed);
-            if let Some(handle) = self.handle.take() {
-                let _ = handle.join();
-            }
-        }
-    }
-}
-
-impl Drop for ProgressLine {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-fn progress_bar(tick: usize, width: usize) -> String {
-    let span = 6usize.min(width);
-    let max_pos = width.saturating_sub(span).max(1);
-    let pos = tick % (max_pos + 1);
-    let mut out = String::with_capacity(width + 2);
-    out.push('[');
-    for idx in 0..width {
-        let ch = if idx >= pos && idx < pos + span {
-            '#'
-        } else if idx < pos {
-            '='
-        } else {
-            '.'
-        };
-        out.push(ch);
-    }
-    out.push(']');
-    out
-}
-
 fn stderr_supports_progress() -> bool {
     io::stderr().is_terminal()
         && env::var("TERM").map(|term| term != "dumb").unwrap_or(true)
         && env::var_os("INDEXSEARCH_NO_PROGRESS").is_none()
 }
 
-fn clear_progress_line() {
-    eprint!("\r{}\r", " ".repeat(80));
-    let _ = io::stderr().flush();
-}
-
-fn color_progress(text: &str) -> String {
-    if stderr_supports_color() {
-        format!("\x1b[1;33m{text}\x1b[0m")
-    } else {
-        text.to_string()
-    }
-}
-
-fn color_success(text: &str) -> String {
-    if stderr_supports_color() {
-        format!("\x1b[1;32m{text}\x1b[0m")
-    } else {
-        text.to_string()
-    }
-}
-
-fn stderr_supports_color() -> bool {
-    if env::var_os("NO_COLOR").is_some() {
-        return false;
-    }
-    if env::var("CLICOLOR_FORCE").is_ok_and(|value| value != "0") {
-        return true;
-    }
-    io::stderr().is_terminal() && stdout_supports_ansi()
-}
-
-fn start_watch(root: &Path) -> Result<(), String> {
+fn start_project_service(root: &Path) -> Result<(), String> {
     let backend = backend_path()?;
-    let show_progress = stderr_supports_progress() && !index_path(root).is_file();
+    let show_progress = stderr_supports_progress();
     let mut command = Command::new(backend);
-    command.arg("watch");
+    command.arg("search-daemon").arg("--detach");
     command.arg(root).stdin(Stdio::null()).stdout(Stdio::null());
     if show_progress {
         command.stderr(Stdio::inherit());
@@ -801,7 +660,7 @@ fn start_watch(root: &Path) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "failed to start watcher for {}",
+            "failed to start project service for {}",
             display_path(root)
         ))
     }
@@ -1030,39 +889,6 @@ fn windows_direct_stdout_enabled() -> bool {
     )
 }
 
-fn start_daemon(root: &Path) -> Result<(), String> {
-    let backend = backend_path()?;
-    let progress = ProgressLine::start("Starting service");
-    #[cfg(windows)]
-    {
-        let args = vec![
-            std::ffi::OsString::from("search-daemon"),
-            std::ffi::OsString::from("--watch"),
-            std::ffi::OsString::from("--detach"),
-            root.as_os_str().to_os_string(),
-        ];
-        spawn_detached_no_inherit(&backend, &args).map_err(|err| err.to_string())?;
-        progress.finish("Project service started");
-        return Ok(());
-    }
-    #[cfg(not(windows))]
-    {
-    let mut command = Command::new(backend);
-    command
-        .arg("search-daemon")
-        .arg("--watch")
-        .arg("--detach")
-        .arg(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    detach_background(&mut command);
-    command.spawn().map_err(|err| err.to_string())?;
-    progress.finish("Project service started");
-    Ok(())
-    }
-}
-
 fn run_backend(args: &[String]) -> Result<i32, String> {
     run_backend_owned(args.iter().map(String::as_str))
 }
@@ -1152,30 +978,6 @@ fn clean_path_string(path: &str) -> String {
     path.to_string()
 }
 
-#[cfg(unix)]
-fn detach_background(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    unsafe {
-        command.pre_exec(|| {
-            libc_setsid();
-            Ok(())
-        });
-    }
-}
-
-#[cfg(unix)]
-fn libc_setsid() {
-    unsafe extern "C" {
-        fn setsid() -> i32;
-    }
-    unsafe {
-        let _ = setsid();
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn detach_background(_command: &mut Command) {}
-
 fn index_path(root: &Path) -> PathBuf {
     root.join(INDEX_DIR).join(INDEX_FILE)
 }
@@ -1184,21 +986,17 @@ fn record_path(root: &Path) -> PathBuf {
     root.join(INDEX_DIR).join(SEARCH_DAEMON_FILE)
 }
 
-fn watch_registry_dir() -> PathBuf {
+fn project_registry_dir() -> PathBuf {
     env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".indexsearch")
-        .join(WATCH_DIR)
+        .join(PROJECTS_DIR)
 }
 
 fn normalized_existing_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-fn path_is_ancestor(parent: &Path, child: &Path) -> bool {
-    child == parent || child.starts_with(parent)
 }
 
 #[derive(Default)]
@@ -1250,14 +1048,14 @@ fn read_record(path: &Path) -> Result<DaemonRecord, String> {
 }
 
 #[derive(Default)]
-struct WatchRecord {
+struct ProjectRecord {
     pid: u32,
     root: PathBuf,
 }
 
-fn read_watch_record(path: &Path) -> Result<WatchRecord, String> {
+fn read_project_record(path: &Path) -> Result<ProjectRecord, String> {
     let text = fs::read_to_string(path).map_err(|err| err.to_string())?;
-    let mut record = WatchRecord::default();
+    let mut record = ProjectRecord::default();
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -1269,34 +1067,9 @@ fn read_watch_record(path: &Path) -> Result<WatchRecord, String> {
         }
     }
     if record.pid == 0 || record.root.as_os_str().is_empty() {
-        return Err("invalid watch record".to_string());
+        return Err("invalid project record".to_string());
     }
     Ok(record)
-}
-
-fn process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        unsafe { libc::kill(pid as i32, 0) == 0 }
-    }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-        use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
-
-        unsafe {
-            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if process.is_null() {
-                return false;
-            }
-            let mut code = 0u32;
-            let ok = GetExitCodeProcess(process, &mut code);
-            CloseHandle(process);
-            ok != 0 && code == STILL_ACTIVE as u32
-        }
-    }
 }
 
 fn stop_process(pid: u32) {
@@ -1345,85 +1118,6 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
     let mut bytes = [0u8; 8];
     reader.read_exact(&mut bytes)?;
     Ok(u64::from_le_bytes(bytes))
-}
-
-#[cfg(windows)]
-fn spawn_detached_no_inherit(exe: &Path, args: &[std::ffi::OsString]) -> io::Result<u32> {
-    use std::mem;
-    use std::os::windows::ffi::OsStrExt;
-    use std::ptr;
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{
-        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CreateProcessW, DETACHED_PROCESS,
-        PROCESS_INFORMATION, STARTUPINFOW,
-    };
-
-    let mut command_line = Vec::new();
-    append_windows_arg(&mut command_line, exe.as_os_str());
-    for arg in args {
-        command_line.push(b' ' as u16);
-        append_windows_arg(&mut command_line, arg.as_os_str());
-    }
-    command_line.push(0);
-
-    let mut exe_wide: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
-    let mut startup: STARTUPINFOW = unsafe { mem::zeroed() };
-    startup.cb = mem::size_of::<STARTUPINFOW>() as u32;
-    let mut process_info: PROCESS_INFORMATION = unsafe { mem::zeroed() };
-    let ok = unsafe {
-        CreateProcessW(
-            exe_wide.as_mut_ptr(),
-            command_line.as_mut_ptr(),
-            ptr::null(),
-            ptr::null(),
-            0,
-            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
-            ptr::null(),
-            ptr::null(),
-            &startup,
-            &mut process_info,
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let pid = process_info.dwProcessId;
-    unsafe {
-        CloseHandle(process_info.hThread);
-        CloseHandle(process_info.hProcess);
-    }
-    Ok(pid)
-}
-
-#[cfg(windows)]
-fn append_windows_arg(out: &mut Vec<u16>, arg: &std::ffi::OsStr) {
-    use std::os::windows::ffi::OsStrExt;
-    let units: Vec<u16> = arg.encode_wide().collect();
-    let needs_quotes = units.is_empty()
-        || units
-            .iter()
-            .any(|&ch| ch == b' ' as u16 || ch == b'\t' as u16 || ch == b'"' as u16);
-    if !needs_quotes {
-        out.extend_from_slice(&units);
-        return;
-    }
-    out.push(b'"' as u16);
-    let mut backslashes = 0usize;
-    for ch in units {
-        if ch == b'\\' as u16 {
-            backslashes += 1;
-        } else if ch == b'"' as u16 {
-            out.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2 + 1));
-            out.push(ch);
-            backslashes = 0;
-        } else {
-            out.extend(std::iter::repeat_n(b'\\' as u16, backslashes));
-            backslashes = 0;
-            out.push(ch);
-        }
-    }
-    out.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2));
-    out.push(b'"' as u16);
 }
 
 fn mtime_ns(meta: &fs::Metadata) -> i64 {
