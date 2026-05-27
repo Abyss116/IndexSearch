@@ -10,6 +10,8 @@ use std::os::unix::net::UnixStream;
 use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
 
 const INDEX_DIR: &str = ".indexsearch";
@@ -360,8 +362,141 @@ fn watch_covering_root(root: &Path) -> Option<PathBuf> {
     None
 }
 
+struct ProgressLine {
+    done: Arc<AtomicBool>,
+    started: Instant,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProgressLine {
+    fn start(label: &'static str) -> Self {
+        if !stderr_supports_progress() {
+            return Self {
+                done: Arc::new(AtomicBool::new(true)),
+                started: Instant::now(),
+                handle: None,
+            };
+        }
+        let done = Arc::new(AtomicBool::new(false));
+        let thread_done = Arc::clone(&done);
+        let started = Instant::now();
+        let handle = std::thread::spawn(move || {
+            let frames = ["|", "/", "-", "\\"];
+            let width = 28usize;
+            let mut tick = 0usize;
+            while !thread_done.load(AtomicOrdering::Relaxed) {
+                eprint!(
+                    "\r  {} {:<18} {} {:>5.1}s",
+                    color_progress(frames[tick % frames.len()]),
+                    label,
+                    progress_bar(tick, width),
+                    started.elapsed().as_secs_f32()
+                );
+                let _ = io::stderr().flush();
+                tick = tick.wrapping_add(1);
+                std::thread::sleep(Duration::from_millis(80));
+            }
+            clear_progress_line();
+        });
+        Self {
+            done,
+            started,
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(mut self, label: &str) {
+        self.stop();
+        if stderr_supports_progress() {
+            eprintln!(
+                "  {} {} in {:.1}s",
+                color_success("ok"),
+                label,
+                self.started.elapsed().as_secs_f32()
+            );
+        }
+    }
+
+    fn stop(&mut self) {
+        if self.handle.is_some() {
+            self.done.store(true, AtomicOrdering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+impl Drop for ProgressLine {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn progress_bar(tick: usize, width: usize) -> String {
+    let span = 6usize.min(width);
+    let max_pos = width.saturating_sub(span).max(1);
+    let pos = tick % (max_pos + 1);
+    let mut out = String::with_capacity(width + 2);
+    out.push('[');
+    for idx in 0..width {
+        let ch = if idx >= pos && idx < pos + span {
+            '#'
+        } else if idx < pos {
+            '='
+        } else {
+            '.'
+        };
+        out.push(ch);
+    }
+    out.push(']');
+    out
+}
+
+fn stderr_supports_progress() -> bool {
+    io::stderr().is_terminal()
+        && env::var("TERM").map(|term| term != "dumb").unwrap_or(true)
+        && env::var_os("INDEXSEARCH_NO_PROGRESS").is_none()
+}
+
+fn clear_progress_line() {
+    eprint!("\r{}\r", " ".repeat(80));
+    let _ = io::stderr().flush();
+}
+
+fn color_progress(text: &str) -> String {
+    if stderr_supports_color() {
+        format!("\x1b[1;33m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn color_success(text: &str) -> String {
+    if stderr_supports_color() {
+        format!("\x1b[1;32m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn stderr_supports_color() -> bool {
+    if env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if env::var("CLICOLOR_FORCE").is_ok_and(|value| value != "0") {
+        return true;
+    }
+    io::stderr().is_terminal() && stdout_supports_ansi()
+}
+
 fn start_watch(root: &Path) -> Result<(), String> {
     let backend = backend_path()?;
+    let progress = ProgressLine::start(if index_path(root).is_file() {
+        "Starting service"
+    } else {
+        "Indexing project"
+    });
     let status = Command::new(backend)
         .arg("watch")
         .arg(root)
@@ -371,6 +506,7 @@ fn start_watch(root: &Path) -> Result<(), String> {
         .status()
         .map_err(|err| err.to_string())?;
     if status.success() {
+        progress.finish("Project service ready");
         Ok(())
     } else {
         Err(format!(

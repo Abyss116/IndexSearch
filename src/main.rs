@@ -15,9 +15,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
@@ -1133,11 +1133,157 @@ fn stdout_supports_search_decoration() -> bool {
     std::io::stdout().is_terminal() && env::var("TERM").map(|term| term != "dumb").unwrap_or(true)
 }
 
+struct ProgressLine {
+    done: Arc<AtomicBool>,
+    label: Arc<Mutex<String>>,
+    started: Instant,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ProgressLine {
+    fn start(label: &str) -> Self {
+        if !stderr_supports_progress() {
+            return Self {
+                done: Arc::new(AtomicBool::new(true)),
+                label: Arc::new(Mutex::new(label.to_string())),
+                started: Instant::now(),
+                handle: None,
+            };
+        }
+        let done = Arc::new(AtomicBool::new(false));
+        let label = Arc::new(Mutex::new(label.to_string()));
+        let thread_done = Arc::clone(&done);
+        let thread_label = Arc::clone(&label);
+        let started = Instant::now();
+        let handle = std::thread::spawn(move || {
+            let frames = ["|", "/", "-", "\\"];
+            let width = 28usize;
+            let mut tick = 0usize;
+            while !thread_done.load(AtomicOrdering::Relaxed) {
+                let text = thread_label
+                    .lock()
+                    .map(|label| label.clone())
+                    .unwrap_or_else(|_| "Working".to_string());
+                let bar = progress_bar(tick, width);
+                let elapsed = started.elapsed().as_secs_f32();
+                eprint!(
+                    "\r  {} {:<18} {} {:>5.1}s",
+                    color_progress(frames[tick % frames.len()]),
+                    text,
+                    bar,
+                    elapsed
+                );
+                let _ = std::io::stderr().flush();
+                tick = tick.wrapping_add(1);
+                std::thread::sleep(Duration::from_millis(80));
+            }
+            clear_progress_line();
+        });
+        Self {
+            done,
+            label,
+            started,
+            handle: Some(handle),
+        }
+    }
+
+    fn update(&self, label: &str) {
+        if let Ok(mut text) = self.label.lock() {
+            *text = label.to_string();
+        }
+    }
+
+    fn finish(mut self, label: &str) {
+        self.stop();
+        if stderr_supports_progress() {
+            eprintln!(
+                "  {} {} in {:.1}s",
+                color_success("ok"),
+                label,
+                self.started.elapsed().as_secs_f32()
+            );
+        }
+    }
+
+    fn stop(&mut self) {
+        if self.handle.is_some() {
+            self.done.store(true, AtomicOrdering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+impl Drop for ProgressLine {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn progress_bar(tick: usize, width: usize) -> String {
+    let span = 6usize.min(width);
+    let max_pos = width.saturating_sub(span).max(1);
+    let pos = tick % (max_pos + 1);
+    let mut out = String::with_capacity(width + 2);
+    out.push('[');
+    for idx in 0..width {
+        let ch = if idx >= pos && idx < pos + span {
+            '#'
+        } else if idx < pos {
+            '='
+        } else {
+            '.'
+        };
+        out.push(ch);
+    }
+    out.push(']');
+    out
+}
+
+fn stderr_supports_progress() -> bool {
+    std::io::stderr().is_terminal()
+        && env::var("TERM").map(|term| term != "dumb").unwrap_or(true)
+        && env::var_os("INDEXSEARCH_NO_PROGRESS").is_none()
+}
+
+fn clear_progress_line() {
+    eprint!("\r{}\r", " ".repeat(80));
+    let _ = std::io::stderr().flush();
+}
+
+fn color_progress(text: &str) -> String {
+    if stderr_supports_color() {
+        format!("\x1b[1;33m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn color_success(text: &str) -> String {
+    if stderr_supports_color() {
+        format!("\x1b[1;32m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn stderr_supports_color() -> bool {
+    if env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if env::var("CLICOLOR_FORCE").is_ok_and(|value| value != "0") {
+        return true;
+    }
+    std::io::stderr().is_terminal() && stdout_supports_ansi()
+}
+
 fn command_index(args: &[String]) -> Result<i32> {
     let (options, start) = parse_index_args(args)?;
     let cfg = load_or_create_config(&start)?;
     let _lock = acquire_exclusive_lock(&cfg.root)?;
     let timer = Instant::now();
+    let progress = ProgressLine::start("Indexing code");
     let mut timings = Timings::default();
     let mut scanned = 0;
     let mut skipped = 0;
@@ -1154,6 +1300,7 @@ fn command_index(args: &[String]) -> Result<i32> {
     save_index_state(&cfg.root)?;
     timings.write += write_timer.elapsed().as_secs_f64();
     let elapsed = timer.elapsed().as_secs_f64();
+    progress.finish("Indexed code");
     println!(
         "indexed {} files ({} skipped, {} scanned) in {:.3}s",
         index.files.len(),
@@ -1173,6 +1320,7 @@ fn command_update(args: &[String]) -> Result<i32> {
     let _lock = acquire_exclusive_lock(&cfg.root)?;
     let path = index_path(&cfg.root);
     let timer = Instant::now();
+    let progress = ProgressLine::start("Updating index");
     let mut timings = Timings::default();
     let mut scanned = 0;
     let mut skipped = 0;
@@ -1186,6 +1334,7 @@ fn command_update(args: &[String]) -> Result<i32> {
                 timings.git += git_timer.elapsed().as_secs_f64();
                 match changes {
                     Some(changes) if changes.is_empty() => {
+                        progress.finish("Index already current");
                         println!(
                             "updated {} files (0 changed by git) in {:.3}s",
                             old_index.file_count,
@@ -1213,6 +1362,7 @@ fn command_update(args: &[String]) -> Result<i32> {
                         timings.write += write_timer.elapsed().as_secs_f64();
                         let elapsed = timer.elapsed().as_secs_f64();
                         let visible_count = stats.reused + stats.updated + stats.added;
+                        progress.finish("Updated index");
                         println!(
                             "updated {} files ({} reused, {} added, {} modified, {} removed, {} skipped, {} scanned) in {:.3}s",
                             visible_count,
@@ -1237,13 +1387,22 @@ fn command_update(args: &[String]) -> Result<i32> {
                             &path,
                             &timer,
                             &mut timings,
+                            progress,
                         );
                     }
                 }
             } else {
-                return update_from_filesystem_scan(&cfg, &options, &path, &timer, &mut timings);
+                return update_from_filesystem_scan(
+                    &cfg,
+                    &options,
+                    &path,
+                    &timer,
+                    &mut timings,
+                    progress,
+                );
             }
         } else {
+            progress.update("Rebuilding index");
             build_index(
                 &cfg,
                 &options,
@@ -1268,6 +1427,7 @@ fn command_update(args: &[String]) -> Result<i32> {
     save_index_state(&cfg.root)?;
     timings.write += write_timer.elapsed().as_secs_f64();
     let elapsed = timer.elapsed().as_secs_f64();
+    progress.finish("Indexed code");
     println!(
         "indexed {} files ({} skipped, {} scanned) in {:.3}s",
         index.files.len(),
@@ -1287,6 +1447,7 @@ fn update_from_filesystem_scan(
     path: &Path,
     timer: &Instant,
     timings: &mut Timings,
+    progress: ProgressLine,
 ) -> Result<i32> {
     let mut scanned = 0;
     let mut skipped = 0;
@@ -1296,6 +1457,7 @@ fn update_from_filesystem_scan(
     if changes.is_empty() {
         save_index_state(&cfg.root)?;
         let elapsed = timer.elapsed().as_secs_f64();
+        progress.finish("Index already current");
         println!(
             "updated {} files ({} reused, 0 added, 0 modified, 0 removed, {} skipped, {} scanned) in {:.3}s",
             visible_before, visible_before, skipped, scanned, elapsed
@@ -1332,6 +1494,7 @@ fn update_from_filesystem_scan(
 
     let elapsed = timer.elapsed().as_secs_f64();
     let visible_count = stats.reused + stats.updated + stats.added;
+    progress.finish("Updated index");
     println!(
         "updated {} files ({} reused, {} added, {} modified, {} removed, {} skipped, {} scanned) in {:.3}s",
         visible_count,
@@ -1497,6 +1660,7 @@ fn sync_index_before_watch(cfg: &ProjectConfig) -> Result<()> {
     };
     let path = index_path(&cfg.root);
     let timer = Instant::now();
+    let progress = ProgressLine::start("Preparing index");
     let mut timings = Timings::default();
     let mut scanned = 0;
     let mut skipped = 0;
@@ -1530,10 +1694,12 @@ fn sync_index_before_watch(cfg: &ProjectConfig) -> Result<()> {
                 timing_summary(&timings)
             ),
         )?;
+        progress.finish("Indexed code");
         return Ok(());
     }
     drop(loaded);
 
+    progress.update("Checking changes");
     let (changes, visible_before) =
         collect_filesystem_changes(cfg, &options, &mut scanned, &mut skipped, &mut timings)?;
     if changes.is_empty() {
@@ -1550,9 +1716,11 @@ fn sync_index_before_watch(cfg: &ProjectConfig) -> Result<()> {
                 timing_summary(&timings)
             ),
         )?;
+        progress.finish("Index already current");
         return Ok(());
     }
 
+    progress.update("Updating index");
     let process_timer = Instant::now();
     let mut changed_scanned = 0;
     let mut changed_skipped = 0;
@@ -1588,6 +1756,7 @@ fn sync_index_before_watch(cfg: &ProjectConfig) -> Result<()> {
             timing_summary(&timings)
         ),
     )?;
+    progress.finish("Updated index");
     Ok(())
 }
 
@@ -2433,6 +2602,7 @@ fn command_compact(args: &[String]) -> Result<i32> {
     let cfg = load_config(&start)?;
     let _lock = acquire_exclusive_lock(&cfg.root)?;
     let timer = Instant::now();
+    let progress = ProgressLine::start("Compacting index");
     let mut timings = Timings::default();
     let path = index_path(&cfg.root);
     let base = MappedIndex::open(&path)?;
@@ -2445,6 +2615,7 @@ fn command_compact(args: &[String]) -> Result<i32> {
     }
     let deltas = load_deltas(&cfg.root)?;
     if deltas.is_empty() {
+        progress.finish("No deltas to compact");
         println!(
             "compacted 0 delta indexes in {:.3}s",
             timer.elapsed().as_secs_f64()
@@ -2464,6 +2635,7 @@ fn command_compact(args: &[String]) -> Result<i32> {
     retire_delta_dir(&cfg.root)?;
     save_index_state(&cfg.root)?;
     timings.write += write_timer.elapsed().as_secs_f64();
+    progress.finish("Compacted index");
     println!(
         "compacted {} files into base index in {:.3}s",
         compacted.files.len(),

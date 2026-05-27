@@ -97,7 +97,7 @@ Get-Process is-daemon -ErrorAction SilentlyContinue | Stop-Process -Force
 ```
 
 Newer releases also write a versioned backend such as
-`is-daemon-0.3.19.exe`, so a locked old backend no longer prevents installing
+`is-daemon-0.3.20.exe`, so a locked old backend no longer prevents installing
 the new frontend.
 
 ## Quick Start
@@ -464,6 +464,9 @@ like `rg PATTERN`. If the pattern is also an IndexSearch command name such as
 `is clean [PATH]` stops any matching project service found on the parent path
 chain and removes `.indexsearch/`, including deltas and logs. It keeps
 `index-search-project.txt`. Pass `--yes` for non-interactive cleanup.
+
+Interactive indexing, update, compaction, and first-search service startup show
+a live progress line on stderr. Set `INDEXSEARCH_NO_PROGRESS=1` to disable it.
 
 ## License
 
