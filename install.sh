@@ -25,6 +25,15 @@ curl -fsSL "$url" -o "$tmp/$asset"
 tar -xzf "$tmp/$asset" -C "$tmp"
 
 payload="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d -name 'indexsearch-*' | head -n 1)"
+if [ -z "$payload" ] && [ -x "$tmp/indexsearch" ]; then
+  payload="$tmp"
+fi
+if [ -z "$payload" ]; then
+  exe="$(find "$tmp" -type f -name indexsearch -perm -111 | head -n 1)"
+  if [ -n "$exe" ]; then
+    payload="$(dirname "$exe")"
+  fi
+fi
 if [ -z "$payload" ]; then
   echo "archive layout changed" >&2
   exit 1

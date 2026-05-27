@@ -21,13 +21,24 @@ try {
     Write-Host "downloading $Url"
     Invoke-WebRequest -Uri $Url -OutFile $Archive
     Expand-Archive -Path $Archive -DestinationPath $Temp -Force
+    $PayloadDir = $null
     $Payload = Get-ChildItem -Path $Temp -Directory -Filter "indexsearch-*" | Select-Object -First 1
-    if (-not $Payload) {
+    if ($Payload) {
+        $PayloadDir = $Payload.FullName
+    } elseif (Test-Path (Join-Path $Temp "indexsearch.exe")) {
+        $PayloadDir = $Temp
+    } else {
+        $Exe = Get-ChildItem -Path $Temp -Recurse -File -Filter "indexsearch.exe" | Select-Object -First 1
+        if ($Exe) {
+            $PayloadDir = $Exe.DirectoryName
+        }
+    }
+    if (-not $PayloadDir) {
         throw "archive layout changed"
     }
 
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    & (Join-Path $Payload.FullName "indexsearch.exe") install --dir $InstallDir
+    & (Join-Path $PayloadDir "indexsearch.exe") install --dir $InstallDir
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }

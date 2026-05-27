@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "indexsearch"
-version = "0.3.22"
+version = "0.3.23"
 dependencies = [
  "aho-corasick",
  "anyhow",
