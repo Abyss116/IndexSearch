@@ -62,8 +62,9 @@ fn run(args: &[String]) -> Result<i32, String> {
     let Some(mut root) = find_project_root(&start) else {
         return handle_missing_project(args);
     };
-    root = ensure_watch(&root)?;
-    if let Some(record) = read_valid_record(&root) {
+    let ready_record;
+    (root, ready_record) = ensure_watch(&root)?;
+    if let Some(record) = ready_record.or_else(|| read_valid_record(&root)) {
         if let Ok(code) = request_daemon(&record, &daemon_args) {
             return Ok(code);
         }
@@ -312,7 +313,7 @@ fn handle_missing_project(args: &[String]) -> Result<i32, String> {
         if io::stdin().read_line(&mut answer).is_ok() {
             match answer.trim() {
                 "" | "y" | "Y" | "yes" | "YES" => {
-                    let root = ensure_watch(&cwd)?;
+                    let (root, _) = ensure_watch(&cwd)?;
                     if index_path(&root).is_file() {
                         return run(args);
                     }
@@ -329,19 +330,25 @@ fn handle_missing_project(args: &[String]) -> Result<i32, String> {
     Ok(2)
 }
 
-fn ensure_watch(root: &Path) -> Result<PathBuf, String> {
+fn ensure_watch(root: &Path) -> Result<(PathBuf, Option<DaemonRecord>), String> {
     if let Some(covering_root) = watch_covering_root(root) {
-        if watch_ready(&covering_root) {
-            return Ok(covering_root);
+        if let Some(record) = ready_watch_record(&covering_root) {
+            return Ok((covering_root, Some(record)));
         }
         stop_watch_for_root(&covering_root);
     }
     start_watch(root)?;
-    Ok(watch_covering_root(root).unwrap_or_else(|| root.to_path_buf()))
+    Ok((
+        watch_covering_root(root).unwrap_or_else(|| root.to_path_buf()),
+        None,
+    ))
 }
 
-fn watch_ready(root: &Path) -> bool {
-    index_path(root).is_file() && read_valid_record(root).is_some()
+fn ready_watch_record(root: &Path) -> Option<DaemonRecord> {
+    if !index_path(root).is_file() {
+        return None;
+    }
+    read_valid_record(root)
 }
 
 fn stop_watch_for_root(root: &Path) {
