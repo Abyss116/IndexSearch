@@ -32,8 +32,8 @@ irm https://raw.githubusercontent.com/Abyss116/IndexSearch/main/install.ps1 | ie
 ```
 
 These scripts download the latest GitHub Release, run `indexsearch install`,
-and install the same `indexsearch`, `is`, and `is-daemon` layout used by direct
-release archives. Re-running the command updates the local install.
+and install `indexsearch`, `is`, and `is-daemon` into the target bin directory.
+Re-running the command updates the local install.
 
 Homebrew:
 
@@ -66,8 +66,8 @@ into a user-writable bin directory:
 ./indexsearch install
 ```
 
-This self-copy install puts lightweight `indexsearch` and `is` frontends plus
-the full `is-daemon` backend into `~/.local/bin` on macOS/Linux or
+This self-copy install copies the full `is-daemon` backend and creates
+lightweight `indexsearch` and `is` frontends in `~/.local/bin` on macOS/Linux or
 `%USERPROFILE%\.local\bin` on Windows. Use `indexsearch install --dir PATH` to
 override the install directory. Package manager installs already put the three
 binaries on PATH and do not need this step. On Windows `is` is a native
@@ -97,7 +97,7 @@ Get-Process is-daemon -ErrorAction SilentlyContinue | Stop-Process -Force
 ```
 
 Newer releases also write a versioned backend such as
-`is-daemon-0.3.27.exe`, so a locked old backend no longer prevents installing
+`is-daemon-0.3.x.exe`, so a locked old backend no longer prevents installing
 the new frontend.
 
 ## Quick Start

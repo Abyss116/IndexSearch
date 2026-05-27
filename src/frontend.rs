@@ -110,7 +110,7 @@ fn run(args: &[String]) -> Result<i32, String> {
     profile.record("frontend_find_project_root", root_timer);
     let ready_record;
     let ensure_timer = Instant::now();
-    (root, ready_record) = ensure_watch(&root)?;
+    (root, ready_record) = ensure_watch(&root, &mut profile)?;
     profile.record("frontend_ensure_project_service", ensure_timer);
     let record_timer = Instant::now();
     if let Some(record) = ready_record.or_else(|| read_valid_record(&root)) {
@@ -375,7 +375,8 @@ fn handle_missing_project(args: &[String]) -> Result<i32, String> {
         if io::stdin().read_line(&mut answer).is_ok() {
             match answer.trim() {
                 "" | "y" | "Y" | "yes" | "YES" => {
-                    let (root, _) = ensure_watch(&cwd)?;
+                    let mut profile = FrontendProfile::default();
+                    let (root, _) = ensure_watch(&cwd, &mut profile)?;
                     if index_path(&root).is_file() {
                         return run(args);
                     }
@@ -392,14 +393,28 @@ fn handle_missing_project(args: &[String]) -> Result<i32, String> {
     Ok(2)
 }
 
-fn ensure_watch(root: &Path) -> Result<(PathBuf, Option<DaemonRecord>), String> {
+fn ensure_watch(
+    root: &Path,
+    profile: &mut FrontendProfile,
+) -> Result<(PathBuf, Option<DaemonRecord>), String> {
+    let covering_timer = Instant::now();
     if let Some(covering_root) = watch_covering_root(root) {
+        profile.record("frontend_watch_covering_root", covering_timer);
+        let ready_timer = Instant::now();
         if let Some(record) = ready_watch_record(&covering_root) {
+            profile.record("frontend_ready_watch_record", ready_timer);
             return Ok((covering_root, Some(record)));
         }
+        profile.record("frontend_ready_watch_record", ready_timer);
+        let stop_timer = Instant::now();
         stop_watch_for_root(&covering_root);
+        profile.record("frontend_stop_stale_watch", stop_timer);
+    } else {
+        profile.record("frontend_watch_covering_root", covering_timer);
     }
+    let start_timer = Instant::now();
     start_watch(root)?;
+    profile.record("frontend_start_watch", start_timer);
     Ok((
         watch_covering_root(root).unwrap_or_else(|| root.to_path_buf()),
         None,
@@ -839,6 +854,20 @@ fn windows_direct_stdout_enabled() -> bool {
 fn start_daemon(root: &Path) -> Result<(), String> {
     let backend = backend_path()?;
     let progress = ProgressLine::start("Starting service");
+    #[cfg(windows)]
+    {
+        let args = vec![
+            std::ffi::OsString::from("search-daemon"),
+            std::ffi::OsString::from("--watch"),
+            std::ffi::OsString::from("--detach"),
+            root.as_os_str().to_os_string(),
+        ];
+        spawn_detached_no_inherit(&backend, &args).map_err(|err| err.to_string())?;
+        progress.finish("Project service started");
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
     let mut command = Command::new(backend);
     command
         .arg("search-daemon")
@@ -852,6 +881,7 @@ fn start_daemon(root: &Path) -> Result<(), String> {
     command.spawn().map_err(|err| err.to_string())?;
     progress.finish("Project service started");
     Ok(())
+    }
 }
 
 fn run_backend(args: &[String]) -> Result<i32, String> {
@@ -948,12 +978,6 @@ fn libc_setsid() {
     unsafe {
         let _ = setsid();
     }
-}
-
-#[cfg(windows)]
-fn detach_background(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    command.creation_flags(0x0800_0000);
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1126,6 +1150,85 @@ fn read_u64(reader: &mut impl Read) -> io::Result<u64> {
     let mut bytes = [0u8; 8];
     reader.read_exact(&mut bytes)?;
     Ok(u64::from_le_bytes(bytes))
+}
+
+#[cfg(windows)]
+fn spawn_detached_no_inherit(exe: &Path, args: &[std::ffi::OsString]) -> io::Result<u32> {
+    use std::mem;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CreateProcessW, DETACHED_PROCESS,
+        PROCESS_INFORMATION, STARTUPINFOW,
+    };
+
+    let mut command_line = Vec::new();
+    append_windows_arg(&mut command_line, exe.as_os_str());
+    for arg in args {
+        command_line.push(b' ' as u16);
+        append_windows_arg(&mut command_line, arg.as_os_str());
+    }
+    command_line.push(0);
+
+    let mut exe_wide: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut startup: STARTUPINFOW = unsafe { mem::zeroed() };
+    startup.cb = mem::size_of::<STARTUPINFOW>() as u32;
+    let mut process_info: PROCESS_INFORMATION = unsafe { mem::zeroed() };
+    let ok = unsafe {
+        CreateProcessW(
+            exe_wide.as_mut_ptr(),
+            command_line.as_mut_ptr(),
+            ptr::null(),
+            ptr::null(),
+            0,
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+            ptr::null(),
+            ptr::null(),
+            &startup,
+            &mut process_info,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let pid = process_info.dwProcessId;
+    unsafe {
+        CloseHandle(process_info.hThread);
+        CloseHandle(process_info.hProcess);
+    }
+    Ok(pid)
+}
+
+#[cfg(windows)]
+fn append_windows_arg(out: &mut Vec<u16>, arg: &std::ffi::OsStr) {
+    use std::os::windows::ffi::OsStrExt;
+    let units: Vec<u16> = arg.encode_wide().collect();
+    let needs_quotes = units.is_empty()
+        || units
+            .iter()
+            .any(|&ch| ch == b' ' as u16 || ch == b'\t' as u16 || ch == b'"' as u16);
+    if !needs_quotes {
+        out.extend_from_slice(&units);
+        return;
+    }
+    out.push(b'"' as u16);
+    let mut backslashes = 0usize;
+    for ch in units {
+        if ch == b'\\' as u16 {
+            backslashes += 1;
+        } else if ch == b'"' as u16 {
+            out.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2 + 1));
+            out.push(ch);
+            backslashes = 0;
+        } else {
+            out.extend(std::iter::repeat_n(b'\\' as u16, backslashes));
+            backslashes = 0;
+            out.push(ch);
+        }
+    }
+    out.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2));
+    out.push(b'"' as u16);
 }
 
 fn mtime_ns(meta: &fs::Metadata) -> i64 {

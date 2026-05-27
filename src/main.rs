@@ -14,7 +14,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(not(windows))]
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -1847,26 +1849,45 @@ fn command_watch(args: &[String]) -> Result<i32> {
 
     let exe = env::current_exe()?;
     let progress = ProgressLine::start("Starting service");
-    let mut command = Command::new(exe);
-    command
-        .arg("search-daemon")
-        .arg("--watch")
-        .arg(&cfg.root)
-        .arg("--idle-seconds")
-        .arg(watch_options.idle_seconds.to_string())
-        .arg("--compact-delta-count")
-        .arg(watch_options.compact_delta_count.to_string())
-        .arg("--compact-delta-bytes")
-        .arg(watch_options.compact_delta_bytes.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    detach_background_command(&mut command);
-    let child = command.spawn()?;
+    #[cfg(windows)]
+    let child_pid = {
+        let args = vec![
+            std::ffi::OsString::from("search-daemon"),
+            std::ffi::OsString::from("--watch"),
+            cfg.root.as_os_str().to_os_string(),
+            std::ffi::OsString::from("--idle-seconds"),
+            std::ffi::OsString::from(watch_options.idle_seconds.to_string()),
+            std::ffi::OsString::from("--compact-delta-count"),
+            std::ffi::OsString::from(watch_options.compact_delta_count.to_string()),
+            std::ffi::OsString::from("--compact-delta-bytes"),
+            std::ffi::OsString::from(watch_options.compact_delta_bytes.to_string()),
+        ];
+        spawn_detached_no_inherit(&exe, &args)?
+    };
+    #[cfg(not(windows))]
+    let child_pid = {
+        let mut command = Command::new(exe);
+        command
+            .arg("search-daemon")
+            .arg("--watch")
+            .arg(&cfg.root)
+            .arg("--idle-seconds")
+            .arg(watch_options.idle_seconds.to_string())
+            .arg("--compact-delta-count")
+            .arg(watch_options.compact_delta_count.to_string())
+            .arg("--compact-delta-bytes")
+            .arg(watch_options.compact_delta_bytes.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        detach_background_command(&mut command);
+        let child = command.spawn()?;
+        child.id()
+    };
     let record = WatchRecord {
         id,
         root: cfg.root.clone(),
-        pid: child.id(),
+        pid: child_pid,
     };
     write_watch_record(&record)?;
     let start = Instant::now();
@@ -3565,18 +3586,32 @@ fn append_profile_events<W: Write>(out: &mut W, profile: &SearchProfile) -> Resu
 
 fn start_search_daemon(root: &Path) -> Result<()> {
     let exe = env::current_exe()?;
-    let mut command = Command::new(exe);
-    command
-        .arg("search-daemon")
-        .arg("--watch")
-        .arg("--detach")
-        .arg(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    detach_background_command(&mut command);
-    command.spawn()?;
-    Ok(())
+    #[cfg(windows)]
+    {
+        let args = vec![
+            std::ffi::OsString::from("search-daemon"),
+            std::ffi::OsString::from("--watch"),
+            std::ffi::OsString::from("--detach"),
+            root.as_os_str().to_os_string(),
+        ];
+        spawn_detached_no_inherit(&exe, &args)?;
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = Command::new(exe);
+        command
+            .arg("search-daemon")
+            .arg("--watch")
+            .arg("--detach")
+            .arg(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        detach_background_command(&mut command);
+        command.spawn()?;
+        Ok(())
+    }
 }
 
 fn command_search_daemon(args: &[String]) -> Result<i32> {
@@ -3922,6 +3957,7 @@ fn run_search_daemon(root: &Path, watch_options: Option<WatchOptions>) -> Result
     let index_meta = fs::metadata(index_path(root))?;
     let exe = env::current_exe()?;
     let exe_meta = fs::metadata(&exe)?;
+    let has_watch = watch_options.is_some();
     let listener = SearchDaemonListener::bind(root)?;
     let port = listener.port();
     let socket_path = listener.socket_path();
@@ -3939,6 +3975,14 @@ fn run_search_daemon(root: &Path, watch_options: Option<WatchOptions>) -> Result
         index_mtime: mtime_ns(&index_meta),
     };
     write_search_daemon_record(&record)?;
+    if has_watch {
+        let watch = WatchRecord {
+            id: watch_id(&record.root),
+            root: record.root.clone(),
+            pid: record.pid,
+        };
+        write_watch_record(&watch)?;
+    }
     let index = {
         let _lock = acquire_shared_lock(root)?;
         MappedIndex::open(&index_path(record.root.as_path()))?
@@ -3966,7 +4010,7 @@ fn run_search_daemon(root: &Path, watch_options: Option<WatchOptions>) -> Result
                     .downcast_ref::<std::io::Error>()
                     .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::WouldBlock)
                 {
-                    std::thread::sleep(Duration::from_millis(10));
+                    std::thread::sleep(Duration::from_millis(1));
                     continue;
                 }
                 return Err(err);
@@ -10211,10 +10255,20 @@ fn process_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}")])
-            .output()
-            .is_ok_and(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
+        };
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let alive = WaitForSingleObject(handle, 0) == WAIT_TIMEOUT;
+            CloseHandle(handle);
+            alive
+        }
     }
 }
 
@@ -10231,25 +10285,99 @@ fn stop_process(pid: u32) {
     }
 }
 
+#[cfg(unix)]
 fn detach_background_command(command: &mut Command) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn detach_background_command(_command: &mut Command) {}
+
+#[cfg(windows)]
+fn spawn_detached_no_inherit(exe: &Path, args: &[std::ffi::OsString]) -> std::io::Result<u32> {
+    use std::mem;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CreateProcessW, DETACHED_PROCESS,
+        PROCESS_INFORMATION, STARTUPINFOW,
+    };
+
+    let mut command_line = Vec::new();
+    append_windows_arg(&mut command_line, exe.as_os_str());
+    for arg in args {
+        command_line.push(b' ' as u16);
+        append_windows_arg(&mut command_line, arg.as_os_str());
+    }
+    command_line.push(0);
+
+    let mut exe_wide: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut startup: STARTUPINFOW = unsafe { mem::zeroed() };
+    startup.cb = mem::size_of::<STARTUPINFOW>() as u32;
+    let mut process_info: PROCESS_INFORMATION = unsafe { mem::zeroed() };
+    let ok = unsafe {
+        CreateProcessW(
+            exe_wide.as_mut_ptr(),
+            command_line.as_mut_ptr(),
+            ptr::null(),
+            ptr::null(),
+            0,
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+            ptr::null(),
+            ptr::null(),
+            &startup,
+            &mut process_info,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let pid = process_info.dwProcessId;
+    unsafe {
+        CloseHandle(process_info.hThread);
+        CloseHandle(process_info.hProcess);
+    }
+    Ok(pid)
+}
+
+#[cfg(windows)]
+fn append_windows_arg(out: &mut Vec<u16>, arg: &std::ffi::OsStr) {
+    use std::os::windows::ffi::OsStrExt;
+    let units: Vec<u16> = arg.encode_wide().collect();
+    let needs_quotes = units.is_empty()
+        || units
+            .iter()
+            .any(|&ch| ch == b' ' as u16 || ch == b'\t' as u16 || ch == b'"' as u16);
+    if !needs_quotes {
+        out.extend_from_slice(&units);
+        return;
+    }
+    out.push(b'"' as u16);
+    let mut backslashes = 0usize;
+    for ch in units {
+        if ch == b'\\' as u16 {
+            backslashes += 1;
+        } else if ch == b'"' as u16 {
+            out.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2 + 1));
+            out.push(ch);
+            backslashes = 0;
+        } else {
+            out.extend(std::iter::repeat_n(b'\\' as u16, backslashes));
+            backslashes = 0;
+            out.push(ch);
         }
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
-    }
+    out.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2));
+    out.push(b'"' as u16);
 }
 
 fn daemonize_current_process() -> Result<()> {

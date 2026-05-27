@@ -89,10 +89,8 @@ jobs:
           else
             cp "target/${{ matrix.target }}/release/is-daemon" "dist/${{ matrix.artifact }}/"
             cp "target/${{ matrix.target }}/release/indexsearch" "dist/${{ matrix.artifact }}/"
-            cp "target/${{ matrix.target }}/release/is" "dist/${{ matrix.artifact }}/"
             chmod +x "dist/${{ matrix.artifact }}/is-daemon"
             chmod +x "dist/${{ matrix.artifact }}/indexsearch"
-            chmod +x "dist/${{ matrix.artifact }}/is"
           fi
           cp README.md "dist/${{ matrix.artifact }}/"
           cp LICENSE-MIT LICENSE-APACHE "dist/${{ matrix.artifact }}/"
