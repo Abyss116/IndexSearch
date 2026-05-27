@@ -140,6 +140,11 @@ issue or chat for analysis. For parallel indexing, per-file phases such as
 `index_file_read`, `index_tokenize`, and `index_compress` are accumulated
 worker time, while `index_process_total` is wall time.
 
+On Windows, fresh indexing uses a capped worker pool by default because very
+high thread counts can make many-small-file reads slower. Set
+`INDEXSEARCH_INDEX_THREADS=N` to override the worker count, or
+`INDEXSEARCH_INDEX_THREADS=0` to use Rayon defaults.
+
 Minimal project file:
 
 ```ini

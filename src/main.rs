@@ -2,6 +2,8 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::env;
+#[cfg(windows)]
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, IsTerminal, Read, Write};
 #[cfg(not(unix))]
@@ -11,6 +13,10 @@ use std::net::TcpStream;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
@@ -31,6 +37,7 @@ use notify::{
     event::{EventKind, MetadataKind, ModifyKind},
 };
 use rayon::prelude::*;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use regex::bytes::{Regex, RegexBuilder};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use walkdir::{DirEntry, WalkDir};
@@ -5128,41 +5135,48 @@ fn build_index(
         timings.scan += scan_timer.elapsed().as_secs_f64();
     }
     let process_timer = Instant::now();
+    let index_pool = build_index_thread_pool()?;
     let skipped_reads = AtomicU64::new(0);
     let read_ns = AtomicU64::new(0);
     let tokenize_ns = AtomicU64::new(0);
     let compress_ns = AtomicU64::new(0);
-    let mut files: Vec<(usize, FileEntry, Vec<u32>, Vec<u32>)> = entries
-        .par_iter()
-        .map_init(TrigramScratch::new, |scratch, entry| {
-            let read_timer = Instant::now();
-            let bytes = fs::read(&entry.path).ok()?;
-            read_ns.fetch_add(elapsed_ns(read_timer), AtomicOrdering::Relaxed);
-            if is_binary(&bytes) {
-                skipped_reads.fetch_add(1, AtomicOrdering::Relaxed);
-                return None;
-            }
-            let tokenize_timer = Instant::now();
-            let (grams, fragments) = index_grams_and_word_fragments(&bytes, scratch);
-            tokenize_ns.fetch_add(elapsed_ns(tokenize_timer), AtomicOrdering::Relaxed);
-            let compress_timer = Instant::now();
-            let compressed_content = lz4_flex::compress_prepend_size(&bytes);
-            compress_ns.fetch_add(elapsed_ns(compress_timer), AtomicOrdering::Relaxed);
-            Some((
-                entry.ordinal,
-                FileEntry {
-                    path: entry.rel.clone(),
-                    mtime: entry.mtime,
-                    size: bytes.len() as u64,
-                    content: ENABLE_CHUNK_EXTENSION.then_some(bytes).unwrap_or_default(),
-                    compressed_content,
-                },
-                grams,
-                fragments,
-            ))
-        })
-        .filter_map(|result| result)
-        .collect();
+    let build_files = || {
+        entries
+            .par_iter()
+            .map_init(TrigramScratch::new, |scratch, entry| {
+                let read_timer = Instant::now();
+                let bytes = fs::read(&entry.path).ok()?;
+                read_ns.fetch_add(elapsed_ns(read_timer), AtomicOrdering::Relaxed);
+                if is_binary(&bytes) {
+                    skipped_reads.fetch_add(1, AtomicOrdering::Relaxed);
+                    return None;
+                }
+                let tokenize_timer = Instant::now();
+                let (grams, fragments) = index_grams_and_word_fragments(&bytes, scratch);
+                tokenize_ns.fetch_add(elapsed_ns(tokenize_timer), AtomicOrdering::Relaxed);
+                let compress_timer = Instant::now();
+                let compressed_content = lz4_flex::compress_prepend_size(&bytes);
+                compress_ns.fetch_add(elapsed_ns(compress_timer), AtomicOrdering::Relaxed);
+                Some((
+                    entry.ordinal,
+                    FileEntry {
+                        path: entry.rel.clone(),
+                        mtime: entry.mtime,
+                        size: bytes.len() as u64,
+                        content: ENABLE_CHUNK_EXTENSION.then_some(bytes).unwrap_or_default(),
+                        compressed_content,
+                    },
+                    grams,
+                    fragments,
+                ))
+            })
+            .filter_map(|result| result)
+            .collect()
+    };
+    let mut files: Vec<(usize, FileEntry, Vec<u32>, Vec<u32>)> = match &index_pool {
+        Some(pool) => pool.install(build_files),
+        None => build_files(),
+    };
     if let Some(timings) = timings.as_deref_mut() {
         timings.file_read += ns_to_secs(read_ns.load(AtomicOrdering::Relaxed));
         timings.tokenize += ns_to_secs(tokenize_ns.load(AtomicOrdering::Relaxed));
@@ -5184,7 +5198,10 @@ fn build_index(
         timings.select_fragments += fragments_timer.elapsed().as_secs_f64();
     }
     let postings_timer = Instant::now();
-    let postings = build_postings_parallel(&files, &selected_fragments);
+    let postings = match &index_pool {
+        Some(pool) => pool.install(|| build_postings_parallel(&files, &selected_fragments)),
+        None => build_postings_parallel(&files, &selected_fragments),
+    };
     if let Some(timings) = timings.as_deref_mut() {
         timings.postings += postings_timer.elapsed().as_secs_f64();
     }
@@ -5199,6 +5216,42 @@ fn build_index(
         files: out_files,
         postings,
     })
+}
+
+fn build_index_thread_pool() -> Result<Option<ThreadPool>> {
+    let threads = index_thread_count();
+    threads
+        .map(|threads| {
+            ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|idx| format!("indexsearch-index-{idx}"))
+                .build()
+                .context("failed to build index worker pool")
+        })
+        .transpose()
+}
+
+fn index_thread_count() -> Option<usize> {
+    if let Ok(value) = env::var("INDEXSEARCH_INDEX_THREADS") {
+        let trimmed = value.trim();
+        if trimmed == "0" {
+            return None;
+        }
+        if let Ok(threads) = trimmed.parse::<usize>() {
+            return (threads > 0).then_some(threads);
+        }
+    }
+    #[cfg(windows)]
+    {
+        std::thread::available_parallelism()
+            .ok()
+            .map(|count| count.get().min(16))
+            .filter(|&threads| threads > 0)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 fn read_current_file_entry(
@@ -5911,6 +5964,21 @@ fn scan_indexable_files(
     scanned: &mut u64,
     skipped: &mut u64,
 ) -> Result<Vec<CurrentFile>> {
+    #[cfg(windows)]
+    {
+        if !options.follow {
+            return scan_indexable_files_windows(cfg, options, scanned, skipped);
+        }
+    }
+    scan_indexable_files_walkdir(cfg, options, scanned, skipped)
+}
+
+fn scan_indexable_files_walkdir(
+    cfg: &ProjectConfig,
+    options: &Options,
+    scanned: &mut u64,
+    skipped: &mut u64,
+) -> Result<Vec<CurrentFile>> {
     let mut out = Vec::new();
     for entry in WalkDir::new(&cfg.root)
         .follow_links(options.follow)
@@ -5955,6 +6023,9 @@ fn scan_indexable_files(
 }
 
 fn should_descend(cfg: &ProjectConfig, options: &Options, entry: &DirEntry) -> bool {
+    if !entry.file_type().is_dir() {
+        return true;
+    }
     let Ok(rel) = entry.path().strip_prefix(&cfg.root) else {
         return true;
     };
@@ -5962,13 +6033,118 @@ fn should_descend(cfg: &ProjectConfig, options: &Options, entry: &DirEntry) -> b
     if rel.is_empty() {
         return true;
     }
-    if !options.hidden && is_hidden(&rel) {
+    should_descend_rel(cfg, options, &rel)
+}
+
+fn should_descend_rel(cfg: &ProjectConfig, options: &Options, rel: &str) -> bool {
+    if !options.hidden && is_hidden(rel) {
         return false;
     }
-    if entry.file_type().is_dir() && cfg.paths_ignore.is_match(&rel) {
+    if cfg.paths_ignore.is_match(rel) {
         return false;
     }
     true
+}
+
+#[cfg(windows)]
+fn scan_indexable_files_windows(
+    cfg: &ProjectConfig,
+    options: &Options,
+    scanned: &mut u64,
+    skipped: &mut u64,
+) -> Result<Vec<CurrentFile>> {
+    let mut out = Vec::new();
+    scan_indexable_dir_windows(cfg, options, &cfg.root, "", &mut out, scanned, skipped)?;
+    Ok(out)
+}
+
+#[cfg(windows)]
+fn scan_indexable_dir_windows(
+    cfg: &ProjectConfig,
+    options: &Options,
+    dir: &Path,
+    dir_rel: &str,
+    out: &mut Vec<CurrentFile>,
+    scanned: &mut u64,
+    skipped: &mut u64,
+) -> Result<()> {
+    use std::ptr::null;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FIND_FIRST_EX_LARGE_FETCH,
+        FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FindNextFileW,
+        WIN32_FIND_DATAW,
+    };
+
+    let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+    let pattern = windows_find_pattern(dir);
+    let handle = unsafe {
+        FindFirstFileExW(
+            pattern.as_ptr(),
+            FindExInfoBasic,
+            &mut data as *mut _ as *mut std::ffi::c_void,
+            FindExSearchNameMatch,
+            null(),
+            FIND_FIRST_EX_LARGE_FETCH,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        *skipped += 1;
+        return Ok(());
+    }
+    loop {
+        let name = windows_find_name(&data.cFileName);
+        let name_text = name.to_string_lossy();
+        if name_text != "." && name_text != ".." {
+            let name_rel = name_text.replace('\\', "/");
+            let rel = if dir_rel.is_empty() {
+                name_rel
+            } else {
+                format!("{dir_rel}/{name_rel}")
+            };
+            let attrs = data.dwFileAttributes;
+            let is_reparse = attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+            if attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                if !is_reparse && should_descend_rel(cfg, options, &rel) {
+                    scan_indexable_dir_windows(
+                        cfg,
+                        options,
+                        &dir.join(&name),
+                        &rel,
+                        out,
+                        scanned,
+                        skipped,
+                    )?;
+                }
+            } else if !is_reparse {
+                let ordinal = *scanned as usize;
+                *scanned += 1;
+                if (!options.hidden && is_hidden(&rel)) || !is_searchable(cfg, &rel) {
+                    *skipped += 1;
+                } else {
+                    let size = ((data.nFileSizeHigh as u64) << 32) | data.nFileSizeLow as u64;
+                    if size > options.max_filesize {
+                        *skipped += 1;
+                    } else {
+                        out.push(CurrentFile {
+                            ordinal,
+                            path: dir.join(&name),
+                            rel,
+                            mtime: windows_find_mtime_ns(&data),
+                            size,
+                        });
+                    }
+                }
+            }
+        }
+        if unsafe { FindNextFileW(handle, &mut data) } == 0 {
+            break;
+        }
+    }
+    unsafe {
+        FindClose(handle);
+    }
+    Ok(())
 }
 
 fn is_searchable(cfg: &ProjectConfig, rel: &str) -> bool {
@@ -5988,12 +6164,54 @@ fn rel_path(root: &Path, path: &Path) -> Option<String> {
         .map(|p| p.to_string_lossy().replace('\\', "/"))
 }
 
+#[cfg(windows)]
+fn windows_find_pattern(dir: &Path) -> Vec<u16> {
+    let mut pattern: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    if !pattern
+        .last()
+        .is_some_and(|&ch| ch == b'\\' as u16 || ch == b'/' as u16)
+    {
+        pattern.push(b'\\' as u16);
+    }
+    pattern.push(b'*' as u16);
+    pattern.push(0);
+    pattern
+}
+
+#[cfg(windows)]
+fn windows_find_name(name: &[u16]) -> OsString {
+    let len = name.iter().position(|&ch| ch == 0).unwrap_or(name.len());
+    OsString::from_wide(&name[..len])
+}
+
+#[cfg(windows)]
+fn windows_filetime_to_unix_ns(ticks_100ns: u64) -> i64 {
+    const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
+    ticks_100ns
+        .saturating_sub(WINDOWS_TO_UNIX_EPOCH_100NS)
+        .saturating_mul(100) as i64
+}
+
+#[cfg(windows)]
+fn windows_find_mtime_ns(data: &windows_sys::Win32::Storage::FileSystem::WIN32_FIND_DATAW) -> i64 {
+    let ticks = ((data.ftLastWriteTime.dwHighDateTime as u64) << 32)
+        | data.ftLastWriteTime.dwLowDateTime as u64;
+    windows_filetime_to_unix_ns(ticks)
+}
+
 fn mtime_ns(meta: &fs::Metadata) -> i64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
+    #[cfg(windows)]
+    {
+        return windows_filetime_to_unix_ns(meta.last_write_time());
+    }
+    #[cfg(not(windows))]
+    {
+        meta.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0)
+    }
 }
 
 fn is_binary(bytes: &[u8]) -> bool {
