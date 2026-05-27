@@ -462,9 +462,8 @@ like `rg PATTERN`. If the pattern is also an IndexSearch command name such as
 `is search PATTERN [PATH ...]`.
 
 `is clean [PATH]` stops any matching project service found on the parent path
-chain and removes `.indexsearch/` plus legacy `.codeindex/` state directories,
-including deltas and logs. It keeps `index-search-project.txt`. Pass `--yes`
-for non-interactive cleanup.
+chain and removes `.indexsearch/`, including deltas and logs. It keeps
+`index-search-project.txt`. Pass `--yes` for non-interactive cleanup.
 
 ## License
 

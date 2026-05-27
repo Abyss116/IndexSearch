@@ -41,7 +41,6 @@ type StdoutFd = i32;
 
 const PROJECT_FILE: &str = "index-search-project.txt";
 const INDEX_DIR: &str = ".indexsearch";
-const LEGACY_INDEX_DIR: &str = ".codeindex";
 const INDEX_FILE: &str = "index.bin";
 const DELTA_DIR: &str = "deltas";
 const WATCH_DIR: &str = "watches";
@@ -2513,10 +2512,9 @@ fn command_clean(args: &[String]) -> Result<i32> {
     if options.dry_run {
         for root in &roots {
             println!("would clean {}", display_path(root));
-            for dir in index_state_dirs(root) {
-                if dir.exists() {
-                    println!("would remove {}", display_path(&dir));
-                }
+            let dir = index_state_dir(root);
+            if dir.exists() {
+                println!("would remove {}", display_path(&dir));
             }
         }
         return Ok(0);
@@ -2530,12 +2528,11 @@ fn command_clean(args: &[String]) -> Result<i32> {
     let mut stopped = 0usize;
     for root in roots {
         stopped += stop_services_for_root(&root)?;
-        for dir in index_state_dirs(&root) {
-            if dir.exists() {
-                fs::remove_dir_all(&dir)?;
-                removed_dirs += 1;
-                println!("removed {}", display_path(&dir));
-            }
+        let dir = index_state_dir(&root);
+        if dir.exists() {
+            fs::remove_dir_all(&dir)?;
+            removed_dirs += 1;
+            println!("removed {}", display_path(&dir));
         }
     }
     println!("cleaned {removed_dirs} index directories; stopped {stopped} services");
@@ -2549,15 +2546,15 @@ fn discover_clean_roots(start: &Path) -> Vec<PathBuf> {
     }
     let mut roots = Vec::new();
     for ancestor in path.ancestors() {
-        if ancestor.join(INDEX_DIR).is_dir() || ancestor.join(LEGACY_INDEX_DIR).is_dir() {
+        if ancestor.join(INDEX_DIR).is_dir() {
             roots.push(ancestor.to_path_buf());
         }
     }
     roots
 }
 
-fn index_state_dirs(root: &Path) -> [PathBuf; 2] {
-    [root.join(INDEX_DIR), root.join(LEGACY_INDEX_DIR)]
+fn index_state_dir(root: &Path) -> PathBuf {
+    root.join(INDEX_DIR)
 }
 
 fn confirm_clean(roots: &[PathBuf]) -> Result<bool> {

@@ -273,12 +273,10 @@ cat > "$clean_tmp/index-search-project.txt" <<'CFG'
 CFG
 printf 'clean_symbol\n' > "$clean_tmp/a.txt"
 "$bin" watch --idle-seconds 1 "$clean_tmp" >/dev/null
-mkdir -p "$clean_tmp/.codeindex"
 clean_dry="$("$bin" clean --dry-run "$clean_tmp")"
 grep -q 'would remove' <<<"$clean_dry"
 "$bin" clean --yes "$clean_tmp" >/dev/null
 [[ ! -d "$clean_tmp/.indexsearch" ]]
-[[ ! -d "$clean_tmp/.codeindex" ]]
 [[ -f "$clean_tmp/index-search-project.txt" ]]
 ! "$bin" list-watches | grep -q "$clean_tmp"
 
