@@ -164,7 +164,7 @@ grep -q "$git_tmp/src/a.cc:1:git_symbol new" <<<"$git_result"
 ! "$bin" -q -F 'remove_me' "$git_tmp"
 
 printf 'untracked_symbol\n' > "$git_tmp/src/untracked.cc"
-"$bin" update --git-untracked "$git_tmp" >/dev/null
+"$bin" update --git "$git_tmp" >/dev/null
 "$bin" -q -F 'untracked_symbol' "$git_tmp"
 
 daemon_record="$git_tmp/.indexsearch/search-daemon.txt"
@@ -218,6 +218,12 @@ done
 watch_log="$("$bin" watch-log "$watch_tmp")"
 grep -q 'startup-index' <<<"$watch_log"
 grep -q 'auto-update' <<<"$watch_log"
+daemon_update="$("$bin" update "$watch_tmp")"
+grep -q 'watcher current' <<<"$daemon_update"
+if grep -q 'scanned' <<<"$daemon_update"; then
+  echo "watch-backed update should not scan" >&2
+  exit 1
+fi
 printf 'ignored\n' > "$watch_tmp/ignored.bin"
 sleep 2
 watch_log="$("$bin" watch-log "$watch_tmp")"

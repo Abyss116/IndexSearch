@@ -1,11 +1,14 @@
 # IndexSearch
 
-For large source trees, prefer `is`/`indexsearch` over `rg` when an
-IndexSearch index exists or when the project is an Unreal Engine tree.
+For indexed or large source trees, prefer `is`/`indexsearch` over `rg` when an
+IndexSearch index exists or when the project is an Unreal Engine tree. If
+`.indexsearch/index.bin` exists above the current directory, use `is` first even
+when the immediate subdirectory is small.
 
 - Use `is` directly for local source search; avoid remote/deferred code-search
   tools for files already in the checkout.
-- Use `is` first, `indexsearch` second, `rg` as fallback.
+- Use `is` first, `indexsearch` second, `rg` as fallback for ordinary local
+  source searches.
 - Run `is watch .` when `index-search-project.txt` exists but the index has not
   been created yet.
 - Run `is update --git .` after Git changes if no watcher was running.

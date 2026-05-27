@@ -70,9 +70,11 @@ This self-copy install copies the full `is-daemon` backend and creates
 lightweight `indexsearch` and `is` frontends in `~/.local/bin` on macOS/Linux or
 `%USERPROFILE%\.local\bin` on Windows. Use `indexsearch install --dir PATH` to
 override the install directory. Package manager installs already put the three
-binaries on PATH and do not need this step. On Windows `is` is a native
-`is.exe`, not an `is.cmd` wrapper, so PowerShell metacharacters inside quoted
-patterns are not re-parsed by `cmd.exe`.
+binaries on PATH and do not need this step. Release archives include
+`indexsearch` and `is-daemon`; `install` creates the shorter `is` frontend in
+the target bin directory. On Windows `is` is a native `is.exe`, not an `is.cmd`
+wrapper, so PowerShell metacharacters inside quoted patterns are not re-parsed
+by `cmd.exe`.
 
 PowerShell still parses unquoted redirection characters before IndexSearch can
 see them. Quote those patterns or put `--` before the pattern:
@@ -192,21 +194,28 @@ index described here does not rely on chunk-level postings yet.
 
 `is index .` rebuilds the base index from scratch.
 
-`is update .` refreshes an existing index. It compares stored path, `mtime`, and
-size metadata, reuses unchanged snapshots, reads only changed or new files, and
-drops deleted or newly ignored files.
+`is update .` refreshes an existing index. If a project daemon/watch is running,
+`update` asks it to flush pending filesystem events and reports whether the
+watcher was already current; this avoids a full tree scan in the normal watched
+case. Without a usable daemon, `update` falls back to comparing stored path,
+`mtime`, and size metadata, reusing unchanged snapshots, reading only changed or
+new files, and dropping deleted or newly ignored files. If an index was just
+built or refreshed, immediate follow-up `update` or `watch` commands reuse that
+recent sync state instead of scanning the tree again. Use `is update
+--force-scan .` to bypass these shortcuts and force the filesystem
+reconciliation path.
 
 For Git worktrees:
 
 ```bash
 is update --git .
-is update --git-untracked .
 ```
 
 `update --git` records the last indexed `HEAD` and can catch clean committed
-changes from `git pull`, `checkout`, and `rebase`. It writes small delta
-segments under `.indexsearch/deltas/` when possible. Use `is compact .` to fold
-deltas back into the base index.
+changes from `git pull`, `checkout`, and `rebase`; it also includes current
+local changes and untracked files by default. It writes small delta segments
+under `.indexsearch/deltas/` when possible. Use `is compact .` to fold deltas
+back into the base index.
 
 For active large repositories:
 
@@ -260,6 +269,11 @@ Use either form to bypass the daemon:
 is --no-daemon -F "SomeSymbol" .
 INDEXSEARCH_NO_DAEMON=1 is -F "SomeSymbol" .
 ```
+
+With the lightweight frontend, bypassing the daemon still launches the full
+`is-daemon` backend once and runs the search there. This mode is mainly for
+profiling and diagnostics; normal searches should use the per-project daemon so
+the index stays mmaped and watched.
 
 Daemon records live in `.indexsearch/search-daemon.txt`. If `indexsearch
 install` replaces `is-daemon`, or if the base index is
@@ -358,7 +372,9 @@ found. Quiet timings are median wall-clock time across 31 IndexSearch runs and
 Both `indexsearch` and `is` are lightweight frontends; the installed full
 backend is `is-daemon`. Large search stdout is written directly from the daemon
 into the frontend's stdout on Unix/macOS and Windows, avoiding an extra RPC
-copy; stderr and control messages remain framed.
+copy; stderr and control messages remain framed. On Windows this direct stdout
+path is enabled by default; set `INDEXSEARCH_WINDOWS_DIRECT_STDOUT=0` only when
+diagnosing handle-passing problems.
 
 To reproduce the search benchmark:
 
@@ -451,7 +467,7 @@ can be controlled with `--color auto|always|never`.
 - `--follow`
 - `--no-auto-index`
 - `--auto-update`
-- `--auto-update-untracked`
+- `--force-scan`
 - `--stats`
 - `--profile`, `--instrument`
 - `--no-daemon`
@@ -463,7 +479,7 @@ for PCRE-specific behavior or unsupported flags.
 
 ```bash
 is index [PATH]
-is update [--git] [--git-untracked] [PATH]
+is update [--git] [--force-scan] [PATH]
 is compact [PATH]
 is clean [--yes] [PATH]
 is watch [PATH]

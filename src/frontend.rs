@@ -87,12 +87,13 @@ fn run(args: &[String]) -> Result<i32, String> {
     let daemon_args = search_daemon_args(args);
     let search_args = strip_search_command(args);
     profile.record("frontend_prepare_args", prepare_timer);
-    if search_args.iter().any(|arg| {
-        matches!(
-            arg.as_str(),
-            "--no-daemon" | "--auto-update" | "--auto-update-untracked"
-        )
-    }) {
+    if env::var_os("INDEXSEARCH_NO_DAEMON").is_some() {
+        return run_backend(args);
+    }
+    if search_args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--no-daemon" | "--auto-update"))
+    {
         return run_backend(args);
     }
     let start_timer = Instant::now();
@@ -109,8 +110,9 @@ fn run(args: &[String]) -> Result<i32, String> {
     };
     profile.record("frontend_find_project_root", root_timer);
     let ready_record;
+    let started_watch;
     let ensure_timer = Instant::now();
-    (root, ready_record) = ensure_watch(&root, &mut profile)?;
+    (root, ready_record, started_watch) = ensure_watch(&root, &mut profile)?;
     profile.record("frontend_ensure_project_service", ensure_timer);
     let record_timer = Instant::now();
     if let Some(record) = ready_record.or_else(|| read_valid_record(&root)) {
@@ -120,9 +122,13 @@ fn run(args: &[String]) -> Result<i32, String> {
             profile.print();
             return Ok(code);
         }
+        stop_process(record.pid);
         let _ = fs::remove_file(record_path(&root));
     } else {
         profile.record("frontend_read_daemon_record", record_timer);
+    }
+    if started_watch {
+        return run_backend_no_daemon(args);
     }
     let start_daemon_timer = Instant::now();
     start_daemon(&root)?;
@@ -137,6 +143,8 @@ fn run(args: &[String]) -> Result<i32, String> {
                 profile.print();
                 return Ok(code);
             }
+            stop_process(record.pid);
+            let _ = fs::remove_file(record_path(&root));
         } else {
             profile.record("frontend_read_daemon_record", record_timer);
         }
@@ -149,12 +157,27 @@ fn should_delegate(args: &[String]) -> bool {
     if args.is_empty() {
         return true;
     }
-    let first = args[0].as_str();
+    let first = first_command_arg(args).unwrap_or(args[0].as_str());
     if matches!(first, "-h" | "--help" | "-V" | "--version") {
         return true;
     }
+    is_command_name(first)
+}
+
+fn first_command_arg(args: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while args
+        .get(i)
+        .is_some_and(|arg| matches!(arg.as_str(), "--profile" | "--instrument"))
+    {
+        i += 1;
+    }
+    args.get(i).map(String::as_str)
+}
+
+fn is_command_name(arg: &str) -> bool {
     matches!(
-        first,
+        arg,
         "index"
             | "update"
             | "compact"
@@ -168,6 +191,7 @@ fn should_delegate(args: &[String]) -> bool {
             | "watch-log"
             | "install"
             | "install-skills"
+            | "install-agents"
             | "status"
     )
 }
@@ -376,7 +400,7 @@ fn handle_missing_project(args: &[String]) -> Result<i32, String> {
             match answer.trim() {
                 "" | "y" | "Y" | "yes" | "YES" => {
                     let mut profile = FrontendProfile::default();
-                    let (root, _) = ensure_watch(&cwd, &mut profile)?;
+                    let (root, _, _) = ensure_watch(&cwd, &mut profile)?;
                     if index_path(&root).is_file() {
                         return run(args);
                     }
@@ -396,14 +420,14 @@ fn handle_missing_project(args: &[String]) -> Result<i32, String> {
 fn ensure_watch(
     root: &Path,
     profile: &mut FrontendProfile,
-) -> Result<(PathBuf, Option<DaemonRecord>), String> {
+) -> Result<(PathBuf, Option<DaemonRecord>, bool), String> {
     let covering_timer = Instant::now();
     if let Some(covering_root) = watch_covering_root(root) {
         profile.record("frontend_watch_covering_root", covering_timer);
         let ready_timer = Instant::now();
         if let Some(record) = ready_watch_record(&covering_root) {
             profile.record("frontend_ready_watch_record", ready_timer);
-            return Ok((covering_root, Some(record)));
+            return Ok((covering_root, Some(record), false));
         }
         profile.record("frontend_ready_watch_record", ready_timer);
         let stop_timer = Instant::now();
@@ -415,9 +439,14 @@ fn ensure_watch(
     let start_timer = Instant::now();
     start_watch(root)?;
     profile.record("frontend_start_watch", start_timer);
+    let covering_root = watch_covering_root(root).unwrap_or_else(|| root.to_path_buf());
+    let wait_timer = Instant::now();
+    let ready_record = wait_for_ready_watch_record(&covering_root, Duration::from_secs(2));
+    profile.record("frontend_wait_watch_record", wait_timer);
     Ok((
-        watch_covering_root(root).unwrap_or_else(|| root.to_path_buf()),
-        None,
+        covering_root,
+        ready_record,
+        true,
     ))
 }
 
@@ -426,6 +455,19 @@ fn ready_watch_record(root: &Path) -> Option<DaemonRecord> {
         return None;
     }
     read_valid_record(root)
+}
+
+fn wait_for_ready_watch_record(root: &Path, timeout: Duration) -> Option<DaemonRecord> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(record) = ready_watch_record(root) {
+            return Some(record);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn stop_watch_for_root(root: &Path) {
@@ -845,9 +887,9 @@ fn duplicate_stdout_for_process(pid: u32) -> io::Result<RawHandle> {
 
 #[cfg(windows)]
 fn windows_direct_stdout_enabled() -> bool {
-    matches!(
+    !matches!(
         env::var("INDEXSEARCH_WINDOWS_DIRECT_STDOUT").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+        Ok("0") | Ok("false") | Ok("FALSE") | Ok("no") | Ok("NO")
     )
 }
 
@@ -886,6 +928,20 @@ fn start_daemon(root: &Path) -> Result<(), String> {
 
 fn run_backend(args: &[String]) -> Result<i32, String> {
     run_backend_owned(args.iter().map(String::as_str))
+}
+
+fn run_backend_no_daemon(args: &[String]) -> Result<i32, String> {
+    if args.iter().any(|arg| arg == "--no-daemon") {
+        return run_backend(args);
+    }
+    let mut owned = args.to_vec();
+    let insert_pos = if owned.first().is_some_and(|arg| arg == "search") {
+        1
+    } else {
+        0
+    };
+    owned.insert(insert_pos, "--no-daemon".to_string());
+    run_backend_owned(owned.iter().map(String::as_str))
 }
 
 fn run_backend_owned<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<i32, String> {
@@ -1115,6 +1171,8 @@ fn stop_process(pid: u32) {
     {
         let _ = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
     }
 }

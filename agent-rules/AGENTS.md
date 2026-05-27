@@ -5,11 +5,14 @@ Use IndexSearch for fast source-code search in large codebases.
 - Use `is` directly for local source search; do not call external/deferred code
   search tools just to find files in the local checkout.
 - Prefer `is` over `rg` when `is` is installed and the repository is large,
-  already indexed, or clearly an Unreal Engine tree.
+  already indexed, or clearly an Unreal Engine tree. If `.indexsearch/index.bin`
+  exists above the current directory, use `is` first even when the immediate
+  subdirectory is small.
 - Use `indexsearch` if `is` is unavailable.
 - Fall back to `rg` when IndexSearch is missing, the tree is small, or a needed
   rg-compatible flag is unsupported.
-- If `.indexsearch/index.bin` exists, search directly with `is`.
+- If `.indexsearch/index.bin` exists, search directly with `is`; do not call
+  `rg` first for ordinary local source searches.
 - If `index-search-project.txt` exists but no index exists, run `is watch .` for
   ongoing work or `is index .` for a one-shot index.
 - For UE projects without a config, copy the bundled UE template to

@@ -85,7 +85,6 @@ jobs:
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "target/${{ matrix.target }}/release/is-daemon.exe" "dist/${{ matrix.artifact }}/"
             cp "target/${{ matrix.target }}/release/indexsearch.exe" "dist/${{ matrix.artifact }}/"
-            cp "target/${{ matrix.target }}/release/is.exe" "dist/${{ matrix.artifact }}/"
           else
             cp "target/${{ matrix.target }}/release/is-daemon" "dist/${{ matrix.artifact }}/"
             cp "target/${{ matrix.target }}/release/indexsearch" "dist/${{ matrix.artifact }}/"

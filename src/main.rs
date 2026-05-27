@@ -14,9 +14,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-#[cfg(not(windows))]
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -58,8 +56,12 @@ const SEARCH_DAEMON_RESPONSE_MAGIC: &[u8; 8] = b"ISDRES1\n";
 const SEARCH_DAEMON_STDOUT_FRAME: u8 = 1;
 const SEARCH_DAEMON_STDERR_FRAME: u8 = 2;
 const SEARCH_DAEMON_DONE_FRAME: u8 = 3;
+const SEARCH_DAEMON_CONTROL_ARG: &str = "--__indexsearch-daemon-control";
+const SEARCH_DAEMON_CONTROL_UPDATE: &str = "update";
+const SEARCH_DAEMON_CONTROL_FALLBACK_CODE: i32 = 75;
 const SEARCH_DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_millis(20);
 const SEARCH_DAEMON_START_TIMEOUT: Duration = Duration::from_millis(250);
+const RECENT_SYNC_NO_SCAN_WINDOW: Duration = Duration::from_secs(30);
 const STREAMING_PIPELINE_MIN_CANDIDATES: usize = 50_000;
 const POSTING_BUILD_CHUNK_FILES: usize = 4096;
 const DEFAULT_PROJECT_CONFIG: &str = "[IndexSearch.paths.ignore]\n.git/\n.hg/\n.svn/\n.indexsearch/\n\n\
@@ -158,7 +160,7 @@ struct Options {
     profile: bool,
     sort_path: bool,
     git_update: bool,
-    git_untracked: bool,
+    force_scan: bool,
     hidden: bool,
     follow: bool,
     max_count: Option<usize>,
@@ -201,6 +203,18 @@ struct BuiltIndex {
     config_hash: u64,
     files: Vec<FileEntry>,
     postings: HashMap<u32, Vec<u32>>,
+}
+
+#[cfg(windows)]
+fn drop_built_index_async(index: BuiltIndex) {
+    let _ = std::thread::Builder::new()
+        .name("indexsearch-drop-index".to_string())
+        .spawn(move || drop(index));
+}
+
+#[cfg(not(windows))]
+fn drop_built_index_async(index: BuiltIndex) {
+    drop(index);
 }
 
 #[derive(Default)]
@@ -302,6 +316,7 @@ struct ChangedPath {
 #[derive(Default)]
 struct IndexState {
     git_head: Option<String>,
+    updated_ns: Option<u128>,
 }
 
 struct TrigramScratch {
@@ -476,6 +491,7 @@ fn run() -> Result<()> {
         print_help();
         std::process::exit(2);
     }
+    normalize_leading_command_flags(&mut args);
     if args[0] == "--" {
         args.remove(0);
         std::process::exit(command_search(&args)?);
@@ -585,6 +601,52 @@ fn run() -> Result<()> {
     }
 }
 
+#[derive(Default)]
+struct WatchState {
+    pending: Mutex<HashSet<String>>,
+}
+
+struct WatchFlushOutcome {
+    events: usize,
+    changed: bool,
+}
+
+fn normalize_leading_command_flags(args: &mut Vec<String>) {
+    let mut i = 0;
+    while args
+        .get(i)
+        .is_some_and(|arg| matches!(arg.as_str(), "--profile" | "--instrument"))
+    {
+        i += 1;
+    }
+    if i > 0 && args.get(i).is_some_and(|arg| is_command_name(arg)) {
+        let command = args.remove(i);
+        args.insert(0, command);
+    }
+}
+
+fn is_command_name(arg: &str) -> bool {
+    matches!(
+        arg,
+        "index"
+            | "update"
+            | "compact"
+            | "clean"
+            | "watch"
+            | "watch-daemon"
+            | "search-daemon"
+            | "list-watches"
+            | "watch-list"
+            | "unwatch"
+            | "watch-log"
+            | "install"
+            | "install-skills"
+            | "install-agents"
+            | "status"
+            | "search"
+    )
+}
+
 fn print_help() {
     let style = HelpStyle::new();
     help_section(&style, "Usage");
@@ -638,7 +700,7 @@ fn print_help() {
     help_command(
         &style,
         "install [--dir PATH]",
-        "copy indexsearch, is, and is-daemon into a user bin dir",
+        "install the daemon backend and user-facing commands into a bin dir",
     );
     help_command(
         &style,
@@ -725,12 +787,12 @@ fn print_help() {
     help_option(
         &style,
         "--git",
-        "update from Git changed paths when possible",
+        "update from Git changed paths, local changes, and untracked files",
     );
     help_option(
         &style,
-        "--git-untracked",
-        "include untracked files with --git update",
+        "--force-scan",
+        "bypass a running watcher and reconcile by scanning the filesystem",
     );
     help_option(
         &style,
@@ -740,7 +802,7 @@ fn print_help() {
     help_option(
         &style,
         "--auto-update",
-        "search performs a fast Git changed-path refresh first",
+        "search performs a fast Git refresh, including untracked files",
     );
     help_option(
         &style,
@@ -828,12 +890,12 @@ fn print_update_help() {
     help_option(
         &style,
         "--git",
-        "update from Git changed paths when possible",
+        "update from Git changed paths, local changes, and untracked files",
     );
     help_option(
         &style,
-        "--git-untracked",
-        "include untracked files with --git update",
+        "--force-scan",
+        "bypass a running watcher and reconcile by scanning the filesystem",
     );
     help_option(
         &style,
@@ -927,7 +989,7 @@ fn print_install_help() {
         &style,
         "install",
         "[OPTIONS] [DIR]",
-        "copy indexsearch, is, and is-daemon into a user bin dir",
+        "install the daemon backend and user-facing commands into a bin dir",
     );
     help_section(&style, "Options");
     help_option(
@@ -1059,12 +1121,7 @@ fn print_search_help() {
     help_option(
         &style,
         "--auto-update",
-        "fast Git changed-path refresh before search",
-    );
-    help_option(
-        &style,
-        "--auto-update-untracked",
-        "include untracked files with --auto-update",
+        "fast Git refresh before search, including untracked files",
     );
     help_option(&style, "--stats", "print search stats");
     help_option(
@@ -1453,12 +1510,18 @@ fn command_index(args: &[String]) -> Result<i32> {
     }
     println!("root: {}", display_path(&cfg.root));
     println!("index: {}", display_path(&index_path(&cfg.root)));
+    std::mem::forget(index);
     Ok(0)
 }
 
 fn command_update(args: &[String]) -> Result<i32> {
     let (options, start) = parse_index_args(args)?;
     let cfg = load_or_create_config(&start)?;
+    if !options.force_scan {
+        if let Some(code) = try_update_via_daemon(&cfg)? {
+            return Ok(code);
+        }
+    }
     let _lock = acquire_exclusive_lock(&cfg.root)?;
     let path = index_path(&cfg.root);
     let timer = Instant::now();
@@ -1473,10 +1536,26 @@ fn command_update(args: &[String]) -> Result<i32> {
     timings.open_index += open_timer.elapsed().as_secs_f64();
     let index = if let Some(ref old_index) = old {
         if old_index.config_hash == cfg.hash {
+            if !options.force_scan
+                && !options.git_update
+                && index_state_recently_synced(&cfg.root, &path).unwrap_or(false)
+            {
+                return update_from_recent_state(
+                    &cfg,
+                    &path,
+                    old_index.file_count,
+                    &timer,
+                    &mut timings,
+                    progress,
+                    &flow,
+                    options.profile,
+                );
+            }
             let try_git_update = options.git_update || is_git_root(&cfg.root)?;
             if try_git_update {
+                let include_untracked = true;
                 let git_timer = Instant::now();
-                let changes = collect_git_changes(&cfg.root, options.git_untracked)?;
+                let changes = collect_git_changes(&cfg.root, include_untracked)?;
                 timings.git += git_timer.elapsed().as_secs_f64();
                 match changes {
                     Some(changes) if changes.is_empty() => {
@@ -1634,6 +1713,7 @@ fn command_update(args: &[String]) -> Result<i32> {
     }
     println!("root: {}", display_path(&cfg.root));
     println!("index: {}", display_path(&path));
+    std::mem::forget(index);
     Ok(0)
 }
 
@@ -1756,6 +1836,38 @@ fn update_from_filesystem_scan(
     Ok(0)
 }
 
+fn update_from_recent_state(
+    cfg: &ProjectConfig,
+    path: &Path,
+    file_count: usize,
+    timer: &Instant,
+    timings: &mut Timings,
+    progress: ProgressLine,
+    flow: &ConsoleFlow,
+    profile: bool,
+) -> Result<i32> {
+    let state_timer = Instant::now();
+    save_index_state(&cfg.root)?;
+    timings.write_state += state_timer.elapsed().as_secs_f64();
+    let elapsed = timer.elapsed().as_secs_f64();
+    progress.finish("Index already current");
+    flow.summary(format!("Checked {}", format_count(file_count as u64)));
+    flow.detail("recent sync state; no filesystem scan");
+    flow.detail(timing_summary(timings));
+    flow.done();
+    println!(
+        "updated {} files (recent sync state) in {:.3}s",
+        file_count, elapsed
+    );
+    print_timings(timings);
+    if profile {
+        print_index_profile(timings);
+    }
+    println!("root: {}", display_path(&cfg.root));
+    println!("index: {}", display_path(path));
+    Ok(0)
+}
+
 fn parse_index_args(args: &[String]) -> Result<(Options, PathBuf)> {
     let mut options = Options {
         max_filesize: DEFAULT_MAX_FILE_SIZE,
@@ -1768,16 +1880,14 @@ fn parse_index_args(args: &[String]) -> Result<(Options, PathBuf)> {
             "--hidden" => options.hidden = true,
             "-L" | "--follow" => options.follow = true,
             "--git" => options.git_update = true,
-            "--git-untracked" => {
-                options.git_update = true;
-                options.git_untracked = true;
-            }
+            "--force-scan" => options.force_scan = true,
             "--profile" | "--instrument" => options.profile = true,
             "--max-filesize" => {
                 i += 1;
                 options.max_filesize =
                     parse_size(args.get(i).context("missing --max-filesize value")?)?;
             }
+            value if value.starts_with('-') => bail!("unsupported option: {value}"),
             value => start = PathBuf::from(value),
         }
         i += 1;
@@ -1974,11 +2084,32 @@ fn sync_index_before_watch(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<()
             timer.elapsed().as_secs_f64()
         ));
         flow.detail(timing_summary(&timings));
+        std::mem::forget(index);
         return Ok(());
     }
+    let loaded_file_count = loaded
+        .as_ref()
+        .map(|index| index.file_count)
+        .unwrap_or_default();
     drop(loaded);
 
     progress.update("Checking changes");
+    if index_state_recently_synced(&cfg.root, &path).unwrap_or(false) {
+        save_index_state(&cfg.root)?;
+        append_watch_log(
+            &cfg.root,
+            &format!(
+                "startup-current files={} elapsed={:.3}s reason=recent-sync",
+                loaded_file_count,
+                timer.elapsed().as_secs_f64()
+            ),
+        )?;
+        progress.finish("Index already current");
+        flow.summary("Index already current");
+        flow.detail("recent sync state; no filesystem scan");
+        flow.detail(timing_summary(&timings));
+        return Ok(());
+    }
     let (changes, visible_before) =
         collect_filesystem_changes(cfg, &options, &mut scanned, &mut skipped, &mut timings)?;
     if changes.is_empty() {
@@ -2652,7 +2783,13 @@ fn run_watch_daemon(cfg: &ProjectConfig, watch_options: WatchOptions) -> Result<
         root: cfg.root.clone(),
         pid: std::process::id(),
     })?;
-    run_watch_loop(cfg, watch_options, None, None)?;
+    run_watch_loop(
+        cfg,
+        watch_options,
+        None,
+        None,
+        Arc::new(WatchState::default()),
+    )?;
     append_watch_log(
         &cfg.root,
         &format!("watch-daemon-stop pid={}", std::process::id()),
@@ -2665,6 +2802,7 @@ fn start_embedded_watch_thread(
     watch_options: WatchOptions,
     search_record: SearchDaemonRecord,
     shutdown: Arc<AtomicBool>,
+    watch_state: Arc<WatchState>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let result = (|| -> Result<()> {
@@ -2678,7 +2816,13 @@ fn start_embedded_watch_thread(
                 &cfg.root,
                 &format!("project-service-watch-start pid={}", std::process::id()),
             )?;
-            run_watch_loop(&cfg, watch_options, Some(&search_record), Some(&shutdown))?;
+            run_watch_loop(
+                &cfg,
+                watch_options,
+                Some(&search_record),
+                Some(&shutdown),
+                watch_state,
+            )?;
             append_watch_log(
                 &cfg.root,
                 &format!("project-service-watch-stop pid={}", std::process::id()),
@@ -2697,6 +2841,7 @@ fn run_watch_loop(
     watch_options: WatchOptions,
     search_record: Option<&SearchDaemonRecord>,
     shutdown: Option<&AtomicBool>,
+    watch_state: Arc<WatchState>,
 ) -> Result<()> {
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
     let mut watcher = RecommendedWatcher::new(
@@ -2707,23 +2852,23 @@ fn run_watch_loop(
     )?;
     watcher.watch(&cfg.root, RecursiveMode::Recursive)?;
 
-    let mut pending = HashSet::default();
     let idle = Duration::from_secs(watch_options.idle_seconds.max(1));
     loop {
         if shutdown.is_some_and(|flag| flag.load(AtomicOrdering::Relaxed)) {
             break;
         }
         match rx.recv_timeout(idle) {
-            Ok(Ok(event)) => collect_event_paths(cfg, event, &mut pending),
+            Ok(Ok(event)) => {
+                let mut pending = watch_state.pending.lock().unwrap();
+                collect_event_paths(cfg, event, &mut pending);
+            }
             Ok(Err(_)) => {}
             Err(RecvTimeoutError::Timeout) => {
-                if !pending.is_empty() {
-                    if flush_watch_batch(cfg, &pending)? {
-                        if let Some(record) = search_record {
-                            let _ = refresh_search_daemon_record(record);
-                        }
+                let outcome = flush_watch_state(cfg, &watch_state)?;
+                if outcome.changed {
+                    if let Some(record) = search_record {
+                        let _ = refresh_search_daemon_record(record);
                     }
-                    pending.clear();
                 }
                 if maybe_compact_idle(cfg, watch_options)? {
                     if let Some(flag) = shutdown {
@@ -2770,6 +2915,27 @@ fn watch_event_can_change_index(kind: &EventKind) -> bool {
         | EventKind::Modify(_)
         | EventKind::Remove(_)
         | EventKind::Other => true,
+    }
+}
+
+fn flush_watch_state(cfg: &ProjectConfig, watch_state: &WatchState) -> Result<WatchFlushOutcome> {
+    let mut pending = watch_state.pending.lock().unwrap();
+    if pending.is_empty() {
+        return Ok(WatchFlushOutcome {
+            events: 0,
+            changed: false,
+        });
+    }
+    let paths: HashSet<String> = pending.iter().cloned().collect();
+    match flush_watch_batch(cfg, &paths) {
+        Ok(changed) => {
+            pending.clear();
+            Ok(WatchFlushOutcome {
+                events: paths.len(),
+                changed,
+            })
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -2912,6 +3078,7 @@ fn compact_root(cfg: &ProjectConfig) -> Result<()> {
             write_elapsed
         ),
     )?;
+    drop_built_index_async(compacted);
     Ok(())
 }
 
@@ -2984,6 +3151,7 @@ fn command_compact(args: &[String]) -> Result<i32> {
     }
     println!("root: {}", display_path(&cfg.root));
     println!("index: {}", display_path(&path));
+    std::mem::forget(compacted);
     Ok(0)
 }
 
@@ -3282,6 +3450,7 @@ fn command_search(args: &[String]) -> Result<i32> {
         ));
         flow.detail(timing_summary(&timings));
         flow.done();
+        std::mem::forget(built);
         index = MappedIndex::open(&path);
     }
     let index = index?;
@@ -3546,6 +3715,7 @@ fn try_search_daemon(
             }
             return Ok(Some(code));
         }
+        stop_process(record.pid);
         let _ = fs::remove_file(search_daemon_record_path(root));
     }
     let start_timer = Instant::now();
@@ -3563,10 +3733,34 @@ fn try_search_daemon(
                 }
                 return Ok(Some(code));
             }
+            stop_process(record.pid);
+            let _ = fs::remove_file(search_daemon_record_path(root));
         }
         std::thread::sleep(Duration::from_millis(10));
     }
     Ok(None)
+}
+
+fn try_update_via_daemon(cfg: &ProjectConfig) -> Result<Option<i32>> {
+    if env::var_os("INDEXSEARCH_NO_DAEMON").is_some() {
+        return Ok(None);
+    }
+    let Some(record) = read_valid_search_daemon_record(&cfg.root, None)? else {
+        return Ok(None);
+    };
+    let args = vec![
+        SEARCH_DAEMON_CONTROL_ARG.to_string(),
+        SEARCH_DAEMON_CONTROL_UPDATE.to_string(),
+    ];
+    match request_search_daemon(&record, &args, None) {
+        Ok(SEARCH_DAEMON_CONTROL_FALLBACK_CODE) => Ok(None),
+        Ok(code) => Ok(Some(code)),
+        Err(_) => {
+            stop_process(record.pid);
+            let _ = fs::remove_file(search_daemon_record_path(&cfg.root));
+            Ok(None)
+        }
+    }
 }
 
 fn write_profile_events(profile: &SearchProfile) -> Result<()> {
@@ -3947,9 +4141,9 @@ fn duplicate_stdout_for_process(pid: u32) -> std::io::Result<RawHandle> {
 
 #[cfg(windows)]
 fn windows_direct_stdout_enabled() -> bool {
-    matches!(
+    !matches!(
         env::var("INDEXSEARCH_WINDOWS_DIRECT_STDOUT").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+        Ok("0") | Ok("false") | Ok("FALSE") | Ok("no") | Ok("NO")
     )
 }
 
@@ -3988,6 +4182,9 @@ fn run_search_daemon(root: &Path, watch_options: Option<WatchOptions>) -> Result
         MappedIndex::open(&index_path(record.root.as_path()))?
     };
     let shutdown = Arc::new(AtomicBool::new(false));
+    let watch_state = watch_options
+        .as_ref()
+        .map(|_| Arc::new(WatchState::default()));
     let _watch_thread = if let Some(watch_options) = watch_options {
         let cfg = load_config(root)?;
         Some(start_embedded_watch_thread(
@@ -3995,6 +4192,10 @@ fn run_search_daemon(root: &Path, watch_options: Option<WatchOptions>) -> Result
             watch_options,
             record.clone(),
             Arc::clone(&shutdown),
+            watch_state
+                .as_ref()
+                .expect("watch state exists when watch options are set")
+                .clone(),
         ))
     } else {
         None
@@ -4003,7 +4204,12 @@ fn run_search_daemon(root: &Path, watch_options: Option<WatchOptions>) -> Result
     while !shutdown.load(AtomicOrdering::Relaxed) {
         match listener.accept() {
             Ok(mut stream) => {
-                let _ = handle_search_daemon_client(&mut stream, &record, &index);
+                let _ = handle_search_daemon_client(
+                    &mut stream,
+                    &record,
+                    &index,
+                    watch_state.as_deref(),
+                );
             }
             Err(err) => {
                 if err
@@ -4026,6 +4232,7 @@ fn handle_search_daemon_client(
     stream: &mut SearchDaemonStream,
     record: &SearchDaemonRecord,
     index: &MappedIndex,
+    watch_state: Option<&WatchState>,
 ) -> Result<()> {
     let mut profile = SearchProfile::default();
     let read_timer = Instant::now();
@@ -4051,6 +4258,14 @@ fn handle_search_daemon_client(
     }
     if let Some(cwd_timer) = cwd_timer {
         profile.record("daemon_set_cwd", cwd_timer.elapsed());
+    }
+    if is_daemon_update_request(&cwd.args) {
+        close_stdout_fd(stdout_fd.take());
+        let result = handle_search_daemon_update_client(stream, record, index, watch_state);
+        if let Some(dir) = current_dir {
+            let _ = env::set_current_dir(dir);
+        }
+        return result;
     }
     let parse_timer = Instant::now();
     let result = parse_search_args(&cwd.args).and_then(|options| {
@@ -4085,6 +4300,69 @@ fn handle_search_daemon_client(
         let _ = env::set_current_dir(dir);
     }
     Ok(())
+}
+
+fn is_daemon_update_request(args: &[String]) -> bool {
+    args.len() == 2
+        && args[0] == SEARCH_DAEMON_CONTROL_ARG
+        && args[1] == SEARCH_DAEMON_CONTROL_UPDATE
+}
+
+fn handle_search_daemon_update_client(
+    stream: &mut SearchDaemonStream,
+    record: &SearchDaemonRecord,
+    index: &MappedIndex,
+    watch_state: Option<&WatchState>,
+) -> Result<()> {
+    write_search_daemon_response_begin(stream)?;
+    let Some(watch_state) = watch_state else {
+        write_search_daemon_done(stream, SEARCH_DAEMON_CONTROL_FALLBACK_CODE)?;
+        return Ok(());
+    };
+    let cfg = load_config(&record.root)?;
+    if cfg.hash != index.config_hash {
+        write_search_daemon_done(stream, SEARCH_DAEMON_CONTROL_FALLBACK_CODE)?;
+        return Ok(());
+    }
+    let timer = Instant::now();
+    let outcome = flush_watch_state(&cfg, watch_state)?;
+    if outcome.changed {
+        let _ = refresh_search_daemon_record(record);
+    }
+    let elapsed = timer.elapsed().as_secs_f64();
+    let message = if outcome.events == 0 {
+        format!(
+            "updated index (watcher current, 0 pending events) in {:.3}s\nroot: {}\nindex: {}\n",
+            elapsed,
+            display_path(&record.root),
+            display_path(&index_path(&record.root))
+        )
+    } else if outcome.changed {
+        format!(
+            "updated index from watcher ({} pending events flushed) in {:.3}s\nroot: {}\nindex: {}\n",
+            outcome.events,
+            elapsed,
+            display_path(&record.root),
+            display_path(&index_path(&record.root))
+        )
+    } else {
+        format!(
+            "updated index (watcher current, {} pending events produced no index changes) in {:.3}s\nroot: {}\nindex: {}\n",
+            outcome.events,
+            elapsed,
+            display_path(&record.root),
+            display_path(&index_path(&record.root))
+        )
+    };
+    append_watch_log(
+        &record.root,
+        &format!(
+            "manual-update events={} changed={} elapsed={:.3}s",
+            outcome.events, outcome.changed, elapsed
+        ),
+    )?;
+    write_search_daemon_chunk(stream, SEARCH_DAEMON_STDOUT_FRAME, message.as_bytes())?;
+    write_search_daemon_done(stream, 0)
 }
 
 fn search_daemon_output_to_stream(
@@ -4416,10 +4694,11 @@ fn refresh_index_for_search(cfg: &ProjectConfig, options: &Options) -> Result<()
         ));
         flow.detail(timing_summary(&timings));
         flow.done();
+        std::mem::forget(built);
         return Ok(());
     }
 
-    let Some(changes) = collect_git_changes(&cfg.root, options.git_untracked)? else {
+    let Some(changes) = collect_git_changes(&cfg.root, true)? else {
         return Ok(());
     };
     if changes.is_empty() {
@@ -4544,10 +4823,6 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
             "--no-auto-index" => options.auto_index = false,
             "--auto-update" => options.auto_update = true,
             "--no-daemon" => options.daemon = false,
-            "--auto-update-untracked" => {
-                options.auto_update = true;
-                options.git_untracked = true;
-            }
             "--" => positional_only = true,
             "--no-messages" | "--no-ignore" | "--no-ignore-vcs" => {}
             "--colors" | "-j" | "--threads" => {
@@ -5470,9 +5745,28 @@ fn read_index_state(root: &Path) -> Result<IndexState> {
         };
         if key == "git_head" && !value.is_empty() {
             state.git_head = Some(value.to_string());
+        } else if key == "updated_ns" && !value.is_empty() {
+            state.updated_ns = value.parse().ok();
         }
     }
     Ok(state)
+}
+
+fn index_state_recently_synced(root: &Path, index: &Path) -> Result<bool> {
+    let state = read_index_state(root)?;
+    let Some(updated_ns) = state.updated_ns else {
+        return Ok(false);
+    };
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    if now_ns.saturating_sub(updated_ns) > RECENT_SYNC_NO_SCAN_WINDOW.as_nanos() {
+        return Ok(false);
+    }
+    let state_meta = fs::metadata(state_path(root))?;
+    let index_meta = fs::metadata(index)?;
+    Ok(mtime_ns(&state_meta) >= mtime_ns(&index_meta))
 }
 
 fn save_index_state(root: &Path) -> Result<()> {
@@ -10281,6 +10575,8 @@ fn stop_process(pid: u32) {
     {
         let _ = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
     }
 }

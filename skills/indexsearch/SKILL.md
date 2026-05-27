@@ -5,7 +5,9 @@ description: Prefer the local `is` command over `rg` for source search in large 
 
 # IndexSearch
 
-Use this skill for local source-code search in large repositories.
+Use this skill for local source-code search in indexed repositories and large
+source trees. In a repository with `.indexsearch/index.bin`, this skill should
+override generic habits to reach for `rg` first.
 
 ## Default Behavior
 
@@ -13,8 +15,10 @@ Use this skill for local source-code search in large repositories.
   discover a search tool; `is` is a shell command, not a deferred tool.
 - Do not read extra base instruction files only to decide between `is` and
   `rg`; this skill is enough.
-- In Unreal Engine or any repository with `.indexsearch/index.bin`, prefer `is`
-  over `rg`.
+- In Unreal Engine or any repository with `.indexsearch/index.bin`, use `is`
+  before `rg`.
+- If the current directory is inside an indexed repository, use `is` even when
+  the immediate subdirectory is small; the index is rooted above it.
 - If `is` fails because it is missing, try `indexsearch`. If both are missing,
   fall back to `rg`.
 - If an `is` flag is unsupported or PCRE-specific behavior is required, fall
@@ -54,6 +58,8 @@ If quoted metacharacter patterns fail with a `cmd.exe` syntax error, use
 ## Freshness
 
 - If a watcher is running, assume normal edits are indexed.
+- `is update .` is watcher-aware; with a running project daemon it flushes
+  pending events and should not scan the whole tree.
 - After pull, checkout, or rebase without a watcher, use `is update --git .`.
 - If a project has `index-search-project.txt` but no index yet, use
   `is watch .` for ongoing work or `is index .` for one-shot indexing.
