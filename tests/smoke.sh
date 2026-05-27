@@ -201,6 +201,9 @@ cat > "$watch_tmp/index-search-project.txt" <<'CFG'
 CFG
 printf 'watch_first\n' > "$watch_tmp/a.txt"
 "$bin" watch --idle-seconds 1 --compact-delta-count 100 "$watch_tmp" >/dev/null
+watch_pid="$(awk -F= '$1 == "pid" { print $2 }' "$watch_tmp/.indexsearch/search-daemon.txt")"
+listed_watch="$("$bin" list-watches)"
+grep -q "pid=$watch_pid" <<<"$listed_watch"
 mkdir -p "$watch_tmp/sub"
 covered="$("$bin" watch "$watch_tmp/sub")"
 grep -q 'watch already covered' <<<"$covered"

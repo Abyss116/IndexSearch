@@ -10,13 +10,30 @@ searches avoid walking the filesystem. The CLI intentionally follows common
 codebases.
 
 The short command is `is`; the full command is `indexsearch`. Both user-facing
-commands are lightweight frontends. They talk to `is-daemon`, the full
-indexer/search backend, for indexing, watching, and daemon-backed search.
+commands are lightweight frontends. They talk to `is-daemon`, the per-project
+backend service that owns indexing, filesystem watching, idle compaction, and
+daemon-backed search.
 
 ## Install
 
 Prebuilt binaries are attached to the
 [latest GitHub Release](https://github.com/Abyss116/IndexSearch/releases/latest).
+
+Install or update to the latest release with one command:
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/Abyss116/IndexSearch/main/install.sh | sh
+```
+
+```powershell
+# Windows PowerShell
+irm https://raw.githubusercontent.com/Abyss116/IndexSearch/main/install.ps1 | iex
+```
+
+These scripts download the latest GitHub Release, run `indexsearch install`,
+and install the same `indexsearch`, `is`, and `is-daemon` layout used by direct
+release archives. Re-running the command updates the local install.
 
 Homebrew:
 
@@ -80,7 +97,7 @@ Get-Process is-daemon -ErrorAction SilentlyContinue | Stop-Process -Force
 ```
 
 Newer releases also write a versioned backend such as
-`is-daemon-0.3.17.exe`, so a locked old backend no longer prevents installing
+`is-daemon-0.3.18.exe`, so a locked old backend no longer prevents installing
 the new frontend.
 
 ## Quick Start
@@ -177,10 +194,16 @@ is watch-log .
 is unwatch .
 ```
 
-The watcher first synchronizes the index with the current filesystem state,
+`watch`, `list-watches`, `watch-log`, and `unwatch` remain the user-facing
+names because the main reason to manage the service manually is filesystem
+watching. Internally, a watched project is now served by one `is-daemon`
+process: it owns search RPC, filesystem watching, startup sync, and idle
+compaction.
+
+The service first synchronizes the index with the current filesystem state,
 then writes batched delta updates on file events and can compact during idle
 periods. If no base index exists, `is watch .` builds it first; otherwise it
-performs a filesystem-based incremental update so edits made while the watcher
+performs a filesystem-based incremental update so edits made while the service
 was stopped are included. Overlapping watches are normalized so a parent watch
 covers child directories. `watch-log` records real index/update/compact
 activity and omits no-op filesystem events.
@@ -198,14 +221,15 @@ is watch . --idle-seconds 5 --compact-delta-count 16 --compact-delta-bytes 256mb
 
 ## Search Daemon
 
-Hot searches automatically try a per-project search daemon. The frontend first
-resolves the project root from the current path, ancestor `.indexsearch`
-directories, or `index-search-project.txt`, ensures the matching watcher is
-running, and then connects to or starts the search daemon. The daemon keeps the
-mmap-backed index open and serves requests over localhost. `indexsearch` and
-`is` are intentionally much smaller than the full backend and do only enough
-client-side work to locate the project, validate or start `is-daemon`, pass
-through arguments, and stream response frames to stdout/stderr.
+Hot searches automatically try the per-project daemon service. The frontend
+first resolves the project root from the current path, ancestor `.indexsearch`
+directories, or `index-search-project.txt`, ensures the matching service is
+running, and then connects to it. The daemon keeps the mmap-backed index open,
+serves requests over localhost or a Unix socket, and watches the project for
+incremental updates. `indexsearch` and `is` are intentionally much smaller than
+the full backend and do only enough client-side work to locate the project,
+validate or start `is-daemon`, pass through arguments, and stream response
+frames to stdout/stderr.
 
 Use either form to bypass the daemon:
 
@@ -232,10 +256,12 @@ cd /path/to/UnrealEngine
 is watch .
 ```
 
-The template keeps source, shader, config, plugin, project, script, and
-build-rule files searchable while skipping generated folders, binary assets,
-archives, object files, and debug artifacts. The same template is bundled inside
-the agent skill at
+The template keeps source, shader, config, plugin, project, script, build-rule,
+and `*.log` files searchable while skipping generated folders, binary assets,
+archives, object files, and debug artifacts. If the first interactive `is`
+inside a tree discovers an Unreal Engine root or a `.uproject` root, the
+auto-created `index-search-project.txt` uses this UE template instead of the
+minimal generic config. The same template is bundled inside the agent skill at
 `skills/indexsearch/assets/unreal-engine-index-search-project.txt`.
 
 ## Agent Skill
@@ -362,15 +388,6 @@ Tagged releases also contain optional package-manager publication jobs:
 If either secret is absent, that publication job is skipped and the release
 artifacts are still produced.
 
-## License
-
-IndexSearch is distributed under the terms of both the MIT license and the
-Apache License 2.0. You may choose either license; see `LICENSE-MIT` and
-`LICENSE-APACHE`.
-
-The references to ripgrep and qgrep in this repository are compatibility and
-benchmark references only; their source code is not vendored into IndexSearch.
-
 ## Supported rg-like Flags
 
 Normal search output follows `rg`'s auto decoration behavior. When stdout is a
@@ -442,3 +459,12 @@ The explicit `search` subcommand is optional. `is PATTERN` searches directly,
 like `rg PATTERN`. If the pattern is also an IndexSearch command name such as
 `index`, `status`, or `watch`, use `is -- PATTERN [PATH ...]` or
 `is search PATTERN [PATH ...]`.
+
+## License
+
+IndexSearch is distributed under the terms of both the MIT license and the
+Apache License 2.0. You may choose either license; see `LICENSE-MIT` and
+`LICENSE-APACHE`.
+
+The references to ripgrep and qgrep in this repository are compatibility and
+benchmark references only; their source code is not vendored into IndexSearch.

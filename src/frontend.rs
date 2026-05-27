@@ -591,6 +591,7 @@ fn start_daemon(root: &Path) -> Result<(), String> {
     let mut command = Command::new(backend);
     command
         .arg("search-daemon")
+        .arg("--watch")
         .arg("--detach")
         .arg(root)
         .stdin(Stdio::null())

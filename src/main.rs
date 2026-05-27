@@ -15,7 +15,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -417,6 +418,7 @@ struct QualifiedCallSpec {
     class_min_extra: usize,
 }
 
+#[derive(Clone)]
 struct SearchDaemonRecord {
     pid: u32,
     port: u16,
@@ -583,10 +585,10 @@ fn print_help() {
     help_command(
         &style,
         "watch [PATH]",
-        "start a background watcher for a root",
+        "start the project daemon service for a root",
     );
-    help_command(&style, "list-watches", "list active watcher records");
-    help_command(&style, "unwatch <ID|PATH>", "stop a watcher");
+    help_command(&style, "list-watches", "list active project services");
+    help_command(&style, "unwatch <ID|PATH>", "stop a project service");
     help_command(
         &style,
         "watch-log [PATH]",
@@ -794,7 +796,7 @@ fn print_watch_help() {
         &style,
         "watch",
         "[OPTIONS] [PATH]",
-        "start a background watcher for a root",
+        "start the project daemon service for a root",
     );
     help_section(&style, "Options");
     help_option(
@@ -816,12 +818,12 @@ fn print_watch_help() {
 
 fn print_list_watches_help() {
     let style = HelpStyle::new();
-    command_usage(&style, "list-watches", "", "list active watcher records");
+    command_usage(&style, "list-watches", "", "list active project services");
 }
 
 fn print_unwatch_help() {
     let style = HelpStyle::new();
-    command_usage(&style, "unwatch", "<ID|PATH>", "stop a watcher");
+    command_usage(&style, "unwatch", "<ID|PATH>", "stop a project service");
 }
 
 fn print_watch_log_help() {
@@ -1386,6 +1388,7 @@ fn command_watch(args: &[String]) -> Result<i32> {
     for (path, record) in child_watches {
         stop_process(record.pid);
         let _ = fs::remove_file(path);
+        let _ = fs::remove_file(search_daemon_record_path(&record.root));
         let _ = append_watch_log(
             &record.root,
             &format!(
@@ -1410,7 +1413,8 @@ fn command_watch(args: &[String]) -> Result<i32> {
     let exe = env::current_exe()?;
     let mut command = Command::new(exe);
     command
-        .arg("watch-daemon")
+        .arg("search-daemon")
+        .arg("--watch")
         .arg(&cfg.root)
         .arg("--idle-seconds")
         .arg(watch_options.idle_seconds.to_string())
@@ -1429,10 +1433,17 @@ fn command_watch(args: &[String]) -> Result<i32> {
         pid: child.id(),
     };
     write_watch_record(&record)?;
+    let start = Instant::now();
+    while start.elapsed() < SEARCH_DAEMON_START_TIMEOUT {
+        if read_valid_search_daemon_record(&cfg.root, None)?.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     append_watch_log(
         &cfg.root,
         &format!(
-            "watch-start pid={} idle_seconds={} compact_delta_count={} compact_delta_bytes={}",
+            "project-service-start pid={} idle_seconds={} compact_delta_count={} compact_delta_bytes={}",
             record.pid,
             watch_options.idle_seconds,
             watch_options.compact_delta_count,
@@ -1608,6 +1619,7 @@ fn command_unwatch(args: &[String]) -> Result<i32> {
     for (path, record) in matched {
         stop_process(record.pid);
         let _ = fs::remove_file(path);
+        let _ = fs::remove_file(search_daemon_record_path(&record.root));
         let _ = append_watch_log(&record.root, &format!("watch-stop pid={}", record.pid));
         println!(
             "unwatched {} pid={} {}",
@@ -2138,7 +2150,52 @@ fn run_watch_daemon(cfg: &ProjectConfig, watch_options: WatchOptions) -> Result<
         root: cfg.root.clone(),
         pid: std::process::id(),
     })?;
+    run_watch_loop(cfg, watch_options, None, None)?;
+    append_watch_log(
+        &cfg.root,
+        &format!("watch-daemon-stop pid={}", std::process::id()),
+    )?;
+    Ok(0)
+}
 
+fn start_embedded_watch_thread(
+    cfg: ProjectConfig,
+    watch_options: WatchOptions,
+    search_record: SearchDaemonRecord,
+    shutdown: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let result = (|| -> Result<()> {
+            fs::create_dir_all(watch_registry_dir())?;
+            write_watch_record(&WatchRecord {
+                id: watch_id(&cfg.root),
+                root: cfg.root.clone(),
+                pid: std::process::id(),
+            })?;
+            append_watch_log(
+                &cfg.root,
+                &format!("project-service-watch-start pid={}", std::process::id()),
+            )?;
+            run_watch_loop(&cfg, watch_options, Some(&search_record), Some(&shutdown))?;
+            append_watch_log(
+                &cfg.root,
+                &format!("project-service-watch-stop pid={}", std::process::id()),
+            )?;
+            Ok(())
+        })();
+        if let Err(err) = result {
+            let _ = append_watch_log(&cfg.root, &format!("project-service-watch-error {err:#}"));
+            shutdown.store(true, AtomicOrdering::Relaxed);
+        }
+    })
+}
+
+fn run_watch_loop(
+    cfg: &ProjectConfig,
+    watch_options: WatchOptions,
+    search_record: Option<&SearchDaemonRecord>,
+    shutdown: Option<&AtomicBool>,
+) -> Result<()> {
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
     let mut watcher = RecommendedWatcher::new(
         move |res| {
@@ -2151,24 +2208,38 @@ fn run_watch_daemon(cfg: &ProjectConfig, watch_options: WatchOptions) -> Result<
     let mut pending = HashSet::default();
     let idle = Duration::from_secs(watch_options.idle_seconds.max(1));
     loop {
+        if shutdown.is_some_and(|flag| flag.load(AtomicOrdering::Relaxed)) {
+            break;
+        }
         match rx.recv_timeout(idle) {
             Ok(Ok(event)) => collect_event_paths(cfg, event, &mut pending),
             Ok(Err(_)) => {}
             Err(RecvTimeoutError::Timeout) => {
                 if !pending.is_empty() {
-                    flush_watch_batch(cfg, &pending)?;
+                    if flush_watch_batch(cfg, &pending)? {
+                        if let Some(record) = search_record {
+                            let _ = refresh_search_daemon_record(record);
+                        }
+                    }
                     pending.clear();
                 }
-                maybe_compact_idle(cfg, watch_options)?;
+                if maybe_compact_idle(cfg, watch_options)? {
+                    if let Some(flag) = shutdown {
+                        let _ = append_watch_log(
+                            &cfg.root,
+                            "project-service-restart-required reason=compact",
+                        );
+                        flag.store(true, AtomicOrdering::Relaxed);
+                        break;
+                    }
+                } else if let Some(record) = search_record {
+                    let _ = refresh_search_daemon_record(record);
+                }
             }
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
-    append_watch_log(
-        &cfg.root,
-        &format!("watch-daemon-stop pid={}", std::process::id()),
-    )?;
-    Ok(0)
+    Ok(())
 }
 
 fn collect_event_paths(cfg: &ProjectConfig, event: Event, pending: &mut HashSet<String>) {
@@ -2185,7 +2256,7 @@ fn collect_event_paths(cfg: &ProjectConfig, event: Event, pending: &mut HashSet<
     }
 }
 
-fn flush_watch_batch(cfg: &ProjectConfig, paths: &HashSet<String>) -> Result<()> {
+fn flush_watch_batch(cfg: &ProjectConfig, paths: &HashSet<String>) -> Result<bool> {
     let _lock = acquire_exclusive_lock(&cfg.root)?;
     let timer = Instant::now();
     let options = Options {
@@ -2200,7 +2271,7 @@ fn flush_watch_batch(cfg: &ProjectConfig, paths: &HashSet<String>) -> Result<()>
         })
         .collect();
     if changes.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     if !index_path(&cfg.root).exists() {
         let mut timings = Timings::default();
@@ -2229,7 +2300,7 @@ fn flush_watch_batch(cfg: &ProjectConfig, paths: &HashSet<String>) -> Result<()>
                 timing_summary(&timings)
             ),
         )?;
-        return Ok(());
+        return Ok(true);
     }
     let mut scanned = 0;
     let mut skipped = 0;
@@ -2238,7 +2309,7 @@ fn flush_watch_batch(cfg: &ProjectConfig, paths: &HashSet<String>) -> Result<()>
         build_delta_index(cfg, &options, &changes, &mut scanned, &mut skipped)?;
     let process_elapsed = process_timer.elapsed().as_secs_f64();
     if stats.added == 0 && stats.updated == 0 && stats.removed == 0 {
-        return Ok(());
+        return Ok(false);
     }
     let write_timer = Instant::now();
     save_delta(&cfg.root, &delta, &meta)?;
@@ -2261,13 +2332,13 @@ fn flush_watch_batch(cfg: &ProjectConfig, paths: &HashSet<String>) -> Result<()>
             write_elapsed
         ),
     )?;
-    Ok(())
+    Ok(true)
 }
 
-fn maybe_compact_idle(cfg: &ProjectConfig, watch_options: WatchOptions) -> Result<()> {
+fn maybe_compact_idle(cfg: &ProjectConfig, watch_options: WatchOptions) -> Result<bool> {
     let files = delta_files(&cfg.root)?;
     if files.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let total_bytes = files
         .iter()
@@ -2276,10 +2347,11 @@ fn maybe_compact_idle(cfg: &ProjectConfig, watch_options: WatchOptions) -> Resul
     if files.len() < watch_options.compact_delta_count
         && total_bytes < watch_options.compact_delta_bytes
     {
-        return Ok(());
+        return Ok(false);
     }
     let _lock = acquire_exclusive_lock(&cfg.root)?;
-    compact_root(cfg)
+    compact_root(cfg)?;
+    Ok(true)
 }
 
 fn compact_root(cfg: &ProjectConfig) -> Result<()> {
@@ -2818,6 +2890,7 @@ fn start_search_daemon(root: &Path) -> Result<()> {
     let mut command = Command::new(exe);
     command
         .arg("search-daemon")
+        .arg("--watch")
         .arg("--detach")
         .arg(root)
         .stdin(Stdio::null())
@@ -2830,19 +2903,43 @@ fn start_search_daemon(root: &Path) -> Result<()> {
 
 fn command_search_daemon(args: &[String]) -> Result<i32> {
     let mut detach = false;
+    let mut watch_options = None;
     let mut root = None;
-    for arg in args {
-        if arg == "--detach" {
-            detach = true;
-        } else {
-            root = Some(PathBuf::from(arg));
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--detach" => detach = true,
+            "--watch" => watch_options = Some(WatchOptions::default()),
+            "--idle-seconds" => {
+                i += 1;
+                let value = args.get(i).context("missing --idle-seconds value")?;
+                watch_options
+                    .get_or_insert_with(WatchOptions::default)
+                    .idle_seconds = value.parse()?;
+            }
+            "--compact-delta-count" => {
+                i += 1;
+                let value = args.get(i).context("missing --compact-delta-count value")?;
+                watch_options
+                    .get_or_insert_with(WatchOptions::default)
+                    .compact_delta_count = value.parse()?;
+            }
+            "--compact-delta-bytes" => {
+                i += 1;
+                let value = args.get(i).context("missing --compact-delta-bytes value")?;
+                watch_options
+                    .get_or_insert_with(WatchOptions::default)
+                    .compact_delta_bytes = parse_size(value)?;
+            }
+            value => root = Some(PathBuf::from(value)),
         }
+        i += 1;
     }
     let root = root.context("search-daemon requires a root")?;
     if detach {
         daemonize_current_process()?;
     }
-    run_search_daemon(&root)
+    run_search_daemon(&root, watch_options)
 }
 
 enum SearchDaemonListener {
@@ -2887,6 +2984,16 @@ impl SearchDaemonListener {
             #[cfg(unix)]
             Self::Unix { path, .. } => Some(path.clone()),
         }
+    }
+
+    fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
+        match self {
+            #[cfg(not(unix))]
+            Self::Tcp(listener) => listener.set_nonblocking(nonblocking)?,
+            #[cfg(unix)]
+            Self::Unix { listener, .. } => listener.set_nonblocking(nonblocking)?,
+        }
+        Ok(())
     }
 
     fn accept(&self) -> Result<SearchDaemonStream> {
@@ -3133,7 +3240,7 @@ fn windows_direct_stdout_enabled() -> bool {
     )
 }
 
-fn run_search_daemon(root: &Path) -> Result<i32> {
+fn run_search_daemon(root: &Path, watch_options: Option<WatchOptions>) -> Result<i32> {
     let index_meta = fs::metadata(index_path(root))?;
     let state_meta = fs::metadata(state_path(root)).ok();
     let exe = env::current_exe()?;
@@ -3161,10 +3268,39 @@ fn run_search_daemon(root: &Path) -> Result<i32> {
         let _lock = acquire_shared_lock(root)?;
         MappedIndex::open(&index_path(record.root.as_path()))?
     };
-    loop {
-        let mut stream = listener.accept()?;
-        let _ = handle_search_daemon_client(&mut stream, &record, &index);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let _watch_thread = if let Some(watch_options) = watch_options {
+        let cfg = load_config(root)?;
+        Some(start_embedded_watch_thread(
+            cfg,
+            watch_options,
+            record.clone(),
+            Arc::clone(&shutdown),
+        ))
+    } else {
+        None
+    };
+    listener.set_nonblocking(true)?;
+    while !shutdown.load(AtomicOrdering::Relaxed) {
+        match listener.accept() {
+            Ok(mut stream) => {
+                let _ = handle_search_daemon_client(&mut stream, &record, &index);
+            }
+            Err(err) => {
+                if err
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::WouldBlock)
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                return Err(err);
+            }
+        }
     }
+    let _ = fs::remove_file(search_daemon_record_path(root));
+    let _ = fs::remove_file(watch_record_path(&watch_id(root)));
+    Ok(0)
 }
 
 fn handle_search_daemon_client(
@@ -3765,20 +3901,29 @@ fn load_or_create_config(start: &Path) -> Result<ProjectConfig> {
 }
 
 fn load_config_inner(start: &Path, create_default: bool) -> Result<ProjectConfig> {
-    let root = discover_root(start)?;
+    let root = if create_default {
+        discover_root_for_create(start)?
+    } else {
+        discover_root(start)?
+    };
     let path = root.join(PROJECT_FILE);
     let text = if path.exists() {
         fs::read_to_string(&path)?
     } else {
+        let default_config = if is_unreal_root(&root) {
+            EMBEDDED_UE_SKILL_CONFIG
+        } else {
+            DEFAULT_PROJECT_CONFIG
+        };
         if create_default {
             fs::create_dir_all(&root)?;
-            fs::write(&path, DEFAULT_PROJECT_CONFIG)?;
+            fs::write(&path, default_config)?;
             eprintln!(
                 "indexsearch: created default config: {}",
                 display_path(&path)
             );
         }
-        DEFAULT_PROJECT_CONFIG.to_string()
+        default_config.to_string()
     };
     let has_config = path.exists();
     let sections = parse_sections(&text);
@@ -3814,6 +3959,48 @@ fn discover_root(start: &Path) -> Result<PathBuf> {
         }
     }
     Ok(fallback)
+}
+
+fn discover_root_for_create(start: &Path) -> Result<PathBuf> {
+    let mut path = fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+    if path.is_file() {
+        path = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    }
+    let fallback = path.clone();
+    let mut current = Some(path.as_path());
+    while let Some(candidate) = current {
+        if candidate.join(PROJECT_FILE).exists() {
+            return Ok(candidate.to_path_buf());
+        }
+        current = candidate.parent();
+    }
+    let mut current = Some(fallback.as_path());
+    while let Some(candidate) = current {
+        if is_unreal_root(candidate) {
+            return Ok(candidate.to_path_buf());
+        }
+        current = candidate.parent();
+    }
+    Ok(fallback)
+}
+
+fn is_unreal_root(path: &Path) -> bool {
+    if path.join("Engine").join("Source").is_dir()
+        && (path.join("Engine").join("Build").is_dir()
+            || path.join("Engine").join("Config").is_dir())
+    {
+        return true;
+    }
+    fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .any(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("uproject"))
+        })
 }
 
 fn parse_sections(text: &str) -> BTreeMap<String, Vec<String>> {
@@ -8963,6 +9150,17 @@ fn write_search_daemon_record(record: &SearchDaemonRecord) -> Result<()> {
     }
     fs::write(search_daemon_record_path(&record.root), text)?;
     Ok(())
+}
+
+fn refresh_search_daemon_record(record: &SearchDaemonRecord) -> Result<()> {
+    let mut updated = record.clone();
+    let index_meta = fs::metadata(index_path(&updated.root))?;
+    let state_meta = fs::metadata(state_path(&updated.root)).ok();
+    updated.index_size = index_meta.len();
+    updated.index_mtime = mtime_ns(&index_meta);
+    updated.state_size = state_meta.as_ref().map(|meta| meta.len()).unwrap_or(0);
+    updated.state_mtime = state_meta.as_ref().map(mtime_ns).unwrap_or(0);
+    write_search_daemon_record(&updated)
 }
 
 fn read_valid_search_daemon_record(

@@ -96,6 +96,7 @@ jobs:
           fi
           cp README.md "dist/${{ matrix.artifact }}/"
           cp LICENSE-MIT LICENSE-APACHE "dist/${{ matrix.artifact }}/"
+          cp install.sh install.ps1 "dist/${{ matrix.artifact }}/"
           cp index-search-project.txt "dist/${{ matrix.artifact }}/"
           cp -R templates "dist/${{ matrix.artifact }}/"
           cp -R skills "dist/${{ matrix.artifact }}/"
