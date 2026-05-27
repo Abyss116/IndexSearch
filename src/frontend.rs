@@ -756,6 +756,7 @@ fn windows_direct_stdout_enabled() -> bool {
 
 fn start_daemon(root: &Path) -> Result<(), String> {
     let backend = backend_path()?;
+    let progress = ProgressLine::start("Starting service");
     let mut command = Command::new(backend);
     command
         .arg("search-daemon")
@@ -767,6 +768,7 @@ fn start_daemon(root: &Path) -> Result<(), String> {
         .stderr(Stdio::null());
     detach_background(&mut command);
     command.spawn().map_err(|err| err.to_string())?;
+    progress.finish("Project service started");
     Ok(())
 }
 
