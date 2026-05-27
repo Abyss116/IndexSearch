@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
@@ -600,7 +600,6 @@ fn run() -> Result<()> {
 struct WatchState {
     pending: Mutex<HashSet<String>>,
     index_io: Mutex<()>,
-    reload_index: AtomicBool,
     restart_required: AtomicBool,
 }
 
@@ -2712,6 +2711,7 @@ fn start_embedded_watch_thread(
     search_record: SearchDaemonRecord,
     shutdown: Arc<AtomicBool>,
     watch_state: Arc<WatchState>,
+    index_state: Arc<RwLock<MappedIndex>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let result = (|| -> Result<()> {
@@ -2731,6 +2731,7 @@ fn start_embedded_watch_thread(
                 Some(&search_record),
                 Some(&shutdown),
                 watch_state,
+                index_state,
             )?;
             append_project_log(
                 &cfg.root,
@@ -2751,6 +2752,7 @@ fn run_watch_loop(
     search_record: Option<&SearchDaemonRecord>,
     shutdown: Option<&AtomicBool>,
     watch_state: Arc<WatchState>,
+    index_state: Arc<RwLock<MappedIndex>>,
 ) -> Result<()> {
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
     let mut watcher = RecommendedWatcher::new(
@@ -2794,17 +2796,9 @@ fn run_watch_loop(
                 }
                 let compacted = {
                     let _io = watch_state.index_io.lock().unwrap();
-                    maybe_compact_idle(cfg, watch_options)?
+                    maybe_compact_idle(cfg, watch_options, search_record, &index_state)?
                 };
-                if compacted {
-                    watch_state
-                        .reload_index
-                        .store(true, AtomicOrdering::Relaxed);
-                    if let Some(record) = search_record {
-                        let _ = refresh_search_daemon_record(record);
-                    }
-                    let _ = append_project_log(&cfg.root, "project-service-reload reason=compact");
-                } else if let Some(record) = search_record {
+                if !compacted && let Some(record) = search_record {
                     let _ = refresh_search_daemon_record(record);
                 }
             }
@@ -2954,7 +2948,12 @@ fn flush_watch_batch(cfg: &ProjectConfig, paths: &HashSet<String>) -> Result<boo
     Ok(true)
 }
 
-fn maybe_compact_idle(cfg: &ProjectConfig, watch_options: WatchOptions) -> Result<bool> {
+fn maybe_compact_idle(
+    cfg: &ProjectConfig,
+    watch_options: WatchOptions,
+    search_record: Option<&SearchDaemonRecord>,
+    index_state: &Arc<RwLock<MappedIndex>>,
+) -> Result<bool> {
     let files = delta_files(&cfg.root)?;
     if files.is_empty() {
         return Ok(false);
@@ -2968,12 +2967,15 @@ fn maybe_compact_idle(cfg: &ProjectConfig, watch_options: WatchOptions) -> Resul
     {
         return Ok(false);
     }
-    let _lock = acquire_exclusive_lock(&cfg.root)?;
-    compact_root(cfg)?;
+    compact_root(cfg, search_record, index_state)?;
     Ok(true)
 }
 
-fn compact_root(cfg: &ProjectConfig) -> Result<()> {
+fn compact_root(
+    cfg: &ProjectConfig,
+    search_record: Option<&SearchDaemonRecord>,
+    index_state: &Arc<RwLock<MappedIndex>>,
+) -> Result<()> {
     let timer = Instant::now();
     let path = index_path(&cfg.root);
     let base = MappedIndex::open(&path)?;
@@ -2999,9 +3001,17 @@ fn compact_root(cfg: &ProjectConfig) -> Result<()> {
     drop(deltas);
     drop(base);
     let write_timer = Instant::now();
-    save_compacted_index(&compacted, &path)?;
+    let compact_path = compacted_index_temp_path(&path);
+    save_index(&compacted, &compact_path)?;
+    let _lock = acquire_exclusive_lock(&cfg.root)?;
+    let mut index_guard = index_state.write().unwrap();
+    publish_compacted_index(&compact_path, &path)?;
+    *index_guard = MappedIndex::open(&path)?;
     retire_delta_dir(&cfg.root)?;
     save_index_state(&cfg.root)?;
+    if let Some(record) = search_record {
+        let _ = refresh_search_daemon_record(record);
+    }
     let write_elapsed = write_timer.elapsed().as_secs_f64();
     append_project_log(
         &cfg.root,
@@ -3014,6 +3024,7 @@ fn compact_root(cfg: &ProjectConfig) -> Result<()> {
             write_elapsed
         ),
     )?;
+    append_project_log(&cfg.root, "project-service-reload reason=compact")?;
     drop_built_index_async(compacted);
     Ok(())
 }
@@ -4430,10 +4441,11 @@ fn run_search_daemon(root: &Path, watch_options: WatchOptions) -> Result<i32> {
         pid: record.pid,
     };
     write_project_record(&project)?;
-    let mut index = {
+    let index = {
         let _lock = acquire_shared_lock(root)?;
         MappedIndex::open(&index_path(record.root.as_path()))?
     };
+    let index_state = Arc::new(RwLock::new(index));
     let shutdown = Arc::new(AtomicBool::new(false));
     let watch_state = Arc::new(WatchState::default());
     let cfg = load_config(root)?;
@@ -4443,6 +4455,7 @@ fn run_search_daemon(root: &Path, watch_options: WatchOptions) -> Result<i32> {
         record.clone(),
         Arc::clone(&shutdown),
         Arc::clone(&watch_state),
+        Arc::clone(&index_state),
     );
     listener.set_nonblocking(true)?;
     while !shutdown.load(AtomicOrdering::Relaxed)
@@ -4453,7 +4466,7 @@ fn run_search_daemon(root: &Path, watch_options: WatchOptions) -> Result<i32> {
                 let _ = handle_search_daemon_client(
                     &mut stream,
                     &record,
-                    &mut index,
+                    Arc::clone(&index_state),
                     watch_state.as_ref(),
                 );
             }
@@ -4489,7 +4502,7 @@ fn run_search_daemon(root: &Path, watch_options: WatchOptions) -> Result<i32> {
 fn handle_search_daemon_client(
     stream: &mut SearchDaemonStream,
     record: &SearchDaemonRecord,
-    index: &mut MappedIndex,
+    index_state: Arc<RwLock<MappedIndex>>,
     watch_state: &WatchState,
 ) -> Result<()> {
     let mut profile = SearchProfile::default();
@@ -4520,7 +4533,7 @@ fn handle_search_daemon_client(
     if is_daemon_update_request(&cwd.args) {
         close_stdout_fd(stdout_fd.take());
         let _io = watch_state.index_io.lock().unwrap();
-        let result = handle_search_daemon_update_client(stream, record, index, watch_state);
+        let result = handle_search_daemon_update_client(stream, record, &index_state, watch_state);
         if let Some(dir) = current_dir {
             let _ = env::set_current_dir(dir);
         }
@@ -4534,19 +4547,19 @@ fn handle_search_daemon_client(
         if options.profile {
             profile.record("daemon_parse_args", parse_timer.elapsed());
         }
-        let _io = watch_state.index_io.lock().unwrap();
         let sync_timer = if options.profile {
             Some(Instant::now())
         } else {
             None
         };
-        sync_daemon_index_before_search(record, index, watch_state)?;
+        sync_daemon_index_before_search(record, watch_state)?;
         if let Some(sync_timer) = sync_timer {
             profile.record("daemon_sync_before_search", sync_timer.elapsed());
         }
+        let index = index_state.read().unwrap();
         let search_timer = Instant::now();
         let code = search_daemon_output_to_stream(
-            index,
+            &index,
             &options,
             stream,
             stdout_fd.take(),
@@ -4585,50 +4598,24 @@ fn is_daemon_update_request(args: &[String]) -> bool {
 
 fn sync_daemon_index_before_search(
     record: &SearchDaemonRecord,
-    index: &mut MappedIndex,
     watch_state: &WatchState,
 ) -> Result<()> {
     if watch_state.restart_required.load(AtomicOrdering::Relaxed) {
         bail!("project configuration changed; project service is restarting");
     }
-    if watch_state
-        .reload_index
-        .swap(false, AtomicOrdering::Relaxed)
-    {
-        let _lock = acquire_shared_lock(&record.root)?;
-        *index = MappedIndex::open(&index_path(&record.root))?;
-        let _ = refresh_search_daemon_record(record);
-    }
-    let cfg = load_config(&record.root)?;
-    if cfg.hash != index.config_hash {
-        watch_state
-            .restart_required
-            .store(true, AtomicOrdering::Relaxed);
-        bail!("project configuration changed; project service is restarting");
-    }
-    let outcome = flush_watch_state(&cfg, watch_state)?;
-    if outcome.changed {
-        let _ = refresh_search_daemon_record(record);
-    }
+    let _ = record;
     Ok(())
 }
 
 fn handle_search_daemon_update_client(
     stream: &mut SearchDaemonStream,
     record: &SearchDaemonRecord,
-    index: &mut MappedIndex,
+    index_state: &Arc<RwLock<MappedIndex>>,
     watch_state: &WatchState,
 ) -> Result<()> {
     write_search_daemon_response_begin(stream)?;
-    if watch_state
-        .reload_index
-        .swap(false, AtomicOrdering::Relaxed)
-    {
-        let _lock = acquire_shared_lock(&record.root)?;
-        *index = MappedIndex::open(&index_path(&record.root))?;
-        let _ = refresh_search_daemon_record(record);
-    }
     let cfg = load_config(&record.root)?;
+    let index = index_state.read().unwrap();
     if cfg.hash != index.config_hash {
         watch_state
             .restart_required
@@ -6832,16 +6819,24 @@ fn save_index_profiled(
 }
 
 fn save_compacted_index(index: &BuiltIndex, path: &Path) -> Result<()> {
-    let parent = path.parent().context("index path has no parent")?;
-    fs::create_dir_all(parent)?;
-    let compact_path = path.with_file_name(format!(
+    let compact_path = compacted_index_temp_path(path);
+    save_index(index, &compact_path)?;
+    publish_compacted_index(&compact_path, path)
+}
+
+fn compacted_index_temp_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
         "{}.compact.{}",
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or(INDEX_FILE),
         std::process::id()
-    ));
-    save_index(index, &compact_path)?;
+    ))
+}
+
+fn publish_compacted_index(compact_path: &Path, path: &Path) -> Result<()> {
+    let parent = path.parent().context("index path has no parent")?;
+    fs::create_dir_all(parent)?;
     let backup_path = path.with_file_name(format!(
         "{}.old.{}",
         path.file_name()
@@ -6852,7 +6847,7 @@ fn save_compacted_index(index: &BuiltIndex, path: &Path) -> Result<()> {
     if path.exists() {
         fs::rename(path, &backup_path)?;
     }
-    if let Err(err) = fs::rename(&compact_path, path) {
+    if let Err(err) = fs::rename(compact_path, path) {
         if backup_path.exists() {
             let _ = fs::rename(&backup_path, path);
         }

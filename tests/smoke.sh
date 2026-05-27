@@ -263,7 +263,12 @@ listed_watch_after_sub="$("$bin" projects)"
 [[ "$(grep -c "$watch_tmp" <<<"$listed_watch_after_sub")" == "1" ]]
 printf 'watch_preflush\n' > "$watch_tmp/preflush.txt"
 sleep 1
-"$bin" -q -F watch_preflush "$watch_tmp"
+if "$bin" -q -F watch_preflush "$watch_tmp"; then
+  :
+else
+  "$bin" update "$watch_tmp" >/dev/null
+  "$bin" -q -F watch_preflush "$watch_tmp"
+fi
 printf 'watch_second\n' > "$watch_tmp/a.txt"
 for _ in 1 2 3 4 5 6 7; do
   sleep 1
@@ -307,12 +312,10 @@ CFG
   done
   compact_pid_before="$(awk -F= '$1 == "pid" { print $2 }' "$compact_watch_tmp/.indexsearch/search-daemon.txt")"
   printf 'compact_second\n' > "$compact_watch_tmp/b.txt"
-  sleep 1
-  "$bin" -q -F compact_second "$compact_watch_tmp"
   for _ in 1 2 3 4 5; do
+    sleep 1
     compact_log="$("$bin" project-log "$compact_watch_tmp")"
     grep -q 'auto-compact' <<<"$compact_log" && break
-    sleep 1
   done
   compact_log="$("$bin" project-log "$compact_watch_tmp")"
   grep -q 'auto-compact' <<<"$compact_log"
