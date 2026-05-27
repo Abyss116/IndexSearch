@@ -2911,12 +2911,15 @@ fn command_search(args: &[String]) -> Result<i32> {
             return Ok(2);
         }
         drop(index);
+        let progress = ProgressLine::start("Indexing code");
         let mut scanned = 0;
         let mut skipped = 0;
         let built = build_index(&cfg, &options, &mut scanned, &mut skipped, None)?;
+        progress.update("Writing index");
         save_index(&built, &path)?;
         remove_delta_dir(&cfg.root)?;
         save_index_state(&cfg.root)?;
+        progress.finish("Indexed code");
         index = MappedIndex::open(&path);
     }
     let index = index?;
@@ -4001,12 +4004,15 @@ fn refresh_index_for_search(cfg: &ProjectConfig, options: &Options) -> Result<()
         .map(|index| index.config_hash != cfg.hash)
         .unwrap_or(true)
     {
+        let progress = ProgressLine::start("Indexing code");
         let mut scanned = 0;
         let mut skipped = 0;
         let built = build_index(cfg, options, &mut scanned, &mut skipped, None)?;
+        progress.update("Writing index");
         save_index(&built, &path)?;
         remove_delta_dir(&cfg.root)?;
         save_index_state(&cfg.root)?;
+        progress.finish("Indexed code");
         return Ok(());
     }
 
@@ -4020,12 +4026,15 @@ fn refresh_index_for_search(cfg: &ProjectConfig, options: &Options) -> Result<()
 
     let mut scanned = 0;
     let mut skipped = 0;
+    let progress = ProgressLine::start("Updating index");
     let (delta, meta, stats) =
         build_delta_index(cfg, options, &changes, &mut scanned, &mut skipped)?;
     if stats.added != 0 || stats.updated != 0 || stats.removed != 0 {
+        progress.update("Writing update");
         save_delta(&cfg.root, &delta, &meta)?;
     }
     save_index_state(&cfg.root)?;
+    progress.finish("Updated index");
     Ok(())
 }
 

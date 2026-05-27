@@ -331,10 +331,41 @@ fn handle_missing_project(args: &[String]) -> Result<i32, String> {
 
 fn ensure_watch(root: &Path) -> Result<PathBuf, String> {
     if let Some(covering_root) = watch_covering_root(root) {
-        return Ok(covering_root);
+        if watch_ready(&covering_root) {
+            return Ok(covering_root);
+        }
+        stop_watch_for_root(&covering_root);
     }
     start_watch(root)?;
     Ok(watch_covering_root(root).unwrap_or_else(|| root.to_path_buf()))
+}
+
+fn watch_ready(root: &Path) -> bool {
+    index_path(root).is_file() && read_valid_record(root).is_some()
+}
+
+fn stop_watch_for_root(root: &Path) {
+    let requested_root = normalized_existing_path(root);
+    let registry = watch_registry_dir();
+    let Ok(entries) = fs::read_dir(registry) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.extension().is_some_and(|ext| ext == "watch") {
+            continue;
+        }
+        let Ok(record) = read_watch_record(&path) else {
+            let _ = fs::remove_file(path);
+            continue;
+        };
+        let record_root = normalized_existing_path(&record.root);
+        if record_root == requested_root {
+            stop_process(record.pid);
+            let _ = fs::remove_file(path);
+            let _ = fs::remove_file(record_path(&record.root));
+        }
+    }
 }
 
 fn watch_covering_root(root: &Path) -> Option<PathBuf> {
@@ -974,6 +1005,19 @@ fn process_alive(pid: u32) -> bool {
             CloseHandle(process);
             ok != 0 && code == STILL_ACTIVE as u32
         }
+    }
+}
+
+fn stop_process(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .status();
     }
 }
 
