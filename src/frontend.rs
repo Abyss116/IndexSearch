@@ -533,7 +533,11 @@ fn stderr_supports_color() -> bool {
 fn start_watch(root: &Path) -> Result<(), String> {
     let backend = backend_path()?;
     let mut command = Command::new(backend);
-    command.arg("watch").arg(root).stdin(Stdio::null()).stdout(Stdio::null());
+    command.arg("watch");
+    if index_path(root).is_file() {
+        command.arg("--no-startup-update");
+    }
+    command.arg(root).stdin(Stdio::null()).stdout(Stdio::null());
     if stderr_supports_progress() {
         command.stderr(Stdio::inherit());
     } else {

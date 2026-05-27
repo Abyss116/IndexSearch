@@ -242,6 +242,7 @@ struct WatchOptions {
     idle_seconds: u64,
     compact_delta_count: usize,
     compact_delta_bytes: u64,
+    startup_update: bool,
 }
 
 impl Default for WatchOptions {
@@ -250,6 +251,7 @@ impl Default for WatchOptions {
             idle_seconds: 5,
             compact_delta_count: 16,
             compact_delta_bytes: 256 * 1024 * 1024,
+            startup_update: true,
         }
     }
 }
@@ -1748,7 +1750,7 @@ fn command_watch(args: &[String]) -> Result<i32> {
         let _ = fs::remove_file(&record_path);
     }
 
-    sync_index_before_watch(&cfg, &flow)?;
+    sync_index_before_watch(&cfg, &flow, watch_options.startup_update)?;
 
     let exe = env::current_exe()?;
     let progress = ProgressLine::start("Starting service");
@@ -1804,7 +1806,11 @@ fn command_watch(args: &[String]) -> Result<i32> {
     Ok(0)
 }
 
-fn sync_index_before_watch(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<()> {
+fn sync_index_before_watch(
+    cfg: &ProjectConfig,
+    flow: &ConsoleFlow,
+    startup_update: bool,
+) -> Result<()> {
     let _lock = acquire_exclusive_lock(&cfg.root)?;
     let options = Options {
         max_filesize: DEFAULT_MAX_FILE_SIZE,
@@ -1861,6 +1867,21 @@ fn sync_index_before_watch(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<()
         return Ok(());
     }
     drop(loaded);
+
+    if !startup_update {
+        save_index_state(&cfg.root)?;
+        append_watch_log(
+            &cfg.root,
+            &format!(
+                "startup-update-skipped existing_index=true elapsed={:.3}s",
+                timer.elapsed().as_secs_f64()
+            ),
+        )?;
+        progress.finish("Index ready");
+        flow.summary("Using existing index");
+        flow.detail("startup filesystem update skipped for search");
+        return Ok(());
+    }
 
     progress.update("Checking changes");
     let (changes, visible_before) =
@@ -2517,6 +2538,7 @@ fn parse_watch_args(args: &[String]) -> Result<(WatchOptions, PathBuf)> {
                 options.compact_delta_bytes =
                     parse_size(args.get(i).context("missing --compact-delta-bytes value")?)?;
             }
+            "--no-startup-update" => options.startup_update = false,
             value => start = PathBuf::from(value),
         }
         i += 1;
