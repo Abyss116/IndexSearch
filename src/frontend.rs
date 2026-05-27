@@ -53,6 +53,12 @@ impl FrontendProfile {
         }
     }
 
+    fn record_value(&mut self, name: &'static str, value: f64) {
+        if self.enabled {
+            self.events.push((name, value));
+        }
+    }
+
     fn print(&self) {
         if !self.enabled {
             return;
@@ -84,7 +90,6 @@ fn run(args: &[String]) -> Result<i32, String> {
     let total_timer = Instant::now();
     let mut profile = FrontendProfile::new(args);
     let prepare_timer = Instant::now();
-    let daemon_args = search_daemon_args(args);
     let search_args = strip_search_command(args);
     profile.record("frontend_prepare_args", prepare_timer);
     if env::var_os("INDEXSEARCH_NO_DAEMON").is_some() {
@@ -96,30 +101,70 @@ fn run(args: &[String]) -> Result<i32, String> {
     {
         return run_backend(args);
     }
-    let start_timer = Instant::now();
-    let Some(start) = search_start_path(&search_args) else {
+    let path_timer = Instant::now();
+    let Some(search_paths) = search_path_args(&search_args) else {
         return run_backend(args);
     };
-    profile.record("frontend_resolve_start_path", start_timer);
+    profile.record("frontend_resolve_search_paths", path_timer);
     if search_args.iter().any(|arg| arg == "--no-auto-index") {
         return run_backend(args);
     }
     let root_timer = Instant::now();
-    let Some(mut root) = find_project_root(&start) else {
-        return handle_missing_project(args);
+    if search_paths.len() == 1 {
+        let Some(root) = find_project_root(&search_paths[0].abs) else {
+            if search_paths[0].arg_index.is_none() {
+                return handle_missing_project(args);
+            }
+            return Err(format!(
+                "no IndexSearch project found above {}; run `indexsearch index` or `is watch` in that project first",
+                display_path(&search_paths[0].abs)
+            ));
+        };
+        profile.record("frontend_find_project_roots", root_timer);
+        let code = run_search_group(&search_args, root, &mut profile)?;
+        profile.record("frontend_total", total_timer);
+        profile.print();
+        return Ok(code);
+    }
+    let groups = match search_groups(&search_args, &search_paths) {
+        Ok(groups) => groups,
+        Err(MissingProject::Single) => return handle_missing_project(args),
+        Err(MissingProject::Path(path)) => {
+            return Err(format!(
+                "no IndexSearch project found above {}; run `indexsearch index` or `is watch` in that project first",
+                display_path(&path)
+            ));
+        }
     };
-    profile.record("frontend_find_project_root", root_timer);
+    profile.record("frontend_find_project_roots", root_timer);
+    if groups.len() > 1 {
+        profile.record_value("frontend_search_root_count", groups.len() as f64);
+    }
+    let mut final_code = 1;
+    for group in groups {
+        let code = run_search_group(&group.args, group.root, &mut profile)?;
+        final_code = combine_exit_codes(final_code, code);
+    }
+    profile.record("frontend_total", total_timer);
+    profile.print();
+    return Ok(final_code);
+}
+
+fn run_search_group(
+    group_args: &[String],
+    mut root: PathBuf,
+    profile: &mut FrontendProfile,
+) -> Result<i32, String> {
+    let daemon_args = search_daemon_args(group_args);
     let ready_record;
     let started_watch;
     let ensure_timer = Instant::now();
-    (root, ready_record, started_watch) = ensure_watch(&root, &mut profile)?;
+    (root, ready_record, started_watch) = ensure_watch(&root, profile)?;
     profile.record("frontend_ensure_project_service", ensure_timer);
     let record_timer = Instant::now();
     if let Some(record) = ready_record.or_else(|| read_valid_record(&root)) {
         profile.record("frontend_read_daemon_record", record_timer);
-        if let Ok(code) = request_daemon(&record, &daemon_args, &mut profile) {
-            profile.record("frontend_total", total_timer);
-            profile.print();
+        if let Ok(code) = request_daemon(&record, &daemon_args, profile) {
             return Ok(code);
         }
         stop_process(record.pid);
@@ -128,7 +173,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         profile.record("frontend_read_daemon_record", record_timer);
     }
     if started_watch {
-        return run_backend_no_daemon(args);
+        return run_backend_no_daemon(group_args);
     }
     let start_daemon_timer = Instant::now();
     start_daemon(&root)?;
@@ -138,9 +183,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         let record_timer = Instant::now();
         if let Some(record) = read_valid_record(&root) {
             profile.record("frontend_read_daemon_record", record_timer);
-            if let Ok(code) = request_daemon(&record, &daemon_args, &mut profile) {
-                profile.record("frontend_total", total_timer);
-                profile.print();
+            if let Ok(code) = request_daemon(&record, &daemon_args, profile) {
                 return Ok(code);
             }
             stop_process(record.pid);
@@ -150,7 +193,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    run_backend(args)
+    run_backend(group_args)
 }
 
 fn should_delegate(args: &[String]) -> bool {
@@ -193,6 +236,7 @@ fn is_command_name(arg: &str) -> bool {
             | "install-skills"
             | "install-agents"
             | "status"
+            | "version"
     )
 }
 
@@ -290,7 +334,23 @@ fn insert_before_double_dash(args: &mut Vec<String>, defaults: Vec<String>) {
     }
 }
 
-fn search_start_path(args: &[String]) -> Option<PathBuf> {
+#[derive(Clone)]
+struct SearchPathArg {
+    arg_index: Option<usize>,
+    abs: PathBuf,
+}
+
+struct SearchGroup {
+    root: PathBuf,
+    args: Vec<String>,
+}
+
+enum MissingProject {
+    Single,
+    Path(PathBuf),
+}
+
+fn search_path_args(args: &[String]) -> Option<Vec<SearchPathArg>> {
     let mut after_double_dash = false;
     let mut saw_pattern = false;
     let mut files_mode = false;
@@ -300,7 +360,7 @@ fn search_start_path(args: &[String]) -> Option<PathBuf> {
         let arg = &args[i];
         if after_double_dash {
             if saw_pattern {
-                paths.push(arg.clone());
+                paths.push((i, arg.clone()));
             } else {
                 saw_pattern = true;
             }
@@ -335,22 +395,97 @@ fn search_start_path(args: &[String]) -> Option<PathBuf> {
             continue;
         }
         if files_mode || saw_pattern {
-            paths.push(arg.clone());
+            paths.push((i, arg.clone()));
         } else {
             saw_pattern = true;
         }
         i += 1;
     }
     let cwd = env::current_dir().ok()?;
-    let start = paths
-        .first()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| cwd.clone());
-    Some(if start.is_absolute() {
-        start
+    if paths.is_empty() {
+        return Some(vec![SearchPathArg {
+            arg_index: None,
+            abs: cwd,
+        }]);
+    }
+    Some(
+        paths
+            .into_iter()
+            .map(|(arg_index, raw)| {
+                let path = PathBuf::from(&raw);
+                let abs = if path.is_absolute() {
+                    path
+                } else {
+                    cwd.join(path)
+                };
+                SearchPathArg {
+                    arg_index: Some(arg_index),
+                    abs,
+                }
+            })
+            .collect(),
+    )
+}
+
+fn search_groups(
+    args: &[String],
+    paths: &[SearchPathArg],
+) -> Result<Vec<SearchGroup>, MissingProject> {
+    let mut groups: Vec<(PathBuf, Vec<Option<usize>>)> = Vec::new();
+    for path in paths {
+        let Some(root) = find_project_root(&path.abs) else {
+            if paths.len() == 1 && path.arg_index.is_none() {
+                return Err(MissingProject::Single);
+            }
+            return Err(MissingProject::Path(path.abs.clone()));
+        };
+        if let Some((_, indexes)) = groups.iter_mut().find(|(group_root, _)| {
+            normalized_existing_path(group_root) == normalized_existing_path(&root)
+        }) {
+            indexes.push(path.arg_index);
+        } else {
+            groups.push((root, vec![path.arg_index]));
+        }
+    }
+    Ok(groups
+        .into_iter()
+        .map(|(root, indexes)| SearchGroup {
+            root,
+            args: search_args_for_group(args, &indexes),
+        })
+        .collect())
+}
+
+fn search_args_for_group(args: &[String], keep_path_indexes: &[Option<usize>]) -> Vec<String> {
+    let explicit_indexes: Vec<usize> = keep_path_indexes.iter().filter_map(|idx| *idx).collect();
+    if explicit_indexes.is_empty() {
+        return args.to_vec();
+    }
+    let all_path_indexes = search_path_args(args)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|path| path.arg_index)
+        .collect::<Vec<_>>();
+    args.iter()
+        .enumerate()
+        .filter_map(|(idx, arg)| {
+            if all_path_indexes.contains(&idx) && !explicit_indexes.contains(&idx) {
+                None
+            } else {
+                Some(arg.clone())
+            }
+        })
+        .collect()
+}
+
+fn combine_exit_codes(current: i32, next: i32) -> i32 {
+    if current > 1 || next > 1 {
+        current.max(next)
+    } else if current == 0 || next == 0 {
+        0
     } else {
-        cwd.join(start)
-    })
+        1
+    }
 }
 
 fn option_takes_value(arg: &str) -> bool {
@@ -651,12 +786,14 @@ fn stderr_supports_color() -> bool {
 
 fn start_watch(root: &Path) -> Result<(), String> {
     let backend = backend_path()?;
+    let show_progress = stderr_supports_progress() && !index_path(root).is_file();
     let mut command = Command::new(backend);
     command.arg("watch");
     command.arg(root).stdin(Stdio::null()).stdout(Stdio::null());
-    if stderr_supports_progress() {
+    if show_progress {
         command.stderr(Stdio::inherit());
     } else {
+        command.env("INDEXSEARCH_NO_PROGRESS", "1");
         command.stderr(Stdio::null());
     }
     let status = command.status().map_err(|err| err.to_string())?;

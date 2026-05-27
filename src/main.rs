@@ -698,7 +698,7 @@ fn print_help() {
         "start the project daemon service for a root",
     );
     help_command(&style, "list-watches", "list active project services");
-    help_command(&style, "unwatch <ID|PATH>", "stop a project service");
+    help_command(&style, "unwatch [--all] <ID|PATH>", "stop project services");
     help_command(
         &style,
         "watch-log [PATH]",
@@ -977,7 +977,13 @@ fn print_list_watches_help() {
 
 fn print_unwatch_help() {
     let style = HelpStyle::new();
-    command_usage(&style, "unwatch", "<ID|PATH>", "stop a project service");
+    command_usage(
+        &style,
+        "unwatch",
+        "[--all] <ID|PATH>",
+        "stop project services",
+    );
+    help_option(&style, "--all", "stop every registered project service");
 }
 
 fn print_watch_log_help() {
@@ -1517,6 +1523,7 @@ fn command_index(args: &[String]) -> Result<i32> {
     }
     println!("root: {}", display_path(&cfg.root));
     println!("index: {}", display_path(&index_path(&cfg.root)));
+    invalidate_search_daemon_for_root(&cfg.root);
     std::mem::forget(index);
     Ok(0)
 }
@@ -1524,7 +1531,7 @@ fn command_index(args: &[String]) -> Result<i32> {
 fn command_update(args: &[String]) -> Result<i32> {
     let (options, start) = parse_index_args(args)?;
     let cfg = load_or_create_config(&start)?;
-    if !options.force_scan {
+    if !options.force_scan && !options.git_update {
         if let Some(code) = try_update_via_daemon(&cfg)? {
             return Ok(code);
         }
@@ -1641,6 +1648,7 @@ fn command_update(args: &[String]) -> Result<i32> {
                         println!("root: {}", display_path(&cfg.root));
                         println!("index: {}", display_path(&path));
                         println!("delta: {}", display_path(&delta_dir(&cfg.root)));
+                        invalidate_search_daemon_for_root(&cfg.root);
                         return Ok(0);
                     }
                     None => {
@@ -1720,6 +1728,7 @@ fn command_update(args: &[String]) -> Result<i32> {
     }
     println!("root: {}", display_path(&cfg.root));
     println!("index: {}", display_path(&path));
+    invalidate_search_daemon_for_root(&cfg.root);
     std::mem::forget(index);
     Ok(0)
 }
@@ -1839,6 +1848,7 @@ fn update_from_filesystem_scan(
     println!("index: {}", display_path(path));
     if stats.added != 0 || stats.updated != 0 || stats.removed != 0 {
         println!("delta: {}", display_path(&delta_dir(&cfg.root)));
+        invalidate_search_daemon_for_root(&cfg.root);
     }
     Ok(0)
 }
@@ -2094,29 +2104,9 @@ fn sync_index_before_watch(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<()
         std::mem::forget(index);
         return Ok(());
     }
-    let loaded_file_count = loaded
-        .as_ref()
-        .map(|index| index.file_count)
-        .unwrap_or_default();
     drop(loaded);
 
     progress.update("Checking changes");
-    if index_state_recently_synced(&cfg.root, &path).unwrap_or(false) {
-        save_index_state(&cfg.root)?;
-        append_watch_log(
-            &cfg.root,
-            &format!(
-                "startup-current files={} elapsed={:.3}s reason=recent-sync",
-                loaded_file_count,
-                timer.elapsed().as_secs_f64()
-            ),
-        )?;
-        progress.finish("Index already current");
-        flow.summary("Index already current");
-        flow.detail("recent sync state; no filesystem scan");
-        flow.detail(timing_summary(&timings));
-        return Ok(());
-    }
     let (changes, visible_before) =
         collect_filesystem_changes(cfg, &options, &mut scanned, &mut skipped, &mut timings)?;
     if changes.is_empty() {
@@ -2236,30 +2226,58 @@ fn command_list_watches(_args: &[String]) -> Result<i32> {
 }
 
 fn command_unwatch(args: &[String]) -> Result<i32> {
-    let target = args.first().context("unwatch requires an id or path")?;
-    let target_path = fs::canonicalize(target).ok();
+    let all = args.iter().any(|arg| arg == "--all");
+    let targets: Vec<&String> = args.iter().filter(|arg| arg.as_str() != "--all").collect();
+    if all && !targets.is_empty() {
+        bail!("unwatch --all does not accept an id or path");
+    }
+    if !all && targets.len() != 1 {
+        bail!("unwatch requires an id or path");
+    }
+    let target = targets.first().copied();
+    let target_roots = target
+        .map(|target| unwatch_target_roots(Path::new(target)))
+        .unwrap_or_default();
     let mut matched = Vec::new();
     fs::create_dir_all(watch_registry_dir())?;
     for entry in fs::read_dir(watch_registry_dir())?.flatten() {
         let path = entry.path();
         if path.extension().is_some_and(|ext| ext == "watch") {
             if let Ok(record) = read_watch_record(&path) {
-                let by_id = record.id == *target;
-                let by_path = target_path.as_ref().is_some_and(|p| *p == record.root);
-                if by_id || by_path {
+                let by_id = target.is_some_and(|target| record.id == *target);
+                let by_path = target_roots
+                    .iter()
+                    .any(|root| same_clean_root(root, &record.root));
+                if all || by_id || by_path {
                     matched.push((path, record));
                 }
             }
         }
     }
+    let mut stopped = HashSet::default();
     if matched.is_empty() {
-        eprintln!("indexsearch: no watch matched {target}");
-        return Ok(1);
+        if !all {
+            if let Some(root) = target_roots.first() {
+                if stop_search_daemon_for_root(root, &mut stopped) {
+                    println!("stopped daemon {}", display_path(root));
+                    return Ok(0);
+                }
+            }
+        }
+        if let Some(target) = target {
+            eprintln!("indexsearch: no watch matched {target}");
+            return Ok(1);
+        } else {
+            eprintln!("indexsearch: no watches registered");
+            return Ok(0);
+        }
     }
     for (path, record) in matched {
-        stop_process(record.pid);
+        if stopped.insert(record.pid) {
+            stop_process(record.pid);
+        }
         let _ = fs::remove_file(path);
-        let _ = fs::remove_file(search_daemon_record_path(&record.root));
+        let _ = stop_search_daemon_for_root(&record.root, &mut stopped);
         let _ = append_watch_log(&record.root, &format!("watch-stop pid={}", record.pid));
         println!(
             "unwatched {} pid={} {}",
@@ -2269,6 +2287,32 @@ fn command_unwatch(args: &[String]) -> Result<i32> {
         );
     }
     Ok(0)
+}
+
+fn unwatch_target_roots(target: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(path) = fs::canonicalize(target) {
+        roots.push(path);
+    }
+    if let Ok(cfg) = load_config(target) {
+        if !roots.iter().any(|root| same_clean_root(root, &cfg.root)) {
+            roots.push(cfg.root);
+        }
+    }
+    roots
+}
+
+fn stop_search_daemon_for_root(root: &Path, stopped: &mut HashSet<u32>) -> bool {
+    let path = search_daemon_record_path(root);
+    let Ok(record) = read_search_daemon_record(&path) else {
+        let _ = fs::remove_file(path);
+        return false;
+    };
+    if stopped.insert(record.pid) {
+        stop_process(record.pid);
+    }
+    let _ = fs::remove_file(path);
+    true
 }
 
 fn command_watch_log(args: &[String]) -> Result<i32> {
@@ -3233,11 +3277,19 @@ fn discover_clean_roots(start: &Path) -> Vec<PathBuf> {
     }
     let mut roots = Vec::new();
     for ancestor in path.ancestors() {
-        if ancestor.join(INDEX_DIR).is_dir() {
+        if is_cleanable_project_root(ancestor) {
             roots.push(ancestor.to_path_buf());
         }
     }
     roots
+}
+
+fn is_cleanable_project_root(root: &Path) -> bool {
+    let state_dir = index_state_dir(root);
+    if !state_dir.is_dir() {
+        return false;
+    }
+    root.join(PROJECT_FILE).is_file() || index_path(root).is_file()
 }
 
 fn index_state_dir(root: &Path) -> PathBuf {
@@ -3287,6 +3339,14 @@ fn stop_services_for_root(root: &Path) -> Result<usize> {
         }
     }
     Ok(stopped.len())
+}
+
+fn invalidate_search_daemon_for_root(root: &Path) {
+    let path = search_daemon_record_path(root);
+    if let Ok(record) = read_search_daemon_record(&path) {
+        stop_process(record.pid);
+    }
+    let _ = fs::remove_file(path);
 }
 
 fn same_clean_root(left: &Path, right: &Path) -> bool {
@@ -3350,6 +3410,12 @@ fn command_search(args: &[String]) -> Result<i32> {
     if options.profile {
         profile.record("client_resolve_start_path", start_timer.elapsed());
     }
+    if !options.auto_update
+        && options.daemon
+        && let Some(code) = try_search_multiple_roots(args, &options, &mut profile, total_timer)?
+    {
+        return Ok(code);
+    }
     if !options.auto_update {
         let find_timer = Instant::now();
         if let Some(root) = find_existing_index_root(&start) {
@@ -3384,6 +3450,11 @@ fn command_search(args: &[String]) -> Result<i32> {
             }
         } else if options.profile {
             profile.record("client_find_index_root", find_timer.elapsed());
+        }
+    }
+    if options.auto_index && find_existing_project_root(&start).is_none() {
+        if !confirm_create_project_for_search(&start)? {
+            return Ok(1);
         }
     }
     let config_timer = Instant::now();
@@ -3462,6 +3533,209 @@ fn command_search(args: &[String]) -> Result<i32> {
     }
     let index = index?;
     run_search_with_index(index, &options, Some(profile), total_timer)
+}
+
+struct BackendSearchPathArg {
+    arg_index: Option<usize>,
+    abs: PathBuf,
+}
+
+struct BackendSearchGroup {
+    root: PathBuf,
+    args: Vec<String>,
+}
+
+fn try_search_multiple_roots(
+    args: &[String],
+    _options: &Options,
+    _profile: &mut SearchProfile,
+    total_timer: Instant,
+) -> Result<Option<i32>> {
+    let Some(path_args) = search_path_args_from_cli(args) else {
+        return Ok(None);
+    };
+    if path_args.len() < 2 {
+        return Ok(None);
+    }
+    let mut groups: Vec<(PathBuf, Vec<Option<usize>>)> = Vec::new();
+    for path in &path_args {
+        let Some(root) = find_existing_index_root(&path.abs) else {
+            bail!(
+                "no IndexSearch project found above {}; run `indexsearch index` or `is watch` in that project first",
+                display_path(&path.abs)
+            );
+        };
+        if let Some((_, indexes)) = groups
+            .iter_mut()
+            .find(|(group_root, _)| same_clean_root(group_root, &root))
+        {
+            indexes.push(path.arg_index);
+        } else {
+            groups.push((root, vec![path.arg_index]));
+        }
+    }
+    if groups.len() < 2 {
+        return Ok(None);
+    }
+
+    let mut final_code = 1;
+    for group in groups
+        .into_iter()
+        .map(|(root, indexes)| BackendSearchGroup {
+            root,
+            args: search_args_for_backend_group(args, &indexes),
+        })
+    {
+        let daemon_args = daemon_search_args(&group.args);
+        let code = match try_search_daemon(&group.root, &daemon_args, None, total_timer)? {
+            Some(code) => code,
+            None => search_direct_root(&group.root, &group.args, total_timer)?,
+        };
+        final_code = combine_search_exit_codes(final_code, code);
+    }
+    Ok(Some(final_code))
+}
+
+fn search_direct_root(root: &Path, args: &[String], total_timer: Instant) -> Result<i32> {
+    let options = parse_search_args(args)?;
+    let _lock = acquire_shared_lock(root)?;
+    let index = MappedIndex::open(&index_path(root))?;
+    run_search_with_index(index, &options, None, total_timer)
+}
+
+fn combine_search_exit_codes(current: i32, next: i32) -> i32 {
+    if current > 1 || next > 1 {
+        current.max(next)
+    } else if current == 0 || next == 0 {
+        0
+    } else {
+        1
+    }
+}
+
+fn search_path_args_from_cli(args: &[String]) -> Option<Vec<BackendSearchPathArg>> {
+    let mut after_double_dash = false;
+    let mut saw_pattern = false;
+    let mut files_mode = false;
+    let mut paths = Vec::new();
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = &args[i];
+        if after_double_dash {
+            if saw_pattern {
+                paths.push((i, arg.clone()));
+            } else {
+                saw_pattern = true;
+            }
+            i += 1;
+            continue;
+        }
+        if arg == "--" {
+            after_double_dash = true;
+            i += 1;
+            continue;
+        }
+        if arg == "--files" {
+            files_mode = true;
+            i += 1;
+            continue;
+        }
+        if arg == "-e" || arg == "--regexp" {
+            saw_pattern = true;
+            i += 2;
+            continue;
+        }
+        if search_option_takes_value(arg) {
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("--") {
+            i += 1;
+            continue;
+        }
+        if search_short_option_with_attached_value(arg) || (arg.starts_with('-') && arg.len() > 1) {
+            i += 1;
+            continue;
+        }
+        if files_mode || saw_pattern {
+            paths.push((i, arg.clone()));
+        } else {
+            saw_pattern = true;
+        }
+        i += 1;
+    }
+    let cwd = env::current_dir().ok()?;
+    if paths.is_empty() {
+        return Some(vec![BackendSearchPathArg {
+            arg_index: None,
+            abs: cwd,
+        }]);
+    }
+    Some(
+        paths
+            .into_iter()
+            .map(|(arg_index, raw)| {
+                let path = PathBuf::from(&raw);
+                let abs = if path.is_absolute() {
+                    path
+                } else {
+                    cwd.join(path)
+                };
+                BackendSearchPathArg {
+                    arg_index: Some(arg_index),
+                    abs,
+                }
+            })
+            .collect(),
+    )
+}
+
+fn search_args_for_backend_group(
+    args: &[String],
+    keep_path_indexes: &[Option<usize>],
+) -> Vec<String> {
+    let explicit_indexes: Vec<usize> = keep_path_indexes.iter().filter_map(|idx| *idx).collect();
+    if explicit_indexes.is_empty() {
+        return args.to_vec();
+    }
+    let all_path_indexes = search_path_args_from_cli(args)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|path| path.arg_index)
+        .collect::<Vec<_>>();
+    args.iter()
+        .enumerate()
+        .filter_map(|(idx, arg)| {
+            if all_path_indexes.contains(&idx) && !explicit_indexes.contains(&idx) {
+                None
+            } else {
+                Some(arg.clone())
+            }
+        })
+        .collect()
+}
+
+fn search_option_takes_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-g" | "--glob"
+            | "-A"
+            | "--after-context"
+            | "-B"
+            | "--before-context"
+            | "-C"
+            | "--context"
+            | "-m"
+            | "--max-count"
+            | "--max-filesize"
+            | "--color"
+            | "--sort"
+            | "--sortr"
+    )
+}
+
+fn search_short_option_with_attached_value(arg: &str) -> bool {
+    (arg.starts_with("-A") || arg.starts_with("-B") || arg.starts_with("-C")) && arg.len() > 2
 }
 
 fn daemon_search_args(args: &[String]) -> Vec<String> {
@@ -3705,6 +3979,50 @@ fn find_existing_index_root(start: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+fn find_existing_project_root(start: &Path) -> Option<PathBuf> {
+    let path = if start.is_absolute() {
+        start.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(start)
+    };
+    path.ancestors()
+        .find(|ancestor| {
+            index_path(ancestor).is_file()
+                || ancestor.join(INDEX_DIR).is_dir()
+                || ancestor.join(PROJECT_FILE).is_file()
+        })
+        .map(Path::to_path_buf)
+}
+
+fn confirm_create_project_for_search(start: &Path) -> Result<bool> {
+    let root = discover_root_for_create(start)?;
+    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+        eprintln!(
+            "indexsearch: no IndexSearch project found above {}; run `indexsearch index .` or `is watch .` at the project root",
+            display_path(start)
+        );
+        return Ok(false);
+    }
+    eprint!(
+        "indexsearch: no IndexSearch project found above {}. Create one at {}? [Y/n] ",
+        display_path(start),
+        display_path(&root)
+    );
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return Ok(false);
+    }
+    match answer.trim() {
+        "" | "y" | "Y" | "yes" | "YES" => {
+            let _ = load_or_create_config(&root)?;
+            Ok(true)
+        }
+        "n" | "N" | "no" | "NO" => Ok(false),
+        _ => Ok(false),
+    }
+}
+
 fn try_search_daemon(
     root: &Path,
     args: &[String],
@@ -3787,32 +4105,19 @@ fn append_profile_events<W: Write>(out: &mut W, profile: &SearchProfile) -> Resu
 
 fn start_search_daemon(root: &Path) -> Result<()> {
     let exe = env::current_exe()?;
-    #[cfg(windows)]
-    {
-        let args = vec![
-            std::ffi::OsString::from("search-daemon"),
-            std::ffi::OsString::from("--watch"),
-            std::ffi::OsString::from("--detach"),
-            root.as_os_str().to_os_string(),
-        ];
-        spawn_detached_no_inherit(&exe, &args)?;
-        return Ok(());
+    let mut command = Command::new(exe);
+    command
+        .arg("watch")
+        .arg(root)
+        .env("INDEXSEARCH_NO_PROGRESS", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = command.status()?;
+    if !status.success() {
+        bail!("failed to start project service for {}", display_path(root));
     }
-    #[cfg(not(windows))]
-    {
-        let mut command = Command::new(exe);
-        command
-            .arg("search-daemon")
-            .arg("--watch")
-            .arg("--detach")
-            .arg(root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        detach_background_command(&mut command);
-        command.spawn()?;
-        Ok(())
-    }
+    Ok(())
 }
 
 fn command_search_daemon(args: &[String]) -> Result<i32> {

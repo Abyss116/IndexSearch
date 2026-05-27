@@ -229,13 +229,15 @@ is watch .
 is list-watches
 is watch-log .
 is unwatch .
+is unwatch --all
 ```
 
 `watch`, `list-watches`, `watch-log`, and `unwatch` remain the user-facing
 names because the main reason to manage the service manually is filesystem
 watching. Internally, a watched project is now served by one `is-daemon`
 process: it owns search RPC, filesystem watching, startup sync, and idle
-compaction.
+compaction. `unwatch <ID|PATH>` stops both the registered watcher and that
+root's daemon record; `unwatch --all` stops every registered project service.
 
 The service first synchronizes the index with the current filesystem state,
 then writes batched delta updates on file events and can compact during idle
@@ -490,7 +492,7 @@ is clean [--yes] [PATH]
 is watch [PATH]
 is list-watches
 is watch-log [PATH]
-is unwatch <ID|PATH>
+is unwatch [--all] <ID|PATH>
 is install [--dir PATH]
 is install-skills [OPTIONS]
 is status [PATH]
