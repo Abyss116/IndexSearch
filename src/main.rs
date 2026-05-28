@@ -57,6 +57,11 @@ const LOCK_FILE: &str = "index.lock";
 const STATE_FILE: &str = "state.txt";
 const PROJECT_LOG_FILE: &str = "project.log";
 const SEARCH_DAEMON_FILE: &str = "search-daemon.txt";
+const SEARCH_DAEMON_SERVICE_NAME: &str = "is-daemon";
+const SEARCH_DAEMON_PROTOCOL: u32 = 1;
+const SEARCH_DAEMON_CAP_SEARCH: &str = "search";
+const SEARCH_DAEMON_CAP_UPDATE: &str = "update";
+const SEARCH_DAEMON_CAP_DIRECT_STDOUT: &str = "direct_stdout";
 const SEARCH_DAEMON_REQUEST_MAGIC: &[u8; 8] = b"ISDREQ1\n";
 const SEARCH_DAEMON_RESPONSE_MAGIC: &[u8; 8] = b"ISDRES1\n";
 const SEARCH_DAEMON_STDOUT_FRAME: u8 = 1;
@@ -445,6 +450,11 @@ struct RenderStats {
     match_count: usize,
 }
 
+struct SearchDaemonRun {
+    code: i32,
+    log_stats: String,
+}
+
 #[derive(Default)]
 struct SearchProfile {
     events: Vec<(&'static str, f64)>,
@@ -472,6 +482,9 @@ struct QualifiedCallSpec {
 
 #[derive(Clone)]
 struct SearchDaemonRecord {
+    service_name: String,
+    protocol: u32,
+    capabilities: Vec<String>,
     pid: u32,
     port: u16,
     socket_path: Option<PathBuf>,
@@ -482,6 +495,42 @@ struct SearchDaemonRecord {
     exe_mtime: i64,
     index_size: u64,
     index_mtime: i64,
+}
+
+impl SearchDaemonRecord {
+    fn current_capabilities() -> Vec<String> {
+        [
+            SEARCH_DAEMON_CAP_SEARCH,
+            SEARCH_DAEMON_CAP_UPDATE,
+            SEARCH_DAEMON_CAP_DIRECT_STDOUT,
+        ]
+        .iter()
+        .map(|capability| capability.to_string())
+        .collect()
+    }
+
+    fn legacy_capabilities() -> Vec<String> {
+        [SEARCH_DAEMON_CAP_SEARCH, SEARCH_DAEMON_CAP_UPDATE]
+            .iter()
+            .map(|capability| capability.to_string())
+            .collect()
+    }
+
+    fn has_capability(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|item| item == capability)
+    }
+
+    fn supports_search(&self) -> bool {
+        self.has_capability(SEARCH_DAEMON_CAP_SEARCH)
+    }
+
+    fn supports_update(&self) -> bool {
+        self.has_capability(SEARCH_DAEMON_CAP_UPDATE)
+    }
+
+    fn capabilities_text(&self) -> String {
+        self.capabilities.join(",")
+    }
 }
 
 fn main() {
@@ -3937,15 +3986,17 @@ fn try_search_daemon(
         return Ok(None);
     }
     if let Some(record) = read_valid_search_daemon_record(root, profile.as_deref_mut())? {
-        if let Ok(code) = request_search_daemon(&record, args, profile.as_deref_mut()) {
-            if let Some(profile) = profile.as_deref_mut() {
-                profile.record("client_search_command_total", total_timer.elapsed());
-                write_profile_events(profile)?;
+        if record.supports_search() {
+            if let Ok(code) = request_search_daemon(&record, args, profile.as_deref_mut()) {
+                if let Some(profile) = profile.as_deref_mut() {
+                    profile.record("client_search_command_total", total_timer.elapsed());
+                    write_profile_events(profile)?;
+                }
+                return Ok(Some(code));
             }
-            return Ok(Some(code));
+            stop_process(record.pid);
+            let _ = fs::remove_file(search_daemon_record_path(root));
         }
-        stop_process(record.pid);
-        let _ = fs::remove_file(search_daemon_record_path(root));
     }
     let start_timer = Instant::now();
     start_search_daemon(root)?;
@@ -3955,6 +4006,10 @@ fn try_search_daemon(
     let start = Instant::now();
     while start.elapsed() < SEARCH_DAEMON_START_TIMEOUT {
         if let Some(record) = read_valid_search_daemon_record(root, profile.as_deref_mut())? {
+            if !record.supports_search() {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
             if let Ok(code) = request_search_daemon(&record, args, profile.as_deref_mut()) {
                 if let Some(profile) = profile.as_deref_mut() {
                     profile.record("client_search_command_total", total_timer.elapsed());
@@ -3977,6 +4032,9 @@ fn try_update_via_daemon(cfg: &ProjectConfig) -> Result<Option<i32>> {
     let Some(record) = read_valid_search_daemon_record(&cfg.root, None)? else {
         return Ok(None);
     };
+    if !record.supports_update() {
+        return Ok(None);
+    }
     let args = vec![
         SEARCH_DAEMON_CONTROL_ARG.to_string(),
         SEARCH_DAEMON_CONTROL_UPDATE.to_string(),
@@ -4415,6 +4473,16 @@ fn windows_direct_stdout_enabled() -> bool {
 }
 
 fn run_search_daemon(root: &Path, watch_options: WatchOptions) -> Result<i32> {
+    let panic_root = root.to_path_buf();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = append_project_log(
+            &panic_root,
+            &format!(
+                "project-service-panic {}",
+                clean_log_text(&info.to_string(), 512)
+            ),
+        );
+    }));
     let index_meta = fs::metadata(index_path(root))?;
     let exe = env::current_exe()?;
     let exe_meta = fs::metadata(&exe)?;
@@ -4423,6 +4491,9 @@ fn run_search_daemon(root: &Path, watch_options: WatchOptions) -> Result<i32> {
     let socket_path = listener.socket_path();
     let token = search_daemon_token(root);
     let record = SearchDaemonRecord {
+        service_name: SEARCH_DAEMON_SERVICE_NAME.to_string(),
+        protocol: SEARCH_DAEMON_PROTOCOL,
+        capabilities: SearchDaemonRecord::current_capabilities(),
         pid: std::process::id(),
         port,
         socket_path,
@@ -4435,6 +4506,16 @@ fn run_search_daemon(root: &Path, watch_options: WatchOptions) -> Result<i32> {
         index_mtime: mtime_ns(&index_meta),
     };
     write_search_daemon_record(&record)?;
+    append_project_log(
+        root,
+        &format!(
+            "project-service-listen pid={} service={} protocol={} capabilities={}",
+            record.pid,
+            record.service_name,
+            record.protocol,
+            record.capabilities_text()
+        ),
+    )?;
     let project = ProjectRecord {
         id: project_id(&record.root),
         root: record.root.clone(),
@@ -4483,6 +4564,15 @@ fn run_search_daemon(root: &Path, watch_options: WatchOptions) -> Result<i32> {
         }
     }
     let restart = watch_state.restart_required.load(AtomicOrdering::Relaxed);
+    append_project_log(
+        root,
+        &format!(
+            "project-service-main-exit pid={} restart={} shutdown={}",
+            record.pid,
+            restart,
+            shutdown.load(AtomicOrdering::Relaxed)
+        ),
+    )?;
     shutdown.store(true, AtomicOrdering::Relaxed);
     drop(listener);
     let _ = watch_thread.join();
@@ -4539,6 +4629,20 @@ fn handle_search_daemon_client(
         }
         return result;
     }
+    let request_timer = Instant::now();
+    let request_cwd = cwd
+        .cwd
+        .as_ref()
+        .map(|path| display_path(path))
+        .unwrap_or_default();
+    let _ = append_project_log(
+        &record.root,
+        &format!(
+            "search-request cwd={} args={}",
+            log_quote(&request_cwd, 240),
+            format_search_log_args(&cwd.args)
+        ),
+    );
     let parse_timer = Instant::now();
     let result = parse_search_args(&cwd.args).and_then(|options| {
         if options.auto_update {
@@ -4558,13 +4662,23 @@ fn handle_search_daemon_client(
         }
         let index = index_state.read().unwrap();
         let search_timer = Instant::now();
-        let code = search_daemon_output_to_stream(
+        let run = search_daemon_output_to_stream(
             &index,
             &options,
             stream,
             stdout_fd.take(),
             &mut profile,
         )?;
+        let code = run.code;
+        let _ = append_project_log(
+            &record.root,
+            &format!(
+                "search-result code={} elapsed={:.3}s {}",
+                code,
+                request_timer.elapsed().as_secs_f64(),
+                run.log_stats
+            ),
+        );
         if options.profile {
             profile.record("daemon_search_with_index_output", search_timer.elapsed());
             let mut stderr = Vec::new();
@@ -4577,6 +4691,14 @@ fn handle_search_daemon_client(
     if let Err(err) = result {
         close_stdout_fd(stdout_fd.take());
         let message = format!("{err:#}");
+        let _ = append_project_log(
+            &record.root,
+            &format!(
+                "search-error elapsed={:.3}s error={}",
+                request_timer.elapsed().as_secs_f64(),
+                log_quote(&message, 512)
+            ),
+        );
         if message.contains("project configuration changed") {
             write_search_daemon_response_begin(stream)?;
             write_search_daemon_done(stream, SEARCH_DAEMON_CONTROL_FALLBACK_CODE)?;
@@ -4670,7 +4792,8 @@ fn search_daemon_output_to_stream(
     stream: &mut SearchDaemonStream,
     stdout_fd: Option<StdoutFd>,
     profile: &mut SearchProfile,
-) -> Result<i32> {
+) -> Result<SearchDaemonRun> {
+    let run_timer = Instant::now();
     if quiet_search_fast_path(options) {
         close_stdout_fd(stdout_fd);
         let output = search_quiet_with_index_output(index, options)?;
@@ -4678,7 +4801,14 @@ fn search_daemon_output_to_stream(
         if !output.stderr.is_empty() {
             write_search_daemon_chunk(stream, SEARCH_DAEMON_STDERR_FRAME, &output.stderr)?;
         }
-        return Ok(output.code);
+        return Ok(SearchDaemonRun {
+            code: output.code,
+            log_stats: format!(
+                "mode=quiet found={} elapsed={:.3}s",
+                output.code == 0,
+                run_timer.elapsed().as_secs_f64()
+            ),
+        });
     }
 
     let delta_timer = if options.profile {
@@ -4709,7 +4839,14 @@ fn search_daemon_output_to_stream(
         if let Some(render_timer) = render_timer {
             profile.record("search_render_files", render_timer.elapsed());
         }
-        return Ok(0);
+        return Ok(SearchDaemonRun {
+            code: 0,
+            log_stats: format!(
+                "mode=files bytes={} elapsed={:.3}s",
+                stdout.len(),
+                run_timer.elapsed().as_secs_f64()
+            ),
+        });
     }
 
     let timer = Instant::now();
@@ -4783,7 +4920,17 @@ fn search_daemon_output_to_stream(
     if !stderr.is_empty() {
         write_search_daemon_chunk(stream, SEARCH_DAEMON_STDERR_FRAME, &stderr)?;
     }
-    Ok(if stats.matched_files == 0 { 1 } else { 0 })
+    let code = if stats.matched_files == 0 { 1 } else { 0 };
+    Ok(SearchDaemonRun {
+        code,
+        log_stats: format!(
+            "mode=search matches={} matched_files={} candidates={} elapsed={:.3}s",
+            stats.match_count,
+            stats.matched_files,
+            searched,
+            run_timer.elapsed().as_secs_f64()
+        ),
+    })
 }
 
 fn close_stdout_fd(stdout_fd: Option<StdoutFd>) {
@@ -10851,7 +10998,10 @@ fn search_daemon_token(root: &Path) -> String {
 fn write_search_daemon_record(record: &SearchDaemonRecord) -> Result<()> {
     fs::create_dir_all(record.root.join(INDEX_DIR))?;
     let mut text = format!(
-        "version=1\npid={}\nport={}\ntoken={}\nroot={}\nexe_path={}\nexe_size={}\nexe_mtime={}\nindex_size={}\nindex_mtime={}\n",
+        "version=1\nservice_name={}\nprotocol={}\ncapabilities={}\npid={}\nport={}\ntoken={}\nroot={}\nexe_path={}\nexe_size={}\nexe_mtime={}\nindex_size={}\nindex_mtime={}\n",
+        record.service_name,
+        record.protocol,
+        record.capabilities_text(),
         record.pid,
         record.port,
         record.token,
@@ -10909,24 +11059,35 @@ fn read_valid_search_daemon_record(
 }
 
 fn search_daemon_fingerprint_matches(record: &SearchDaemonRecord) -> bool {
-    let Ok(exe) = env::current_exe() else {
+    if record.protocol != SEARCH_DAEMON_PROTOCOL {
         return false;
-    };
-    let Ok(exe_meta) = fs::metadata(&exe) else {
-        return false;
-    };
+    }
     let Ok(index_meta) = fs::metadata(index_path(&record.root)) else {
         return false;
     };
+    if index_meta.len() != record.index_size || mtime_ns(&index_meta) != record.index_mtime {
+        return false;
+    }
+    let Ok(record_exe_meta) = fs::metadata(&record.exe_path) else {
+        return false;
+    };
+    if record_exe_meta.len() != record.exe_size || mtime_ns(&record_exe_meta) != record.exe_mtime {
+        return false;
+    }
+    if record.service_name != SEARCH_DAEMON_SERVICE_NAME {
+        return true;
+    }
+    let Ok(exe) = env::current_exe() else {
+        return false;
+    };
     exe == record.exe_path
-        && exe_meta.len() == record.exe_size
-        && mtime_ns(&exe_meta) == record.exe_mtime
-        && index_meta.len() == record.index_size
-        && mtime_ns(&index_meta) == record.index_mtime
 }
 
 fn read_search_daemon_record(path: &Path) -> Result<SearchDaemonRecord> {
     let text = fs::read_to_string(path)?;
+    let mut service_name = SEARCH_DAEMON_SERVICE_NAME.to_string();
+    let mut protocol = SEARCH_DAEMON_PROTOCOL;
+    let mut capabilities = None;
     let mut pid = 0;
     let mut port = 0;
     let mut socket_path = None;
@@ -10942,6 +11103,9 @@ fn read_search_daemon_record(path: &Path) -> Result<SearchDaemonRecord> {
             continue;
         };
         match key {
+            "service_name" => service_name = value.to_string(),
+            "protocol" => protocol = value.parse().unwrap_or(0),
+            "capabilities" => capabilities = Some(parse_search_daemon_capabilities(value)),
             "pid" => pid = value.parse().unwrap_or(0),
             "port" => port = value.parse().unwrap_or(0),
             "socket_path" => socket_path = Some(PathBuf::from(value)),
@@ -10955,14 +11119,21 @@ fn read_search_daemon_record(path: &Path) -> Result<SearchDaemonRecord> {
             _ => {}
         }
     }
+    let capabilities = capabilities.unwrap_or_else(SearchDaemonRecord::legacy_capabilities);
     if pid == 0
         || (port == 0 && socket_path.is_none())
         || token.is_empty()
         || root.as_os_str().is_empty()
+        || service_name.is_empty()
+        || protocol == 0
+        || capabilities.is_empty()
     {
         bail!("invalid search daemon record {}", display_path(path));
     }
     Ok(SearchDaemonRecord {
+        service_name,
+        protocol,
+        capabilities,
         pid,
         port,
         socket_path,
@@ -10974,6 +11145,20 @@ fn read_search_daemon_record(path: &Path) -> Result<SearchDaemonRecord> {
         index_size,
         index_mtime,
     })
+}
+
+fn parse_search_daemon_capabilities(value: &str) -> Vec<String> {
+    let mut capabilities = Vec::new();
+    for capability in value.split(',') {
+        let capability = capability.trim();
+        if capability.is_empty() {
+            continue;
+        }
+        if !capabilities.iter().any(|item| item == capability) {
+            capabilities.push(capability.to_string());
+        }
+    }
+    capabilities
 }
 
 fn path_is_ancestor(parent: &Path, child: &Path) -> bool {
@@ -10988,6 +11173,43 @@ fn append_project_log(root: &Path, message: &str) -> Result<()> {
         .open(project_log_path(root))?;
     writeln!(file, "{} {}", log_timestamp(), message)?;
     Ok(())
+}
+
+fn clean_log_text(value: &str, max_len: usize) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        let clean = match ch {
+            '\r' | '\n' | '\t' => ' ',
+            _ if ch.is_control() => ' ',
+            _ => ch,
+        };
+        out.push(clean);
+        if out.len() >= max_len {
+            out.truncate(max_len);
+            out.push_str("...");
+            break;
+        }
+    }
+    out
+}
+
+fn log_quote(value: &str, max_len: usize) -> String {
+    let value = clean_log_text(value, max_len);
+    format!("{value:?}")
+}
+
+fn format_search_log_args(args: &[String]) -> String {
+    let mut out = String::new();
+    for (idx, arg) in args.iter().take(32).enumerate() {
+        if idx != 0 {
+            out.push(' ');
+        }
+        out.push_str(&log_quote(arg, 160));
+    }
+    if args.len() > 32 {
+        out.push_str(" ...");
+    }
+    out
 }
 
 fn log_timestamp() -> String {
