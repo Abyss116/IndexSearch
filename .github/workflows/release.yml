@@ -84,11 +84,14 @@ jobs:
           mkdir -p "dist/${{ matrix.artifact }}"
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "target/${{ matrix.target }}/release/is-daemon.exe" "dist/${{ matrix.artifact }}/"
+            cp "target/${{ matrix.target }}/release/istool.exe" "dist/${{ matrix.artifact }}/"
             cp "target/${{ matrix.target }}/release/indexsearch.exe" "dist/${{ matrix.artifact }}/"
           else
             cp "target/${{ matrix.target }}/release/is-daemon" "dist/${{ matrix.artifact }}/"
+            cp "target/${{ matrix.target }}/release/istool" "dist/${{ matrix.artifact }}/"
             cp "target/${{ matrix.target }}/release/indexsearch" "dist/${{ matrix.artifact }}/"
             chmod +x "dist/${{ matrix.artifact }}/is-daemon"
+            chmod +x "dist/${{ matrix.artifact }}/istool"
             chmod +x "dist/${{ matrix.artifact }}/indexsearch"
           fi
           cp README.md "dist/${{ matrix.artifact }}/"
@@ -195,6 +198,7 @@ jobs:
               odie "IndexSearch archive layout changed" if payload.nil?
               cd payload do
                 bin.install "is-daemon" if File.exist?("is-daemon")
+                bin.install "istool"
                 bin.install "indexsearch"
                 if File.exist?("is")
                   bin.install "is"
@@ -210,12 +214,13 @@ jobs:
             def caveats
               <<~EOS
                 Agent integrations are bundled into the binary:
-                  is install-skills
-                  is install-skills --scope project --project /path/to/project --ue-template
+                  istool install-skills
+                  istool install-skills --scope project --project /path/to/project --ue-template
               EOS
             end
 
             test do
+              assert_match version.to_s, shell_output("#{bin}/istool --version")
               assert_match version.to_s, shell_output("#{bin}/indexsearch --version")
               assert_match version.to_s, shell_output("#{bin}/is --version")
             end

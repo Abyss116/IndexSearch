@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use anyhow::{Context, Result, anyhow, bail};
 use fs2::FileExt;
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use memchr::{memchr, memmem, memrchr};
 use memmap2::Mmap;
 use notify::{
@@ -71,7 +71,6 @@ const SEARCH_DAEMON_DONE_FRAME: u8 = 3;
 const SEARCH_DAEMON_CONTROL_ARG: &str = "--__indexsearch-daemon-control";
 const SEARCH_DAEMON_CONTROL_UPDATE: &str = "update";
 const SEARCH_DAEMON_SKIP_STARTUP_SYNC_ARG: &str = "--__indexsearch-daemon-skip-startup-sync";
-const SEARCH_DAEMON_CONTROL_FALLBACK_CODE: i32 = 75;
 const SEARCH_DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_millis(20);
 #[cfg(windows)]
 const SEARCH_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(2);
@@ -136,12 +135,16 @@ struct MatcherSet {
 
 impl MatcherSet {
     fn new(patterns: &[String]) -> Result<Self> {
+        Self::new_with_case(patterns, false)
+    }
+
+    fn new_with_case(patterns: &[String], case_insensitive: bool) -> Result<Self> {
         if patterns.is_empty() {
             return Ok(Self { set: None });
         }
         let mut builder = GlobSetBuilder::new();
         for pat in patterns {
-            add_glob_pattern(&mut builder, pat)?;
+            add_glob_pattern(&mut builder, pat, case_insensitive)?;
         }
         Ok(Self {
             set: Some(builder.build()?),
@@ -166,17 +169,22 @@ struct Options {
     with_filename: Option<bool>,
     heading: Option<bool>,
     files_with_matches: bool,
+    files_without_match: bool,
     count: bool,
+    count_matches: bool,
     files: bool,
     vimgrep: bool,
     stats: bool,
     quiet: bool,
     only_matching: bool,
+    invert_match: bool,
+    line_regexp: bool,
+    include_zero: bool,
+    trim: bool,
     json: bool,
     color: ColorChoice,
     auto_index: bool,
     auto_update: bool,
-    daemon: bool,
     profile: bool,
     sort_path: bool,
     git_update: bool,
@@ -187,8 +195,21 @@ struct Options {
     max_filesize: u64,
     pattern: String,
     globs: Vec<String>,
+    ignore_files: Vec<String>,
+    glob_case_insensitive: bool,
+    ignore_file_case_insensitive: bool,
+    max_depth: Option<usize>,
+    type_includes: Vec<String>,
+    type_excludes: Vec<String>,
+    compatibility_notes: Vec<SearchCompatibilityNote>,
     paths: Vec<String>,
     cwd: PathBuf,
+}
+
+#[derive(Clone)]
+struct SearchCompatibilityNote {
+    flag: String,
+    detail: &'static str,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -447,6 +468,7 @@ impl TrigramScratch {
 struct PathFilter {
     prefixes: Vec<String>,
     matcher: Option<(MatcherSet, MatcherSet)>,
+    max_depth: Option<usize>,
 }
 
 struct FileView<'a> {
@@ -633,7 +655,7 @@ impl SearchDaemonRecord {
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("indexsearch: {err:#}");
+        eprintln!("istool: {err:#}");
         std::process::exit(2);
     }
 }
@@ -680,6 +702,9 @@ fn run() -> Result<()> {
         }
         "search-daemon" => {
             args.remove(0);
+            if maybe_print_command_help("search-daemon", &args) {
+                std::process::exit(0);
+            }
             std::process::exit(command_search_daemon(&args)?);
         }
         "projects" => {
@@ -696,9 +721,9 @@ fn run() -> Result<()> {
             }
             std::process::exit(command_stop_projects(&args)?);
         }
-        "project-log" => {
+        "log" => {
             args.remove(0);
-            if maybe_print_command_help("project-log", &args) {
+            if maybe_print_command_help("log", &args) {
                 std::process::exit(0);
             }
             std::process::exit(command_project_log(&args)?);
@@ -731,16 +756,134 @@ fn run() -> Result<()> {
             }
             std::process::exit(command_search(&args)?);
         }
+        "completions" => {
+            args.remove(0);
+            if maybe_print_command_help("completions", &args) {
+                std::process::exit(0);
+            }
+            std::process::exit(command_completions(&args)?);
+        }
         "-h" | "--help" => {
             print_help();
             Ok(())
         }
-        "-V" | "--version" | "version" => {
-            println!("indexsearch {}", env!("CARGO_PKG_VERSION"));
+        "-V" | "--version" => {
+            println!("{} {}", cli_binary_name(), env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        _ => std::process::exit(command_search(&args)?),
+        "version" => {
+            args.remove(0);
+            if maybe_print_command_help("version", &args) {
+                std::process::exit(0);
+            }
+            println!("{} {}", cli_binary_name(), env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        value => {
+            bail!(
+                "unknown command `{value}`; use `istool search {value}` to search for that pattern"
+            )
+        }
     }
+}
+
+fn cli_binary_name() -> &'static str {
+    if env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
+        })
+        .is_some_and(|stem| stem == "is-daemon" || stem.starts_with("is-daemon-"))
+    {
+        "is-daemon"
+    } else {
+        "istool"
+    }
+}
+
+struct CommandSpec {
+    name: &'static str,
+    usage: &'static str,
+    description: &'static str,
+}
+
+const ISTOOL_COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "index",
+        usage: "index [PATH]",
+        description: "rebuild the base index from scratch",
+    },
+    CommandSpec {
+        name: "update",
+        usage: "update [PATH]",
+        description: "incrementally update or rebuild the index",
+    },
+    CommandSpec {
+        name: "compact",
+        usage: "compact [PATH]",
+        description: "fold delta indexes into the base index",
+    },
+    CommandSpec {
+        name: "clean",
+        usage: "clean [PATH]",
+        description: "stop project services and remove index state",
+    },
+    CommandSpec {
+        name: "search-daemon",
+        usage: "search-daemon [OPTIONS] PATH",
+        description: "run the project service backend",
+    },
+    CommandSpec {
+        name: "projects",
+        usage: "projects",
+        description: "list active project services",
+    },
+    CommandSpec {
+        name: "stop",
+        usage: "stop [--all] [ID|PATH]",
+        description: "stop project services",
+    },
+    CommandSpec {
+        name: "log",
+        usage: "log [PATH]",
+        description: "print project service activity",
+    },
+    CommandSpec {
+        name: "install",
+        usage: "install [--dir PATH]",
+        description: "install the daemon backend and user-facing commands into a bin dir",
+    },
+    CommandSpec {
+        name: "install-skills",
+        usage: "install-skills [OPTIONS]",
+        description: "install bundled agent skills and rules",
+    },
+    CommandSpec {
+        name: "status",
+        usage: "status [PATH]",
+        description: "print index status",
+    },
+    CommandSpec {
+        name: "search",
+        usage: "search [OPTIONS] PATTERN [PATH ...]",
+        description: "explicit search mode",
+    },
+    CommandSpec {
+        name: "completions",
+        usage: "completions [SHELL]",
+        description: "print shell completion script",
+    },
+    CommandSpec {
+        name: "version",
+        usage: "version",
+        description: "print version information",
+    },
+];
+
+fn command_spec(name: &str) -> Option<&'static CommandSpec> {
+    ISTOOL_COMMANDS.iter().find(|command| command.name == name)
 }
 
 #[derive(Default)]
@@ -770,21 +913,7 @@ fn normalize_leading_command_flags(args: &mut Vec<String>) {
 }
 
 fn is_command_name(arg: &str) -> bool {
-    matches!(
-        arg,
-        "index"
-            | "update"
-            | "compact"
-            | "clean"
-            | "search-daemon"
-            | "projects"
-            | "stop"
-            | "project-log"
-            | "install"
-            | "install-skills"
-            | "status"
-            | "search"
-    )
+    command_spec(arg).is_some()
 }
 
 fn print_help() {
@@ -792,62 +921,16 @@ fn print_help() {
     help_section(&style, "Usage");
     println!(
         "  {} {} {}",
-        style.cmd("indexsearch"),
-        style.opt("[OPTIONS]"),
-        style.meta("PATTERN [PATH ...]")
-    );
-    println!(
-        "  {} {} {}",
-        style.cmd("indexsearch"),
+        style.cmd("istool"),
         style.meta("<COMMAND>"),
         style.opt("[ARGS]")
     );
     println!();
 
     help_section(&style, "Commands");
-    help_command(
-        &style,
-        "index [PATH]",
-        "rebuild the base index from scratch",
-    );
-    help_command(
-        &style,
-        "update [PATH]",
-        "incrementally update or rebuild the index",
-    );
-    help_command(
-        &style,
-        "compact [PATH]",
-        "fold delta indexes into the base index",
-    );
-    help_command(
-        &style,
-        "clean [PATH]",
-        "stop project services and remove index state",
-    );
-    help_command(&style, "projects", "list active project services");
-    help_command(&style, "stop [--all] [ID|PATH]", "stop project services");
-    help_command(
-        &style,
-        "project-log [PATH]",
-        "print project service activity",
-    );
-    help_command(
-        &style,
-        "install [--dir PATH]",
-        "install the daemon backend and user-facing commands into a bin dir",
-    );
-    help_command(
-        &style,
-        "install-skills [OPTIONS]",
-        "install bundled agent skills and rules",
-    );
-    help_command(&style, "status [PATH]", "print index status");
-    help_command(
-        &style,
-        "search [OPTIONS] PATTERN [PATH ...]",
-        "explicit search mode",
-    );
+    for command in ISTOOL_COMMANDS {
+        help_command(&style, command.usage, command.description);
+    }
     println!();
 
     help_section(&style, "Common Search Options");
@@ -889,8 +972,20 @@ fn print_help() {
         "-l, --files-with-matches",
         "print matching file paths",
     );
+    help_option(
+        &style,
+        "--files-without-match",
+        "print non-matching file paths",
+    );
     help_option(&style, "-c, --count", "print match counts per file");
+    help_option(
+        &style,
+        "--count-matches",
+        "print match occurrence counts per file",
+    );
     help_option(&style, "-o, --only-matching", "print only matching text");
+    help_option(&style, "-v, --invert-match", "print non-matching lines");
+    help_option(&style, "-x, --line-regexp", "match whole lines only");
     help_option(&style, "-q, --quiet", "suppress normal output");
     help_option(&style, "--files", "print indexed searchable files");
     help_option(&style, "--json", "print JSON Lines matches");
@@ -908,7 +1003,6 @@ fn print_help() {
         "--profile, --instrument",
         "print internal timing breakdown to stderr",
     );
-    help_option(&style, "--no-daemon", "do not use the search daemon");
     println!();
 
     help_section(&style, "Indexing Options");
@@ -948,11 +1042,11 @@ fn print_help() {
 
     println!(
         "Run {} for command-specific options.",
-        style.cmd("indexsearch <COMMAND> --help")
+        style.cmd("istool <COMMAND> --help")
     );
     println!(
         "Use {} to search for a pattern that is also a command name.",
-        style.cmd("indexsearch -- PATTERN [PATH ...]")
+        style.cmd("istool search -- PATTERN [PATH ...]")
     );
 }
 
@@ -971,13 +1065,16 @@ fn print_command_help(command: &str) {
         "update" => print_update_help(),
         "compact" => print_compact_help(),
         "clean" => print_clean_help(),
+        "search-daemon" => print_search_daemon_help(),
         "projects" => print_projects_help(),
         "stop" => print_stop_help(),
-        "project-log" => print_project_log_help(),
+        "log" => print_project_log_help(),
         "install" => print_install_help(),
         "install-skills" => print_install_skills_help(),
         "status" => print_status_help(),
         "search" => print_search_help(),
+        "completions" => print_completions_help(),
+        "version" => print_version_help(),
         _ => print_help(),
     }
 }
@@ -1090,10 +1187,61 @@ fn print_project_log_help() {
     let style = HelpStyle::new();
     command_usage(
         &style,
-        "project-log",
+        "log",
         "[PATH]",
         "print project service activity for a root",
     );
+}
+
+fn print_search_daemon_help() {
+    let style = HelpStyle::new();
+    command_usage(
+        &style,
+        "search-daemon",
+        "[OPTIONS] PATH",
+        "run the project service backend",
+    );
+    help_section(&style, "Options");
+    help_option(&style, "--detach", "start the service in the background");
+    help_option(
+        &style,
+        "--idle-seconds NUM",
+        "seconds of inactivity before idle maintenance",
+    );
+    help_option(
+        &style,
+        "--compact-delta-count NUM",
+        "compact after this many delta indexes",
+    );
+    help_option(
+        &style,
+        "--compact-delta-bytes SIZE",
+        "compact after this many delta bytes",
+    );
+}
+
+fn print_completions_help() {
+    let style = HelpStyle::new();
+    command_usage(
+        &style,
+        "completions",
+        "[SHELL]",
+        "print shell completion script",
+    );
+    help_section(&style, "Shells");
+    help_option(
+        &style,
+        "powershell",
+        "PowerShell Register-ArgumentCompleter script",
+    );
+    help_option(&style, "bash", "bash completion script");
+    help_option(&style, "zsh", "zsh completion script");
+    help_option(&style, "fish", "fish completion script");
+}
+
+fn print_version_help() {
+    let style = HelpStyle::new();
+    command_usage(&style, "version", "", "print version information");
 }
 
 fn print_install_help() {
@@ -1148,12 +1296,25 @@ fn print_status_help() {
 
 fn print_search_help() {
     let style = HelpStyle::new();
-    command_usage(
-        &style,
-        "search",
-        "[OPTIONS] PATTERN [PATH ...]",
-        "search the indexed tree",
-    );
+    if let Ok(frontend_name) = env::var("INDEXSEARCH_FRONTEND_HELP_NAME") {
+        help_section(&style, "Usage");
+        println!(
+            "  {} {}",
+            style.cmd(&frontend_name),
+            style.meta("[OPTIONS] PATTERN [PATH ...]")
+        );
+        println!();
+        help_section(&style, "Description");
+        println!("  search the indexed tree");
+        println!();
+    } else {
+        command_usage(
+            &style,
+            "search",
+            "[OPTIONS] PATTERN [PATH ...]",
+            "search the indexed tree",
+        );
+    }
     help_section(&style, "Options");
     help_option(&style, "-i, --ignore-case", "case insensitive search");
     help_option(&style, "-s, --case-sensitive", "case sensitive search");
@@ -1242,17 +1403,16 @@ fn print_search_help() {
         "--profile, --instrument",
         "print internal timing breakdown to stderr",
     );
-    help_option(&style, "--no-daemon", "do not use the search daemon");
 }
 
 fn command_usage(style: &HelpStyle, command: &str, args: &str, description: &str) {
     help_section(style, "Usage");
     if args.is_empty() {
-        println!("  {} {}", style.cmd("indexsearch"), style.cmd(command));
+        println!("  {} {}", style.cmd("istool"), style.cmd(command));
     } else {
         println!(
             "  {} {} {}",
-            style.cmd("indexsearch"),
+            style.cmd("istool"),
             style.cmd(command),
             style.meta(args)
         );
@@ -1395,9 +1555,9 @@ impl ProgressLine {
                     .map(|label| label.clone())
                     .unwrap_or_else(|_| "Working".to_string());
                 let bar = progress_bar(tick, width);
-                let elapsed = started.elapsed().as_secs_f32();
+                let elapsed = format_elapsed_duration(started.elapsed());
                 eprint!(
-                    "\r  {} {:<18} {} {:>5.1}s",
+                    "\r  {} {:<18} {} {:>9}",
                     color_progress(frames[tick % frames.len()]),
                     text,
                     bar,
@@ -1428,10 +1588,10 @@ impl ProgressLine {
         if stderr_supports_progress() {
             eprintln!("│");
             eprintln!(
-                "{} {} — done ({:.1}s)",
+                "{} {} — done ({})",
                 color_success("◆"),
                 label,
-                self.started.elapsed().as_secs_f32()
+                format_elapsed_duration(self.started.elapsed())
             );
         }
     }
@@ -1489,7 +1649,10 @@ impl ConsoleFlow {
     fn done(&self) {
         if self.enabled {
             eprintln!("│");
-            eprintln!("└ Done in {:.1}s", self.started.elapsed().as_secs_f32());
+            eprintln!(
+                "└ Done in {}",
+                format_elapsed_duration(self.started.elapsed())
+            );
         }
     }
 }
@@ -1549,6 +1712,26 @@ fn color_info(text: &str) -> String {
     }
 }
 
+fn format_elapsed_duration(elapsed: Duration) -> String {
+    format_elapsed_secs(elapsed.as_secs_f64())
+}
+
+fn format_elapsed_secs(secs: f64) -> String {
+    if secs > 5.0 {
+        format!("{secs:.3}s")
+    } else {
+        format!("{:.3}ms", secs * 1000.0)
+    }
+}
+
+fn format_elapsed_millis(ms: f64) -> String {
+    if ms > 5_000.0 {
+        format!("{:.3}s", ms / 1000.0)
+    } else {
+        format!("{ms:.3}ms")
+    }
+}
+
 fn format_count(value: u64) -> String {
     let text = value.to_string();
     let mut out = String::with_capacity(text.len() + text.len() / 3);
@@ -1603,19 +1786,19 @@ fn command_index(args: &[String]) -> Result<i32> {
         format_count(index.files.len() as u64)
     ));
     flow.detail(format!(
-        "{} scanned, {} skipped in {:.3}s",
+        "{} scanned, {} skipped in {}",
         format_count(scanned),
         format_count(skipped),
-        elapsed
+        format_elapsed_secs(elapsed)
     ));
     flow.detail(timing_summary(&timings));
     flow.done();
     println!(
-        "indexed {} files ({} skipped, {} scanned) in {:.3}s",
+        "indexed {} files ({} skipped, {} scanned) in {}",
         index.files.len(),
         skipped,
         scanned,
-        elapsed
+        format_elapsed_secs(elapsed)
     );
     print_timings(&timings);
     if options.profile {
@@ -1686,9 +1869,9 @@ fn command_update(args: &[String]) -> Result<i32> {
                         flow.detail(timing_summary(&timings));
                         flow.done();
                         println!(
-                            "updated {} files (0 changed by git) in {:.3}s",
+                            "updated {} files (0 changed by git) in {}",
                             old_index.file_count,
-                            timer.elapsed().as_secs_f64()
+                            format_elapsed_duration(timer.elapsed())
                         );
                         print_timings(&timings);
                         if options.profile {
@@ -1732,7 +1915,7 @@ fn command_update(args: &[String]) -> Result<i32> {
                         flow.detail(timing_summary(&timings));
                         flow.done();
                         println!(
-                            "updated {} files ({} reused, {} added, {} modified, {} removed, {} skipped, {} scanned) in {:.3}s",
+                            "updated {} files ({} reused, {} added, {} modified, {} removed, {} skipped, {} scanned) in {}",
                             visible_count,
                             stats.reused,
                             stats.added,
@@ -1740,7 +1923,7 @@ fn command_update(args: &[String]) -> Result<i32> {
                             stats.removed,
                             skipped,
                             scanned,
-                            elapsed
+                            format_elapsed_secs(elapsed)
                         );
                         print_timings(&timings);
                         if options.profile {
@@ -1809,19 +1992,19 @@ fn command_update(args: &[String]) -> Result<i32> {
         format_count(index.files.len() as u64)
     ));
     flow.detail(format!(
-        "{} scanned, {} skipped in {:.3}s",
+        "{} scanned, {} skipped in {}",
         format_count(scanned),
         format_count(skipped),
-        elapsed
+        format_elapsed_secs(elapsed)
     ));
     flow.detail(timing_summary(&timings));
     flow.done();
     println!(
-        "indexed {} files ({} skipped, {} scanned) in {:.3}s",
+        "indexed {} files ({} skipped, {} scanned) in {}",
         index.files.len(),
         skipped,
         scanned,
-        elapsed
+        format_elapsed_secs(elapsed)
     );
     print_timings(&timings);
     if options.profile {
@@ -1859,16 +2042,20 @@ fn update_from_filesystem_scan(
             format_count(visible_before as u64)
         ));
         flow.detail(format!(
-            "{} scanned, {} skipped in {:.3}s",
+            "{} scanned, {} skipped in {}",
             format_count(scanned),
             format_count(skipped),
-            elapsed
+            format_elapsed_secs(elapsed)
         ));
         flow.detail(timing_summary(timings));
         flow.done();
         println!(
-            "updated {} files ({} reused, 0 added, 0 modified, 0 removed, {} skipped, {} scanned) in {:.3}s",
-            visible_before, visible_before, skipped, scanned, elapsed
+            "updated {} files ({} reused, 0 added, 0 modified, 0 removed, {} skipped, {} scanned) in {}",
+            visible_before,
+            visible_before,
+            skipped,
+            scanned,
+            format_elapsed_secs(elapsed)
         );
         print_timings(timings);
         if options.profile {
@@ -1923,15 +2110,15 @@ fn update_from_filesystem_scan(
         format_count(stats.removed as u64)
     ));
     flow.detail(format!(
-        "{} scanned, {} skipped in {:.3}s",
+        "{} scanned, {} skipped in {}",
         format_count(scanned),
         format_count(skipped),
-        elapsed
+        format_elapsed_secs(elapsed)
     ));
     flow.detail(timing_summary(timings));
     flow.done();
     println!(
-        "updated {} files ({} reused, {} added, {} modified, {} removed, {} skipped, {} scanned) in {:.3}s",
+        "updated {} files ({} reused, {} added, {} modified, {} removed, {} skipped, {} scanned) in {}",
         visible_count,
         stats.reused,
         stats.added,
@@ -1939,7 +2126,7 @@ fn update_from_filesystem_scan(
         stats.removed,
         skipped,
         scanned,
-        elapsed
+        format_elapsed_secs(elapsed)
     );
     print_timings(timings);
     if options.profile {
@@ -1974,8 +2161,9 @@ fn update_from_recent_state(
     flow.detail(timing_summary(timings));
     flow.done();
     println!(
-        "updated {} files (recent sync state) in {:.3}s",
-        file_count, elapsed
+        "updated {} files (recent sync state) in {}",
+        file_count,
+        format_elapsed_secs(elapsed)
     );
     print_timings(timings);
     if profile {
@@ -2047,11 +2235,11 @@ fn sync_index_before_service(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<
         append_project_log(
             &cfg.root,
             &format!(
-                "startup-index files={} skipped={} scanned={} elapsed={:.3}s {}",
+                "startup-index files={} skipped={} scanned={} elapsed={} {}",
                 index.files.len(),
                 skipped,
                 scanned,
-                timer.elapsed().as_secs_f64(),
+                format_elapsed_duration(timer.elapsed()),
                 timing_summary(&timings)
             ),
         )?;
@@ -2061,10 +2249,10 @@ fn sync_index_before_service(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<
             format_count(index.files.len() as u64)
         ));
         flow.detail(format!(
-            "{} scanned, {} skipped in {:.3}s",
+            "{} scanned, {} skipped in {}",
             format_count(scanned),
             format_count(skipped),
-            timer.elapsed().as_secs_f64()
+            format_elapsed_duration(timer.elapsed())
         ));
         flow.detail(timing_summary(&timings));
         std::mem::forget(index);
@@ -2080,12 +2268,12 @@ fn sync_index_before_service(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<
         append_project_log(
             &cfg.root,
             &format!(
-                "startup-update files={} reused={} added=0 modified=0 removed=0 skipped={} scanned={} elapsed={:.3}s {}",
+                "startup-update files={} reused={} added=0 modified=0 removed=0 skipped={} scanned={} elapsed={} {}",
                 visible_before,
                 visible_before,
                 skipped,
                 scanned,
-                timer.elapsed().as_secs_f64(),
+                format_elapsed_duration(timer.elapsed()),
                 timing_summary(&timings)
             ),
         )?;
@@ -2095,10 +2283,10 @@ fn sync_index_before_service(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<
             format_count(visible_before as u64)
         ));
         flow.detail(format!(
-            "{} scanned, {} skipped in {:.3}s",
+            "{} scanned, {} skipped in {}",
             format_count(scanned),
             format_count(skipped),
-            timer.elapsed().as_secs_f64()
+            format_elapsed_duration(timer.elapsed())
         ));
         flow.detail(timing_summary(&timings));
         return Ok(());
@@ -2129,7 +2317,7 @@ fn sync_index_before_service(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<
     append_project_log(
         &cfg.root,
         &format!(
-            "startup-update files={} reused={} added={} modified={} removed={} skipped={} scanned={} elapsed={:.3}s {}",
+            "startup-update files={} reused={} added={} modified={} removed={} skipped={} scanned={} elapsed={} {}",
             stats.reused + stats.updated + stats.added,
             stats.reused,
             stats.added,
@@ -2137,7 +2325,7 @@ fn sync_index_before_service(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<
             stats.removed,
             skipped,
             scanned,
-            timer.elapsed().as_secs_f64(),
+            format_elapsed_duration(timer.elapsed()),
             timing_summary(&timings)
         ),
     )?;
@@ -2382,7 +2570,14 @@ fn command_project_log(args: &[String]) -> Result<i32> {
         .first()
         .map(PathBuf::from)
         .unwrap_or(env::current_dir()?);
-    let cfg = load_config(&start)?;
+    let Some(root) = find_existing_project_root(&start) else {
+        eprintln!(
+            "istool: not in an IndexSearch project: {}",
+            display_path(&start)
+        );
+        return Ok(1);
+    };
+    let cfg = load_config(&root)?;
     let path = project_log_path(&cfg.root);
     let lines = fs::read_to_string(&path).unwrap_or_default();
     if lines.is_empty() {
@@ -2391,6 +2586,184 @@ fn command_project_log(args: &[String]) -> Result<i32> {
         print!("{lines}");
     }
     Ok(0)
+}
+
+fn command_completions(args: &[String]) -> Result<i32> {
+    if args.len() > 1 {
+        bail!("completions accepts at most one shell: powershell, bash, zsh, or fish");
+    }
+    let shell = args
+        .first()
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_else(default_completion_shell);
+    match shell.as_str() {
+        "powershell" | "pwsh" | "ps" => print_powershell_completions(),
+        "bash" => print_bash_completions(),
+        "zsh" => print_zsh_completions(),
+        "fish" => print_fish_completions(),
+        _ => {
+            bail!("unsupported completion shell `{shell}`; expected powershell, bash, zsh, or fish")
+        }
+    }
+    Ok(0)
+}
+
+fn default_completion_shell() -> String {
+    #[cfg(windows)]
+    {
+        "powershell".to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        let shell = env::var("SHELL")
+            .ok()
+            .and_then(|value| {
+                Path::new(&value)
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.to_ascii_lowercase())
+            })
+            .unwrap_or_default();
+        if shell.contains("zsh") {
+            "zsh".to_string()
+        } else if shell.contains("fish") {
+            "fish".to_string()
+        } else {
+            "bash".to_string()
+        }
+    }
+}
+
+fn print_powershell_completions() {
+    println!("Register-ArgumentCompleter -Native -CommandName istool -ScriptBlock {{");
+    println!("    param($wordToComplete, $commandAst, $cursorPosition)");
+    println!();
+    println!("    $commands = @({})", powershell_command_array());
+    println!("    $commandSet = @{{}}");
+    println!("    foreach ($command in $commands) {{");
+    println!("        $commandSet[$command] = $true");
+    println!("    }}");
+    println!();
+    println!("    $seenCommand = $false");
+    println!("    $currentStart = $cursorPosition - $wordToComplete.Length");
+    println!("    foreach ($element in $commandAst.CommandElements | Select-Object -Skip 1) {{");
+    println!(
+        "        if ($element.Extent.StartOffset -ge $currentStart -and $element.Extent.EndOffset -le $cursorPosition) {{"
+    );
+    println!("            continue");
+    println!("        }}");
+    println!("        if ($element.Extent.EndOffset -gt $cursorPosition) {{");
+    println!("            continue");
+    println!("        }}");
+    println!("        if ($commandSet.ContainsKey($element.Extent.Text)) {{");
+    println!("            $seenCommand = $true");
+    println!("            break");
+    println!("        }}");
+    println!("    }}");
+    println!();
+    println!("    if (-not $seenCommand) {{");
+    println!(
+        "        $commands | Where-Object {{ $_ -like \"$wordToComplete*\" }} | ForEach-Object {{"
+    );
+    println!(
+        "            [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)"
+    );
+    println!("        }}");
+    println!("    }}");
+    println!("}}");
+}
+
+fn print_bash_completions() {
+    println!("_istool() {{");
+    println!("    local cur command word i");
+    println!("    COMPREPLY=()");
+    println!("    cur=\"${{COMP_WORDS[COMP_CWORD]}}\"");
+    println!("    command=\"\"");
+    println!("    for ((i = 1; i < COMP_CWORD; i++)); do");
+    println!("        word=\"${{COMP_WORDS[i]}}\"");
+    println!("        case \"$word\" in");
+    println!(
+        "            {}) command=\"$word\"; break ;;",
+        bash_command_case()
+    );
+    println!("        esac");
+    println!("    done");
+    println!("    if [[ -z \"$command\" ]]; then");
+    println!(
+        "        COMPREPLY=( $(compgen -W \"{}\" -- \"$cur\") )",
+        command_names_space_separated()
+    );
+    println!("    fi");
+    println!("}}");
+    println!("complete -F _istool istool");
+}
+
+fn print_zsh_completions() {
+    println!("#compdef istool");
+    println!();
+    println!("local -a commands");
+    println!("commands=(");
+    for command in ISTOOL_COMMANDS {
+        println!(
+            "  {}",
+            shell_single_quote(&format!("{}:{}", command.name, command.description))
+        );
+    }
+    println!(")");
+    println!();
+    println!("if (( CURRENT <= 2 )); then");
+    println!("  _describe 'command' commands");
+    println!("else");
+    println!("  _files");
+    println!("fi");
+}
+
+fn print_fish_completions() {
+    println!("function __fish_istool_needs_command");
+    println!(
+        "    not __fish_seen_subcommand_from {}",
+        command_names_space_separated()
+    );
+    println!("end");
+    println!();
+    for command in ISTOOL_COMMANDS {
+        println!(
+            "complete -c istool -f -n '__fish_istool_needs_command' -a {} -d {}",
+            shell_single_quote(command.name),
+            shell_single_quote(command.description)
+        );
+    }
+}
+
+fn powershell_command_array() -> String {
+    ISTOOL_COMMANDS
+        .iter()
+        .map(|command| {
+            let escaped = command.name.replace('\'', "''");
+            format!("'{escaped}'")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn command_names_space_separated() -> String {
+    ISTOOL_COMMANDS
+        .iter()
+        .map(|command| command.name)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn bash_command_case() -> String {
+    ISTOOL_COMMANDS
+        .iter()
+        .map(|command| command.name)
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn command_install(args: &[String]) -> Result<i32> {
@@ -2408,7 +2781,10 @@ fn command_install(args: &[String]) -> Result<i32> {
     }
     fs::create_dir_all(&dir)?;
     let src = env::current_exe()?;
+    let daemon_src = sibling_executable(&src, "is-daemon").unwrap_or_else(|| src.clone());
+    let tool_src = sibling_executable(&src, "istool").unwrap_or_else(|| src.clone());
     let daemon_path = dir.join(executable_name("is-daemon"));
+    let tool_path = dir.join(executable_name("istool"));
     let exe_path = dir.join(executable_name("indexsearch"));
     let alias_path = dir.join(executable_name("is"));
     #[cfg(windows)]
@@ -2417,8 +2793,8 @@ fn command_install(args: &[String]) -> Result<i32> {
             "is-daemon-{}",
             env!("CARGO_PKG_VERSION")
         )));
-        install_executable(&src, &versioned_daemon_path)?;
-        if let Err(err) = install_executable(&src, &daemon_path) {
+        install_executable(&daemon_src, &versioned_daemon_path)?;
+        if let Err(err) = install_executable(&daemon_src, &daemon_path) {
             eprintln!(
                 "indexsearch: warning: could not replace {}; installed versioned backend {} instead ({err:#})",
                 display_path(&daemon_path),
@@ -2429,9 +2805,10 @@ fn command_install(args: &[String]) -> Result<i32> {
     };
     #[cfg(not(windows))]
     let installed_backend_path = {
-        install_executable(&src, &daemon_path)?;
+        install_executable(&daemon_src, &daemon_path)?;
         daemon_path.clone()
     };
+    install_executable(&tool_src, &tool_path)?;
     let frontend_src = src
         .parent()
         .map(|parent| parent.join(executable_name("indexsearch")))
@@ -2451,28 +2828,37 @@ fn command_install(args: &[String]) -> Result<i32> {
         warn_legacy_cmd_shims(&dir, &legacy_alias_path);
     }
     if let Some(frontend_src) = frontend_src {
-        install_executable(&frontend_src, &alias_path)?;
         install_executable(&frontend_src, &exe_path)?;
+        install_search_alias(&exe_path, &alias_path)?;
     } else if let Some(short_frontend_src) = short_frontend_src {
-        install_executable(&short_frontend_src, &alias_path)?;
         install_executable(&short_frontend_src, &exe_path)?;
+        install_search_alias(&exe_path, &alias_path)?;
     } else {
-        install_alias(&installed_backend_path, &alias_path)?;
-        install_alias(&installed_backend_path, &exe_path)?;
+        bail!(
+            "cannot find `{}` next to {}; build or package the search frontend first",
+            executable_name("indexsearch"),
+            display_path(&src)
+        );
     }
     println!("installed: {}", display_path(&installed_backend_path));
     if installed_backend_path != daemon_path {
         println!("legacy backend: {}", display_path(&daemon_path));
     }
+    println!("tool: {}", display_path(&tool_path));
     println!("frontend: {}", display_path(&exe_path));
     println!("frontend: {}", display_path(&alias_path));
     if !path_contains(&dir) {
         println!(
-            "note: add {} to PATH to use indexsearch and is from any shell",
+            "note: add {} to PATH to use istool, indexsearch, and is from any shell",
             display_path(&dir)
         );
     }
     Ok(0)
+}
+
+fn sibling_executable(src: &Path, stem: &str) -> Option<PathBuf> {
+    let path = src.parent()?.join(executable_name(stem));
+    path.is_file().then_some(path)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3052,12 +3438,12 @@ fn flush_watch_batch(cfg: &ProjectConfig, paths: &HashSet<String>) -> Result<boo
         append_project_log(
             &cfg.root,
             &format!(
-                "auto-index files={} skipped={} scanned={} events={} elapsed={:.3}s {}",
+                "auto-index files={} skipped={} scanned={} events={} elapsed={} {}",
                 index.files.len(),
                 skipped,
                 scanned,
                 paths.len(),
-                timer.elapsed().as_secs_f64(),
+                format_elapsed_duration(timer.elapsed()),
                 timing_summary(&timings)
             ),
         )?;
@@ -3079,7 +3465,7 @@ fn flush_watch_batch(cfg: &ProjectConfig, paths: &HashSet<String>) -> Result<boo
     append_project_log(
         &cfg.root,
         &format!(
-            "auto-update files={} reused={} added={} modified={} removed={} skipped={} scanned={} events={} elapsed={:.3}s process={:.3}s write={:.3}s",
+            "auto-update files={} reused={} added={} modified={} removed={} skipped={} scanned={} events={} elapsed={} process={} write={}",
             stats.reused + stats.added + stats.updated,
             stats.reused,
             stats.added,
@@ -3088,9 +3474,9 @@ fn flush_watch_batch(cfg: &ProjectConfig, paths: &HashSet<String>) -> Result<boo
             skipped,
             scanned,
             paths.len(),
-            timer.elapsed().as_secs_f64(),
-            process_elapsed,
-            write_elapsed
+            format_elapsed_duration(timer.elapsed()),
+            format_elapsed_secs(process_elapsed),
+            format_elapsed_secs(write_elapsed)
         ),
     )?;
     Ok(true)
@@ -3164,12 +3550,12 @@ fn compact_root(
     append_project_log(
         &cfg.root,
         &format!(
-            "auto-compact files={} deltas={} elapsed={:.3}s process={:.3}s write={:.3}s",
+            "auto-compact files={} deltas={} elapsed={} process={} write={}",
             compacted.files.len(),
             delta_count,
-            timer.elapsed().as_secs_f64(),
-            process_elapsed,
-            write_elapsed
+            format_elapsed_duration(timer.elapsed()),
+            format_elapsed_secs(process_elapsed),
+            format_elapsed_secs(write_elapsed)
         ),
     )?;
     append_project_log(&cfg.root, "project-service-reload reason=compact")?;
@@ -3202,8 +3588,8 @@ fn command_compact(args: &[String]) -> Result<i32> {
         flow.detail(timing_summary(&timings));
         flow.done();
         println!(
-            "compacted 0 delta indexes in {:.3}s",
-            timer.elapsed().as_secs_f64()
+            "compacted 0 delta indexes in {}",
+            format_elapsed_duration(timer.elapsed())
         );
         print_timings(&timings);
         if options.profile {
@@ -3236,9 +3622,9 @@ fn command_compact(args: &[String]) -> Result<i32> {
     flow.detail(timing_summary(&timings));
     flow.done();
     println!(
-        "compacted {} files into base index in {:.3}s",
+        "compacted {} files into base index in {}",
         compacted.files.len(),
-        timer.elapsed().as_secs_f64()
+        format_elapsed_duration(timer.elapsed())
     );
     print_timings(&timings);
     if options.profile {
@@ -3455,7 +3841,6 @@ fn command_search(args: &[String]) -> Result<i32> {
         profile.record("client_resolve_start_path", start_timer.elapsed());
     }
     if !options.auto_update
-        && options.daemon
         && let Some(code) = try_search_multiple_roots(args, &options, &mut profile, total_timer)?
     {
         return Ok(code);
@@ -3466,32 +3851,16 @@ fn command_search(args: &[String]) -> Result<i32> {
             if options.profile {
                 profile.record("client_find_index_root", find_timer.elapsed());
             }
-            if options.daemon {
-                if let Some(code) = try_search_daemon(
-                    &root,
-                    &daemon_search_args(args),
-                    if options.profile {
-                        Some(&mut profile)
-                    } else {
-                        None
-                    },
-                    total_timer,
-                )? {
-                    return Ok(code);
-                }
-            }
-            let lock_timer = Instant::now();
-            let _lock = acquire_shared_lock(&root)?;
-            if options.profile {
-                profile.record("client_acquire_shared_lock", lock_timer.elapsed());
-            }
-            let open_timer = Instant::now();
-            if let Ok(index) = MappedIndex::open(&index_path(&root)) {
+            return try_search_daemon(
+                &root,
+                &daemon_search_args(args),
                 if options.profile {
-                    profile.record("client_open_index_mmap", open_timer.elapsed());
-                }
-                return run_search_with_index(index, &options, Some(profile), total_timer);
-            }
+                    Some(&mut profile)
+                } else {
+                    None
+                },
+                total_timer,
+            );
         } else if options.profile {
             profile.record("client_find_index_root", find_timer.elapsed());
         }
@@ -3517,6 +3886,7 @@ fn command_search(args: &[String]) -> Result<i32> {
             profile.record("client_auto_update", update_timer.elapsed());
         }
     }
+    log_search_compat_notes(&cfg.root, &options);
     let lock_timer = Instant::now();
     let _lock = acquire_shared_lock(&cfg.root)?;
     if options.profile {
@@ -3605,7 +3975,7 @@ fn try_search_multiple_roots(
     for path in &path_args {
         let Some(root) = find_existing_index_root(&path.abs) else {
             bail!(
-                "no IndexSearch project found above {}; run `is index` in that project first",
+                "no IndexSearch project found above {}; run `istool index` in that project first",
                 display_path(&path.abs)
             );
         };
@@ -3631,20 +4001,10 @@ fn try_search_multiple_roots(
         })
     {
         let daemon_args = daemon_search_args(&group.args);
-        let code = match try_search_daemon(&group.root, &daemon_args, None, total_timer)? {
-            Some(code) => code,
-            None => search_direct_root(&group.root, &group.args, total_timer)?,
-        };
+        let code = try_search_daemon(&group.root, &daemon_args, None, total_timer)?;
         final_code = combine_search_exit_codes(final_code, code);
     }
     Ok(Some(final_code))
-}
-
-fn search_direct_root(root: &Path, args: &[String], total_timer: Instant) -> Result<i32> {
-    let options = parse_search_args(args)?;
-    let _lock = acquire_shared_lock(root)?;
-    let index = MappedIndex::open(&index_path(root))?;
-    run_search_with_index(index, &options, None, total_timer)
 }
 
 fn combine_search_exit_codes(current: i32, next: i32) -> i32 {
@@ -3773,13 +4133,46 @@ fn search_option_takes_value(arg: &str) -> bool {
             | "--max-count"
             | "--max-filesize"
             | "--color"
+            | "--colors"
+            | "-j"
+            | "--threads"
             | "--sort"
             | "--sortr"
+            | "--engine"
+            | "--encoding"
+            | "-t"
+            | "--type"
+            | "-T"
+            | "--type-not"
+            | "--max-depth"
+            | "--ignore-file"
+            | "--pre"
+            | "--pre-glob"
+            | "--replace"
+            | "--path-separator"
+            | "--field-context-separator"
+            | "--field-match-separator"
+            | "--context-separator"
+            | "--dfa-size-limit"
+            | "--hyperlink-format"
+            | "--hostname-bin"
+            | "--max-columns"
+            | "--regex-size-limit"
+            | "--type-add"
+            | "--type-clear"
     )
 }
 
 fn search_short_option_with_attached_value(arg: &str) -> bool {
-    (arg.starts_with("-A") || arg.starts_with("-B") || arg.starts_with("-C")) && arg.len() > 2
+    (arg.starts_with("-A")
+        || arg.starts_with("-B")
+        || arg.starts_with("-C")
+        || arg.starts_with("-g")
+        || arg.starts_with("-m")
+        || arg.starts_with("-t")
+        || arg.starts_with("-T")
+        || arg.starts_with("-j"))
+        && arg.len() > 2
 }
 
 fn daemon_search_args(args: &[String]) -> Vec<String> {
@@ -4004,7 +4397,7 @@ fn search_with_index_output(index: &MappedIndex, options: &Options) -> Result<Se
         writeln!(stderr, "{match_count} matches")?;
         writeln!(stderr, "{} matched files", results.len())?;
         writeln!(stderr, "{searched} candidate files")?;
-        writeln!(stderr, "{:.6} seconds", timer.elapsed().as_secs_f64())?;
+        writeln!(stderr, "{}", format_elapsed_duration(timer.elapsed()))?;
     }
     if options.profile {
         append_profile_events(&mut stderr, &profile)?;
@@ -4046,13 +4439,13 @@ fn confirm_create_project_for_search(start: &Path) -> Result<bool> {
     }
     if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
         eprintln!(
-            "indexsearch: no IndexSearch project found above {}; run `is index .` at the project root",
+            "istool: no IndexSearch project found above {}; run `istool index .` at the project root",
             display_path(start)
         );
         return Ok(false);
     }
     eprint!(
-        "indexsearch: no IndexSearch project found above {}. Create one at {}? [Y/n] ",
+        "istool: no IndexSearch project found above {}. Create one at {}? [Y/n] ",
         display_path(start),
         display_path(&root)
     );
@@ -4084,22 +4477,25 @@ fn try_search_daemon(
     args: &[String],
     mut profile: Option<&mut SearchProfile>,
     total_timer: Instant,
-) -> Result<Option<i32>> {
-    if env::var_os("INDEXSEARCH_NO_DAEMON").is_some() {
-        return Ok(None);
-    }
+) -> Result<i32> {
+    let mut last_error: Option<String> = None;
     if let Some(record) = read_valid_search_daemon_record(root, profile.as_deref_mut())? {
         if record.supports_search() {
-            if let Ok(code) = request_search_daemon(&record, args, profile.as_deref_mut()) {
-                if let Some(profile) = profile.as_deref_mut() {
-                    profile.record("client_search_command_total", total_timer.elapsed());
-                    write_profile_events(profile)?;
+            match request_search_daemon(&record, args, profile.as_deref_mut()) {
+                Ok(code) => {
+                    if let Some(profile) = profile.as_deref_mut() {
+                        profile.record("client_search_command_total", total_timer.elapsed());
+                        write_profile_events(profile)?;
+                    }
+                    return Ok(code);
                 }
-                return Ok(Some(code));
+                Err(err) => {
+                    last_error = Some(format!("{err:#}"));
+                }
             }
-            stop_process(record.pid);
-            let _ = fs::remove_file(search_daemon_record_path(root));
         }
+        stop_process(record.pid);
+        let _ = fs::remove_file(search_daemon_record_path(root));
     }
     let start_timer = Instant::now();
     start_search_daemon(root)?;
@@ -4113,25 +4509,36 @@ fn try_search_daemon(
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             }
-            if let Ok(code) = request_search_daemon(&record, args, profile.as_deref_mut()) {
-                if let Some(profile) = profile.as_deref_mut() {
-                    profile.record("client_search_command_total", total_timer.elapsed());
-                    write_profile_events(profile)?;
+            match request_search_daemon(&record, args, profile.as_deref_mut()) {
+                Ok(code) => {
+                    if let Some(profile) = profile.as_deref_mut() {
+                        profile.record("client_search_command_total", total_timer.elapsed());
+                        write_profile_events(profile)?;
+                    }
+                    return Ok(code);
                 }
-                return Ok(Some(code));
+                Err(err) => {
+                    last_error = Some(format!("{err:#}"));
+                }
             }
             stop_process(record.pid);
             let _ = fs::remove_file(search_daemon_record_path(root));
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    Ok(None)
+    if let Some(err) = last_error {
+        bail!(
+            "project service failed for {} after restart: {err}",
+            display_path(root)
+        );
+    }
+    bail!(
+        "project service did not become ready for {}",
+        display_path(root)
+    )
 }
 
 fn try_update_via_daemon(cfg: &ProjectConfig) -> Result<Option<i32>> {
-    if env::var_os("INDEXSEARCH_NO_DAEMON").is_some() {
-        return Ok(None);
-    }
     let Some(record) = read_valid_search_daemon_record(&cfg.root, None)? else {
         return Ok(None);
     };
@@ -4143,12 +4550,14 @@ fn try_update_via_daemon(cfg: &ProjectConfig) -> Result<Option<i32>> {
         SEARCH_DAEMON_CONTROL_UPDATE.to_string(),
     ];
     match request_search_daemon(&record, &args, None) {
-        Ok(SEARCH_DAEMON_CONTROL_FALLBACK_CODE) => Ok(None),
         Ok(code) => Ok(Some(code)),
-        Err(_) => {
+        Err(err) => {
             stop_process(record.pid);
             let _ = fs::remove_file(search_daemon_record_path(&cfg.root));
-            Ok(None)
+            bail!(
+                "project service update failed for {}: {err:#}",
+                display_path(&cfg.root)
+            )
         }
     }
 }
@@ -4163,13 +4572,13 @@ fn write_profile_events(profile: &SearchProfile) -> Result<()> {
 
 fn append_profile_events<W: Write>(out: &mut W, profile: &SearchProfile) -> Result<()> {
     for (name, ms) in &profile.events {
-        writeln!(out, "profile: {name}={ms:.3}ms")?;
+        writeln!(out, "profile: {name}={}", format_elapsed_millis(*ms))?;
     }
     Ok(())
 }
 
 fn start_search_daemon(root: &Path) -> Result<()> {
-    let exe = env::current_exe()?;
+    let exe = search_daemon_executable()?;
     let mut command = Command::new(exe);
     command
         .arg("search-daemon")
@@ -4246,7 +4655,7 @@ fn search_daemon_child_args(root: &Path, options: WatchOptions) -> Vec<OsString>
 }
 
 fn spawn_search_daemon_detached(root: &Path, options: WatchOptions) -> Result<()> {
-    let exe = env::current_exe()?;
+    let exe = search_daemon_executable()?;
     let args = search_daemon_child_args(root, options);
     #[cfg(windows)]
     {
@@ -4264,6 +4673,31 @@ fn spawn_search_daemon_detached(root: &Path, options: WatchOptions) -> Result<()
         command.spawn()?;
     }
     Ok(())
+}
+
+fn search_daemon_executable() -> Result<PathBuf> {
+    let exe = env::current_exe()?;
+    if exe
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem == "is-daemon" || stem.starts_with("is-daemon-"))
+    {
+        return Ok(exe);
+    }
+    if let Some(dir) = exe.parent() {
+        let versioned = dir.join(executable_name(&format!(
+            "is-daemon-{}",
+            env!("CARGO_PKG_VERSION")
+        )));
+        if versioned.is_file() {
+            return Ok(versioned);
+        }
+        let daemon = dir.join(executable_name("is-daemon"));
+        if daemon.is_file() {
+            return Ok(daemon);
+        }
+    }
+    Ok(exe)
 }
 
 #[cfg(unix)]
@@ -4706,6 +5140,7 @@ fn handle_search_daemon_client(
         if options.auto_update {
             bail!("daemon does not run auto-update searches");
         }
+        log_search_compat_notes(&record.root, &options);
         if options.profile {
             profile.record("daemon_parse_args", parse_timer.elapsed());
         }
@@ -4731,9 +5166,9 @@ fn handle_search_daemon_client(
         let _ = append_project_log(
             &record.root,
             &format!(
-                "search-result code={} elapsed={:.3}s {}",
+                "search-result code={} elapsed={} {}",
                 code,
-                request_timer.elapsed().as_secs_f64(),
+                format_elapsed_duration(request_timer.elapsed()),
                 run.log_stats
             ),
         );
@@ -4752,17 +5187,12 @@ fn handle_search_daemon_client(
         let _ = append_project_log(
             &record.root,
             &format!(
-                "search-error elapsed={:.3}s error={}",
-                request_timer.elapsed().as_secs_f64(),
+                "search-error elapsed={} error={}",
+                format_elapsed_duration(request_timer.elapsed()),
                 log_quote(&message, 512)
             ),
         );
-        if message.contains("project configuration changed") {
-            write_search_daemon_response_begin(stream)?;
-            write_search_daemon_done(stream, SEARCH_DAEMON_CONTROL_FALLBACK_CODE)?;
-        } else {
-            write_search_daemon_error(stream, &format!("indexsearch: {message}\n"))?;
-        }
+        write_search_daemon_error(stream, &format!("indexsearch: {message}\n"))?;
     };
     if let Some(dir) = current_dir {
         let _ = env::set_current_dir(dir);
@@ -4800,7 +5230,10 @@ fn handle_search_daemon_update_client(
         watch_state
             .restart_required
             .store(true, AtomicOrdering::Relaxed);
-        write_search_daemon_done(stream, SEARCH_DAEMON_CONTROL_FALLBACK_CODE)?;
+        write_search_daemon_error(
+            stream,
+            "indexsearch: project configuration changed; project service is restarting\n",
+        )?;
         return Ok(());
     }
     let timer = Instant::now();
@@ -4811,24 +5244,24 @@ fn handle_search_daemon_update_client(
     let elapsed = timer.elapsed().as_secs_f64();
     let message = if outcome.events == 0 {
         format!(
-            "updated index (project service current, 0 pending events) in {:.3}s\nroot: {}\nindex: {}\n",
-            elapsed,
+            "updated index (project service current, 0 pending events) in {}\nroot: {}\nindex: {}\n",
+            format_elapsed_secs(elapsed),
             display_path(&record.root),
             display_path(&index_path(&record.root))
         )
     } else if outcome.changed {
         format!(
-            "updated index from project service ({} pending events flushed) in {:.3}s\nroot: {}\nindex: {}\n",
+            "updated index from project service ({} pending events flushed) in {}\nroot: {}\nindex: {}\n",
             outcome.events,
-            elapsed,
+            format_elapsed_secs(elapsed),
             display_path(&record.root),
             display_path(&index_path(&record.root))
         )
     } else {
         format!(
-            "updated index (project service current, {} pending events produced no index changes) in {:.3}s\nroot: {}\nindex: {}\n",
+            "updated index (project service current, {} pending events produced no index changes) in {}\nroot: {}\nindex: {}\n",
             outcome.events,
-            elapsed,
+            format_elapsed_secs(elapsed),
             display_path(&record.root),
             display_path(&index_path(&record.root))
         )
@@ -4836,8 +5269,10 @@ fn handle_search_daemon_update_client(
     append_project_log(
         &record.root,
         &format!(
-            "manual-update events={} changed={} elapsed={:.3}s",
-            outcome.events, outcome.changed, elapsed
+            "manual-update events={} changed={} elapsed={}",
+            outcome.events,
+            outcome.changed,
+            format_elapsed_secs(elapsed)
         ),
     )?;
     write_search_daemon_chunk(stream, SEARCH_DAEMON_STDOUT_FRAME, message.as_bytes())?;
@@ -4862,9 +5297,9 @@ fn search_daemon_output_to_stream(
         return Ok(SearchDaemonRun {
             code: output.code,
             log_stats: format!(
-                "mode=quiet found={} elapsed={:.3}s",
+                "mode=quiet found={} elapsed={}",
                 output.code == 0,
-                run_timer.elapsed().as_secs_f64()
+                format_elapsed_duration(run_timer.elapsed())
             ),
         });
     }
@@ -4900,9 +5335,9 @@ fn search_daemon_output_to_stream(
         return Ok(SearchDaemonRun {
             code: 0,
             log_stats: format!(
-                "mode=files bytes={} elapsed={:.3}s",
+                "mode=files bytes={} elapsed={}",
                 stdout.len(),
-                run_timer.elapsed().as_secs_f64()
+                format_elapsed_duration(run_timer.elapsed())
             ),
         });
     }
@@ -4973,7 +5408,7 @@ fn search_daemon_output_to_stream(
         writeln!(stderr, "{} matches", stats.match_count)?;
         writeln!(stderr, "{} matched files", stats.matched_files)?;
         writeln!(stderr, "{searched} candidate files")?;
-        writeln!(stderr, "{:.6} seconds", timer.elapsed().as_secs_f64())?;
+        writeln!(stderr, "{}", format_elapsed_duration(timer.elapsed()))?;
     }
     if !stderr.is_empty() {
         write_search_daemon_chunk(stream, SEARCH_DAEMON_STDERR_FRAME, &stderr)?;
@@ -4982,11 +5417,11 @@ fn search_daemon_output_to_stream(
     Ok(SearchDaemonRun {
         code,
         log_stats: format!(
-            "mode=search matches={} matched_files={} candidates={} elapsed={:.3}s",
+            "mode=search matches={} matched_files={} candidates={} elapsed={}",
             stats.match_count,
             stats.matched_files,
             searched,
-            run_timer.elapsed().as_secs_f64()
+            format_elapsed_duration(run_timer.elapsed())
         ),
     })
 }
@@ -5250,10 +5685,275 @@ fn refresh_index_for_search(cfg: &ProjectConfig, options: &Options) -> Result<()
     Ok(())
 }
 
+fn note_search_compat(options: &mut Options, flag: &str, detail: &'static str) {
+    if options
+        .compatibility_notes
+        .iter()
+        .any(|note| note.flag == flag && note.detail == detail)
+    {
+        return;
+    }
+    options.compatibility_notes.push(SearchCompatibilityNote {
+        flag: flag.to_string(),
+        detail,
+    });
+}
+
+fn split_arg_value(arg: &str) -> String {
+    arg.split_once('=')
+        .map(|(_, value)| value.to_string())
+        .unwrap_or_default()
+}
+
+fn flag_name(arg: &str) -> &str {
+    arg.split_once('=').map(|(flag, _)| flag).unwrap_or(arg)
+}
+
+fn parse_unrestricted_short_flag(arg: &str) -> Option<usize> {
+    let rest = arg.strip_prefix('-')?;
+    if rest.is_empty() || rest.starts_with('-') || !rest.bytes().all(|byte| byte == b'u') {
+        return None;
+    }
+    Some(rest.len())
+}
+
+fn apply_unrestricted_flag(options: &mut Options, flag: &str, level: usize) {
+    if level >= 2 {
+        options.hidden = true;
+    }
+    note_search_compat(
+        options,
+        flag,
+        "unrestricted rg search can only affect paths already present in the IndexSearch index",
+    );
+}
+
+fn apply_short_flag_cluster(options: &mut Options, arg: &str) -> bool {
+    if !arg.starts_with('-') || arg.starts_with("--") || arg.len() <= 2 {
+        return false;
+    }
+    let rest = &arg[1..];
+    if rest.starts_with(['A', 'B', 'C', 'e', 'g', 'j', 'm', 't', 'T']) {
+        return false;
+    }
+    for ch in rest.chars() {
+        match ch {
+            'i' => options.ignore_case = true,
+            's' => options.ignore_case = false,
+            'S' => options.smart_case = true,
+            'F' => options.fixed = true,
+            'w' => options.whole_word = true,
+            'n' => options.line_number = true,
+            'N' => options.line_number = false,
+            'H' => options.with_filename = Some(true),
+            'I' => options.with_filename = Some(false),
+            'l' => options.files_with_matches = true,
+            'c' => options.count = true,
+            'o' => options.only_matching = true,
+            'q' => options.quiet = true,
+            'v' => options.invert_match = true,
+            'x' => options.line_regexp = true,
+            'L' => options.follow = true,
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn apply_search_encoding_flag(options: &mut Options, flag: &str, value: &str) {
+    if !matches!(
+        value.to_ascii_lowercase().as_str(),
+        "auto" | "utf-8" | "utf8" | "none"
+    ) {
+        note_search_compat(
+            options,
+            &format!("{flag}={value}"),
+            "non-UTF-8 decoding is not supported; indexed bytes are searched as stored",
+        );
+    }
+}
+
+fn apply_search_engine_flag(options: &mut Options, flag: &str, value: &str) {
+    if !matches!(value.to_ascii_lowercase().as_str(), "auto" | "default") {
+        note_search_compat(
+            options,
+            &format!("{flag}={value}"),
+            "unsupported regex engine ignored",
+        );
+    }
+}
+
+fn add_search_type_filter(options: &mut Options, flag: &str, value: &str, include: bool) {
+    if search_type_globs(value).is_some() {
+        if include {
+            options.type_includes.push(value.to_string());
+        } else {
+            options.type_excludes.push(value.to_string());
+        }
+    } else {
+        note_search_compat(
+            options,
+            &format!("{flag}={value}"),
+            "unknown file type ignored",
+        );
+    }
+}
+
+fn search_type_globs(name: &str) -> Option<&'static [&'static str]> {
+    match name.to_ascii_lowercase().as_str() {
+        "c" => Some(&["*.c", "*.h"]),
+        "cpp" | "c++" | "cc" => Some(&[
+            "*.cpp", "*.cc", "*.cxx", "*.c++", "*.hpp", "*.hh", "*.hxx", "*.h", "*.inl", "*.ipp",
+        ]),
+        "cs" | "csharp" => Some(&["*.cs"]),
+        "py" | "python" => Some(&["*.py", "*.pyw"]),
+        "rust" | "rs" => Some(&["*.rs"]),
+        "js" | "javascript" => Some(&["*.js", "*.jsx", "*.mjs", "*.cjs"]),
+        "ts" | "typescript" => Some(&["*.ts", "*.tsx", "*.mts", "*.cts"]),
+        "json" => Some(&["*.json"]),
+        "xml" => Some(&["*.xml"]),
+        "md" | "markdown" => Some(&["*.md", "*.markdown"]),
+        "toml" => Some(&["*.toml"]),
+        "yaml" | "yml" => Some(&["*.yaml", "*.yml"]),
+        "ini" => Some(&["*.ini"]),
+        "shader" => Some(&["*.usf", "*.ush", "*.hlsl", "*.metal", "*.glsl"]),
+        "hlsl" => Some(&["*.hlsl", "*.usf", "*.ush"]),
+        "cmake" => Some(&["CMakeLists.txt", "*.cmake"]),
+        "build" => Some(&[
+            "*.Build.cs",
+            "*.Target.cs",
+            "CMakeLists.txt",
+            "*.cmake",
+            "*.bat",
+            "*.sh",
+            "*.ps1",
+        ]),
+        "ue" | "unreal" => Some(&[
+            "*.Build.cs",
+            "*.Target.cs",
+            "*.uplugin",
+            "*.uproject",
+            "*.usf",
+            "*.ush",
+        ]),
+        _ => None,
+    }
+}
+
+fn print_search_type_list() {
+    for (name, globs) in supported_search_types() {
+        println!("{name}: {}", globs.join(", "));
+    }
+}
+
+fn supported_search_types() -> &'static [(&'static str, &'static [&'static str])] {
+    &[
+        (
+            "build",
+            &["*.Build.cs", "*.Target.cs", "CMakeLists.txt", "*.cmake"],
+        ),
+        ("c", &["*.c", "*.h"]),
+        (
+            "cpp",
+            &["*.cpp", "*.cc", "*.cxx", "*.hpp", "*.hh", "*.h", "*.inl"],
+        ),
+        ("cs", &["*.cs"]),
+        ("hlsl", &["*.hlsl", "*.usf", "*.ush"]),
+        ("ini", &["*.ini"]),
+        ("js", &["*.js", "*.jsx", "*.mjs", "*.cjs"]),
+        ("json", &["*.json"]),
+        ("markdown", &["*.md", "*.markdown"]),
+        ("py", &["*.py", "*.pyw"]),
+        ("rust", &["*.rs"]),
+        ("shader", &["*.usf", "*.ush", "*.hlsl", "*.metal", "*.glsl"]),
+        ("toml", &["*.toml"]),
+        ("ts", &["*.ts", "*.tsx", "*.mts", "*.cts"]),
+        (
+            "ue",
+            &[
+                "*.Build.cs",
+                "*.Target.cs",
+                "*.uplugin",
+                "*.uproject",
+                "*.usf",
+                "*.ush",
+            ],
+        ),
+        ("xml", &["*.xml"]),
+        ("yaml", &["*.yaml", "*.yml"]),
+    ]
+}
+
+fn is_known_unsupported_search_flag_with_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--context-separator"
+            | "--dfa-size-limit"
+            | "--hostname-bin"
+            | "--regex-size-limit"
+            | "--type-add"
+            | "--type-clear"
+    )
+}
+
+fn is_known_unsupported_search_flag(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--binary"
+            | "--block-buffered"
+            | "--byte-offset"
+            | "--debug"
+            | "--line-buffered"
+            | "--multiline"
+            | "--multiline-dotall"
+            | "--no-block-buffered"
+            | "--no-crlf"
+            | "--no-line-buffered"
+            | "--no-mmap"
+            | "--auto-hybrid-regex"
+            | "--mmap"
+            | "--one-file-system"
+            | "--no-pcre2-unicode"
+            | "--null"
+            | "--null-data"
+            | "--passthru"
+            | "--pcre2"
+            | "--pcre2-unicode"
+            | "--pcre2-version"
+            | "--search-zip"
+            | "--text"
+            | "-a"
+            | "-b"
+            | "-P"
+            | "-U"
+            | "-z"
+    )
+}
+
+fn log_search_compat_notes(root: &Path, options: &Options) {
+    if options.compatibility_notes.is_empty() {
+        return;
+    }
+    let mut details = String::new();
+    for (idx, note) in options.compatibility_notes.iter().take(24).enumerate() {
+        if idx != 0 {
+            details.push(' ');
+        }
+        details.push_str("flag=");
+        details.push_str(&log_quote(&note.flag, 120));
+        details.push_str(" detail=");
+        details.push_str(&log_quote(note.detail, 180));
+    }
+    if options.compatibility_notes.len() > 24 {
+        details.push_str(" more=");
+        details.push_str(&(options.compatibility_notes.len() - 24).to_string());
+    }
+    let _ = append_project_log(root, &format!("search-compat {details}"));
+}
+
 fn parse_search_args(args: &[String]) -> Result<Options> {
     let mut options = Options {
         auto_index: true,
-        daemon: true,
         line_number: stdout_supports_search_decoration(),
         max_filesize: DEFAULT_MAX_FILE_SIZE,
         cwd: env::current_dir().unwrap_or_default(),
@@ -5291,9 +5991,16 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
             "-w" | "--word-regexp" => options.whole_word = true,
             "-e" | "--regexp" => regexps.push(need_value(arg)?),
             "-g" | "--glob" => options.globs.push(need_value(arg)?),
+            "--iglob" => {
+                options.glob_case_insensitive = true;
+                options.globs.push(need_value(arg)?);
+            }
+            "--glob-case-insensitive" => options.glob_case_insensitive = true,
+            "--glob-case-sensitive" => options.glob_case_insensitive = false,
             "-n" | "--line-number" => options.line_number = true,
             "-N" | "--no-line-number" => options.line_number = false,
             "--column" => options.column = true,
+            "--no-column" => options.column = false,
             "-A" | "--after-context" => {
                 options.after_context = parse_context_count(&need_value(arg)?)?
             }
@@ -5310,8 +6017,17 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
             "--heading" => options.heading = Some(true),
             "--no-heading" => options.heading = Some(false),
             "-l" | "--files-with-matches" => options.files_with_matches = true,
+            "--files-without-match" => options.files_without_match = true,
             "-c" | "--count" => options.count = true,
+            "--count-matches" => {
+                options.count = true;
+                options.count_matches = true;
+            }
             "-o" | "--only-matching" => options.only_matching = true,
+            "-v" | "--invert-match" => options.invert_match = true,
+            "-x" | "--line-regexp" => options.line_regexp = true,
+            "--trim" => options.trim = true,
+            "--no-trim" => options.trim = false,
             "-q" | "--quiet" => options.quiet = true,
             "--files" => options.files = true,
             "--json" => options.json = true,
@@ -5322,24 +6038,130 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
             "--sort" | "--sortr" => {
                 options.sort_path = parse_sort_choice(&need_value(arg)?);
             }
+            "--sort-files" => options.sort_path = true,
             "--hidden" => options.hidden = true,
+            "--no-hidden" => options.hidden = false,
             "-L" | "--follow" => options.follow = true,
+            "--no-follow" => options.follow = false,
             "--no-auto-index" => options.auto_index = false,
             "--auto-update" => options.auto_update = true,
-            "--no-daemon" => options.daemon = false,
+            "--no-daemon" => {
+                bail!("unsupported option: --no-daemon; search always uses the project service")
+            }
+            "--max-depth" => options.max_depth = Some(need_value(arg)?.parse()?),
+            "--include-zero" => options.include_zero = true,
+            "-t" | "--type" => {
+                let value = need_value(arg)?;
+                add_search_type_filter(&mut options, arg, &value, true);
+            }
+            "-T" | "--type-not" => {
+                let value = need_value(arg)?;
+                add_search_type_filter(&mut options, arg, &value, false);
+            }
+            "--type-list" => {
+                print_search_type_list();
+                std::process::exit(0);
+            }
+            "--ignore-file" => options.ignore_files.push(need_value(arg)?),
+            "--ignore-file-case-insensitive" => options.ignore_file_case_insensitive = true,
+            "--encoding" => {
+                let value = need_value(arg)?;
+                apply_search_encoding_flag(&mut options, arg, &value);
+            }
+            "--engine" => {
+                let value = need_value(arg)?;
+                apply_search_engine_flag(&mut options, arg, &value);
+            }
+            "--no-require-git" | "--no-ignore-parent" | "--no-ignore-global" | "--no-config"
+            | "--crlf" => {}
+            "--no-ignore" | "--no-ignore-vcs" => note_search_compat(
+                &mut options,
+                arg,
+                "ignore overrides are limited by the existing IndexSearch project index",
+            ),
             "--" => positional_only = true,
-            "--no-messages" | "--no-ignore" | "--no-ignore-vcs" => {}
+            "--no-messages" => {}
             "--colors" | "-j" | "--threads" => {
                 let _ = need_value(arg)?;
             }
+            "--pre"
+            | "--pre-glob"
+            | "--replace"
+            | "--path-separator"
+            | "--context-separator"
+            | "--field-context-separator"
+            | "--field-match-separator" => {
+                let _ = need_value(arg)?;
+                note_search_compat(&mut options, arg, "unsupported option ignored");
+            }
             "-m" | "--max-count" => options.max_count = Some(need_value(arg)?.parse()?),
             "--max-filesize" => options.max_filesize = parse_size(&need_value(arg)?)?,
+            _ if parse_unrestricted_short_flag(arg).is_some() => {
+                apply_unrestricted_flag(
+                    &mut options,
+                    arg,
+                    parse_unrestricted_short_flag(arg).unwrap_or(1),
+                );
+            }
+            _ if apply_short_flag_cluster(&mut options, arg) => {}
+            "--unrestricted" => apply_unrestricted_flag(&mut options, arg, 1),
             _ if arg.starts_with("--color=") => {
                 options.color = parse_color_choice(
                     arg.split_once('=')
                         .map(|(_, value)| value)
                         .unwrap_or_default(),
                 )?
+            }
+            _ if arg.starts_with("--glob=") => {
+                options.globs.push(split_arg_value(arg));
+            }
+            _ if arg.starts_with("--iglob=") => {
+                options.glob_case_insensitive = true;
+                options.globs.push(split_arg_value(arg));
+            }
+            _ if arg.starts_with("--max-count=") => {
+                options.max_count = Some(split_arg_value(arg).parse()?);
+            }
+            _ if arg.starts_with("--max-filesize=") => {
+                options.max_filesize = parse_size(&split_arg_value(arg))?;
+            }
+            _ if arg.starts_with("--max-depth=") => {
+                options.max_depth = Some(split_arg_value(arg).parse()?);
+            }
+            _ if arg.starts_with("--type=") => {
+                let value = split_arg_value(arg);
+                add_search_type_filter(&mut options, "--type", &value, true);
+            }
+            _ if arg.starts_with("--type-not=") => {
+                let value = split_arg_value(arg);
+                add_search_type_filter(&mut options, "--type-not", &value, false);
+            }
+            _ if arg.starts_with("--ignore-file=") => {
+                options.ignore_files.push(split_arg_value(arg));
+            }
+            _ if arg.starts_with("--encoding=") => {
+                apply_search_encoding_flag(&mut options, "--encoding", &split_arg_value(arg));
+            }
+            _ if arg.starts_with("--engine=") => {
+                apply_search_engine_flag(&mut options, "--engine", &split_arg_value(arg));
+            }
+            _ if arg.starts_with("--colors=")
+                || arg.starts_with("--threads=")
+                || arg.starts_with("--path-separator=")
+                || arg.starts_with("--context-separator=")
+                || arg.starts_with("--field-context-separator=")
+                || arg.starts_with("--field-match-separator=") =>
+            {
+                note_search_compat(&mut options, flag_name(arg), "unsupported option ignored");
+            }
+            _ if arg.starts_with("--hyperlink-format=") || arg.starts_with("--max-columns=") => {
+                note_search_compat(&mut options, flag_name(arg), "unsupported option ignored");
+            }
+            _ if arg.starts_with("--pre=")
+                || arg.starts_with("--pre-glob=")
+                || arg.starts_with("--replace=") =>
+            {
+                note_search_compat(&mut options, flag_name(arg), "unsupported option ignored");
             }
             _ if arg.starts_with("--after-context=") => {
                 options.after_context = parse_context_count(
@@ -5375,6 +6197,18 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
                 options.before_context = value;
                 options.after_context = value;
             }
+            _ if arg.starts_with("-g") && arg.len() > 2 => {
+                options.globs.push(arg[2..].to_string());
+            }
+            _ if arg.starts_with("-m") && arg.len() > 2 => {
+                options.max_count = Some(arg[2..].parse()?);
+            }
+            _ if arg.starts_with("-t") && arg.len() > 2 => {
+                add_search_type_filter(&mut options, "-t", &arg[2..], true);
+            }
+            _ if arg.starts_with("-T") && arg.len() > 2 => {
+                add_search_type_filter(&mut options, "-T", &arg[2..], false);
+            }
             _ if arg.starts_with("--sort=") || arg.starts_with("--sortr=") => {
                 options.sort_path = parse_sort_choice(
                     arg.split_once('=')
@@ -5382,7 +6216,16 @@ fn parse_search_args(args: &[String]) -> Result<Options> {
                         .unwrap_or_default(),
                 );
             }
-            _ if arg.starts_with('-') => bail!("unsupported option: {arg}"),
+            _ if is_known_unsupported_search_flag_with_value(arg) => {
+                let _ = need_value(arg)?;
+                note_search_compat(&mut options, arg, "unsupported option ignored");
+            }
+            _ if is_known_unsupported_search_flag(arg) => {
+                note_search_compat(&mut options, arg, "unsupported option ignored");
+            }
+            _ if arg.starts_with('-') => {
+                note_search_compat(&mut options, flag_name(arg), "unsupported option ignored");
+            }
             _ if options.pattern.is_empty() && regexps.is_empty() && !options.files => {
                 options.pattern = arg.clone();
             }
@@ -5580,7 +6423,19 @@ fn clean_section(lines: Option<&Vec<String>>) -> Vec<String> {
         .collect()
 }
 
-fn add_glob_pattern(builder: &mut GlobSetBuilder, raw: &str) -> Result<()> {
+fn load_pattern_lines(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|text| {
+            text.lines()
+                .map(|l| l.trim().trim_start_matches('\u{feff}').replace('\\', "/"))
+                .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('!'))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn add_glob_pattern(builder: &mut GlobSetBuilder, raw: &str, case_insensitive: bool) -> Result<()> {
     let mut pat = raw.replace('\\', "/");
     let directory_only = pat.ends_with('/');
     while pat.starts_with('/') {
@@ -5614,7 +6469,11 @@ fn add_glob_pattern(builder: &mut GlobSetBuilder, raw: &str) -> Result<()> {
         }
     }
     for variant in variants {
-        builder.add(Glob::new(&variant)?);
+        builder.add(
+            GlobBuilder::new(&variant)
+                .case_insensitive(case_insensitive)
+                .build()?,
+        );
     }
     Ok(())
 }
@@ -7689,13 +8548,23 @@ fn execute_search_any_segments(
     Ok(false)
 }
 
-#[cold]
-#[inline(never)]
-fn search_candidate_files(
-    index: &MappedIndex,
-    options: &Options,
-    excluded_paths: &HashSet<String>,
-) -> Result<Vec<u32>> {
+fn requires_all_candidate_files(options: &Options) -> bool {
+    options.invert_match || options.files_without_match || options.include_zero
+}
+
+fn special_line_scan_requested(options: &Options) -> bool {
+    options.invert_match
+        || options.files_without_match
+        || options.count_matches
+        || options.include_zero
+        || options.line_regexp
+        || options.only_matching
+}
+
+fn candidate_file_ids(index: &MappedIndex, options: &Options) -> Result<Vec<u32>> {
+    if requires_all_candidate_files(options) {
+        return Ok((0..index.file_count as u32).collect());
+    }
     let candidates = if let Some(prefixes) = whole_word_literal_prefixes(options) {
         if let Some(candidates) = prefix_candidate_files(index, &prefixes)? {
             candidates
@@ -7725,7 +8594,15 @@ fn search_candidate_files(
         let alternatives = query_trigram_alternatives(options);
         candidate_files(index, &alternatives)?
     };
-    let candidates = chunk_bloom_filter_candidates(index, options, candidates)?;
+    chunk_bloom_filter_candidates(index, options, candidates)
+}
+
+fn search_candidate_files(
+    index: &MappedIndex,
+    options: &Options,
+    excluded_paths: &HashSet<String>,
+) -> Result<Vec<u32>> {
+    let candidates = candidate_file_ids(index, options)?;
     if excluded_paths.is_empty() && !has_path_restriction(options, &index.root) {
         return Ok(candidates);
     }
@@ -7769,7 +8646,9 @@ fn execute_search_rendered(
     searched: &mut u64,
     excluded_paths: &HashSet<String>,
 ) -> Result<Vec<RenderedFileResult>> {
-    if let Some(chunk_candidates) = candidate_chunks(index, options)? {
+    if !requires_all_candidate_files(options)
+        && let Some(chunk_candidates) = candidate_chunks(index, options)?
+    {
         return execute_search_rendered_chunks(
             index,
             options,
@@ -7779,36 +8658,7 @@ fn execute_search_rendered(
         );
     }
 
-    let candidates = if let Some(prefixes) = whole_word_literal_prefixes(options) {
-        if let Some(candidates) = prefix_candidate_files(index, &prefixes)? {
-            candidates
-        } else if let Some(candidates) = word_fragment_candidate_files(index, options)? {
-            candidates
-        } else {
-            let alternatives = query_trigram_alternatives(options);
-            candidate_files(index, &alternatives)?
-        }
-    } else if let Some(candidates) = word_fragment_candidate_files(index, options)? {
-        candidates
-    } else if let Some(prefixes) = boundary_word_prefixes(options) {
-        if let Some(candidates) = prefix_candidate_files(index, &prefixes)? {
-            candidates
-        } else {
-            let alternatives = query_trigram_alternatives(options);
-            candidate_files(index, &alternatives)?
-        }
-    } else if let Some(spec) = qualified_call_spec(&options.pattern) {
-        if let Some(candidates) = qualified_call_candidate_files(index, &spec)? {
-            candidates
-        } else {
-            let alternatives = query_trigram_alternatives(options);
-            candidate_files(index, &alternatives)?
-        }
-    } else {
-        let alternatives = query_trigram_alternatives(options);
-        candidate_files(index, &alternatives)?
-    };
-    let candidates = chunk_bloom_filter_candidates(index, options, candidates)?;
+    let candidates = candidate_file_ids(index, options)?;
     let filtered = if excluded_paths.is_empty() && !has_path_restriction(options, &index.root) {
         candidates
     } else {
@@ -7859,7 +8709,9 @@ fn execute_search_rendered_to_writer<W: Write>(
     excluded_paths: &HashSet<String>,
     out: &mut W,
 ) -> Result<RenderStats> {
-    if let Some(chunk_candidates) = candidate_chunks(index, options)? {
+    if !requires_all_candidate_files(options)
+        && let Some(chunk_candidates) = candidate_chunks(index, options)?
+    {
         return execute_search_rendered_chunks_to_writer(
             index,
             options,
@@ -7870,36 +8722,7 @@ fn execute_search_rendered_to_writer<W: Write>(
         );
     }
 
-    let candidates = if let Some(prefixes) = whole_word_literal_prefixes(options) {
-        if let Some(candidates) = prefix_candidate_files(index, &prefixes)? {
-            candidates
-        } else if let Some(candidates) = word_fragment_candidate_files(index, options)? {
-            candidates
-        } else {
-            let alternatives = query_trigram_alternatives(options);
-            candidate_files(index, &alternatives)?
-        }
-    } else if let Some(candidates) = word_fragment_candidate_files(index, options)? {
-        candidates
-    } else if let Some(prefixes) = boundary_word_prefixes(options) {
-        if let Some(candidates) = prefix_candidate_files(index, &prefixes)? {
-            candidates
-        } else {
-            let alternatives = query_trigram_alternatives(options);
-            candidate_files(index, &alternatives)?
-        }
-    } else if let Some(spec) = qualified_call_spec(&options.pattern) {
-        if let Some(candidates) = qualified_call_candidate_files(index, &spec)? {
-            candidates
-        } else {
-            let alternatives = query_trigram_alternatives(options);
-            candidate_files(index, &alternatives)?
-        }
-    } else {
-        let alternatives = query_trigram_alternatives(options);
-        candidate_files(index, &alternatives)?
-    };
-    let candidates = chunk_bloom_filter_candidates(index, options, candidates)?;
+    let candidates = candidate_file_ids(index, options)?;
     let mut filtered = if excluded_paths.is_empty() && !has_path_restriction(options, &index.root) {
         candidates
     } else {
@@ -8231,6 +9054,7 @@ enum QueryMatcher {
         ac: Option<AhoCorasick>,
         whole_word: bool,
         ignore_case: bool,
+        line_regexp: bool,
     },
     WordPrefix {
         ac: AhoCorasick,
@@ -8278,7 +9102,15 @@ impl QueryMatcher {
                 ac,
                 whole_word: options.whole_word,
                 ignore_case: options.ignore_case,
+                line_regexp: options.line_regexp,
             });
+        }
+        if options.line_regexp {
+            let regex = RegexBuilder::new(&format!("^(?:{})$", options.pattern))
+                .case_insensitive(options.ignore_case)
+                .multi_line(true)
+                .build()?;
+            return Ok(Self::Regex(regex));
         }
         if let Some(word_prefix) = word_prefix_regex(options)? {
             return Ok(word_prefix);
@@ -8330,6 +9162,9 @@ impl QueryMatcher {
         options: &Options,
         show_path: bool,
     ) -> Result<Option<RenderedFileResult>> {
+        if special_line_scan_requested(options) {
+            return self.search_file_line_scan_rendered(content, path, options, show_path);
+        }
         if context_requested(options) && !options.json && !options.vimgrep {
             let matches = self.search_file(content, options);
             if matches.is_empty() {
@@ -8349,6 +9184,7 @@ impl QueryMatcher {
             ac,
             whole_word,
             ignore_case,
+            ..
         } = self
         {
             return search_fixed_rendered(
@@ -8421,6 +9257,9 @@ impl QueryMatcher {
     #[cold]
     #[inline(never)]
     fn search_file_has_match(&self, content: &[u8], options: &Options) -> bool {
+        if special_line_scan_requested(options) {
+            return self.search_file_line_scan_has_match(content, options);
+        }
         match self {
             QueryMatcher::Fixed {
                 needle,
@@ -8428,6 +9267,7 @@ impl QueryMatcher {
                 ac,
                 whole_word,
                 ignore_case,
+                ..
             } => {
                 if needle.is_empty() {
                     return false;
@@ -8485,12 +9325,241 @@ impl QueryMatcher {
         }
     }
 
+    fn search_file_line_scan_has_match(&self, content: &[u8], options: &Options) -> bool {
+        let mut selected_lines = 0usize;
+        for_each_line(content, |_, line| {
+            let spans = self.line_match_spans(line, options);
+            let selected = if options.invert_match {
+                spans.is_empty()
+            } else {
+                !spans.is_empty()
+            };
+            if selected {
+                selected_lines += 1;
+                if !options.files_without_match {
+                    return false;
+                }
+            }
+            true
+        });
+        if options.files_without_match {
+            selected_lines == 0
+        } else {
+            selected_lines != 0
+        }
+    }
+
+    fn search_file_line_scan_rendered(
+        &self,
+        content: &[u8],
+        path: &str,
+        options: &Options,
+        show_path: bool,
+    ) -> Result<Option<RenderedFileResult>> {
+        let mut output = Vec::new();
+        let mut path_written = false;
+        let mut selected_lines = 0usize;
+        let mut match_count = 0usize;
+        for_each_line(content, |line_no, line| {
+            let spans = self.line_match_spans(line, options);
+            let selected = if options.invert_match {
+                spans.is_empty()
+            } else {
+                !spans.is_empty()
+            };
+            if !selected {
+                return true;
+            }
+            selected_lines += 1;
+            let line_match_count = if options.count_matches && !options.invert_match {
+                spans.len()
+            } else {
+                1
+            };
+            match_count += line_match_count;
+            if options.files_without_match || options.count {
+                return options.max_count.is_none_or(|max| selected_lines < max);
+            }
+            if options.files_with_matches {
+                if !path_written {
+                    let _ = writeln!(output, "{path}");
+                    path_written = true;
+                }
+                return !files_with_matches_can_stop(options);
+            }
+            let mut render_one = |start: usize, end: usize| -> Result<()> {
+                let match_show_path =
+                    prepare_match_render(&mut output, path, options, show_path, &mut path_written)?;
+                render_match_to(
+                    &mut output,
+                    path,
+                    line_no,
+                    start + 1,
+                    line,
+                    &line[start..end.min(line.len())],
+                    options,
+                    match_show_path,
+                )
+            };
+            if options.invert_match {
+                if let Err(_err) = render_one(0, 0) {
+                    return false;
+                }
+            } else if options.only_matching {
+                for (start, end) in spans {
+                    if let Err(_err) = render_one(start, end) {
+                        return false;
+                    }
+                }
+            } else if let Some((start, end)) = spans.first().copied() {
+                if let Err(_err) = render_one(start, end) {
+                    return false;
+                }
+            }
+            options.max_count.is_none_or(|max| selected_lines < max)
+        });
+
+        if options.files_without_match {
+            if selected_lines == 0 {
+                writeln!(output, "{path}")?;
+                return Ok(Some(RenderedFileResult {
+                    path: path.to_string(),
+                    output,
+                    match_count: 0,
+                }));
+            }
+            return Ok(None);
+        }
+        if selected_lines == 0 && !(options.count && options.include_zero) {
+            return Ok(None);
+        }
+        if options.count {
+            if show_path {
+                write!(output, "{path}:")?;
+            }
+            writeln!(output, "{match_count}")?;
+        }
+        Ok(Some(RenderedFileResult {
+            path: path.to_string(),
+            output,
+            match_count,
+        }))
+    }
+
+    fn line_match_spans(&self, line: &[u8], options: &Options) -> Vec<(usize, usize)> {
+        match self {
+            QueryMatcher::Fixed {
+                needle,
+                finder,
+                ac,
+                whole_word,
+                ignore_case,
+                line_regexp,
+            } => {
+                if needle.is_empty() {
+                    return Vec::new();
+                }
+                if *line_regexp {
+                    let matched = if *ignore_case {
+                        line.eq_ignore_ascii_case(options.pattern.as_bytes())
+                    } else {
+                        line == needle.as_slice()
+                    };
+                    return matched.then_some((0, line.len())).into_iter().collect();
+                }
+                if *ignore_case {
+                    let Some(ac) = ac else {
+                        return Vec::new();
+                    };
+                    return ac
+                        .find_iter(line)
+                        .filter_map(|found| {
+                            (!*whole_word || word_boundary(line, found.start(), found.len()))
+                                .then_some((found.start(), found.end()))
+                        })
+                        .collect();
+                }
+                finder
+                    .find_iter(line)
+                    .filter_map(|start| {
+                        let end = start + needle.len();
+                        (!*whole_word || word_boundary(line, start, needle.len()))
+                            .then_some((start, end))
+                    })
+                    .collect()
+            }
+            QueryMatcher::WordPrefix {
+                ac,
+                boundary_start,
+                boundary_end,
+            } => ac
+                .find_iter(line)
+                .filter_map(|found| {
+                    let start = found.start();
+                    if *boundary_start && start > 0 && is_word_byte(line[start - 1]) {
+                        return None;
+                    }
+                    let mut end = found.end();
+                    while end < line.len() && is_word_byte(line[end]) {
+                        end += 1;
+                    }
+                    if *boundary_end && end < line.len() && is_word_byte(line[end]) {
+                        return None;
+                    }
+                    Some((start, end))
+                })
+                .collect(),
+            QueryMatcher::LiteralSet { ac } => ac
+                .find_iter(line)
+                .map(|found| (found.start(), found.end()))
+                .collect(),
+            QueryMatcher::QualifiedCall { spec, finder } => {
+                let mut spans = Vec::new();
+                for found in finder.find_iter(line) {
+                    if found == 0 || found + 2 >= line.len() {
+                        continue;
+                    }
+                    let token_start = rewind_word(line, found);
+                    let Some(class_start) =
+                        qualified_call_match_start(line, token_start, found, spec)
+                    else {
+                        continue;
+                    };
+                    let method_start = found + 2;
+                    if method_start >= line.len() || !is_word_byte(line[method_start]) {
+                        continue;
+                    }
+                    let method_end = advance_word(line, method_start);
+                    if method_end < line.len() && line[method_end] == b'(' {
+                        spans.push((class_start, method_end + 1));
+                    }
+                }
+                spans
+            }
+            QueryMatcher::OrderedLiterals {
+                literals,
+                finder,
+                ignore_case,
+            } => ordered_literal_line_spans(line, literals, finder.as_ref(), *ignore_case),
+            QueryMatcher::OrderedWordSpanLiterals {
+                literals,
+                finder,
+                ignore_case,
+            } => ordered_wordspan_line_spans(line, literals, finder.as_ref(), *ignore_case),
+            QueryMatcher::Regex(regex) => regex
+                .find_iter(line)
+                .map(|found| (found.start(), found.end()))
+                .collect(),
+        }
+    }
+
     fn search_file(&self, content: &[u8], options: &Options) -> Vec<MatchLine> {
         if let QueryMatcher::Fixed {
             needle,
             finder,
             whole_word: false,
             ignore_case: false,
+            line_regexp: false,
             ..
         } = self
         {
@@ -8523,6 +9592,7 @@ impl QueryMatcher {
                     ac,
                     whole_word,
                     ignore_case,
+                    ..
                 } => {
                     if needle.is_empty() {
                         return true;
@@ -9184,6 +10254,60 @@ fn search_ordered_literals_rendered(
     finish_rendered_match_output(output, match_count, path, options, show_path)
 }
 
+fn ordered_literal_line_spans(
+    line: &[u8],
+    literals: &[Vec<u8>],
+    finder: Option<&memmem::Finder<'_>>,
+    ignore_case: bool,
+) -> Vec<(usize, usize)> {
+    let Some(first) = literals.first() else {
+        return Vec::new();
+    };
+    let lowered;
+    let haystack = if ignore_case {
+        lowered = lower_bytes(line);
+        lowered.as_slice()
+    } else {
+        line
+    };
+    let mut spans = Vec::new();
+    if !ignore_case && let Some(finder) = finder {
+        for start in finder.find_iter(line) {
+            if let Some(span) = ordered_literal_match_at(haystack, literals, start) {
+                spans.push(span);
+            }
+        }
+        return spans;
+    }
+    let first_finder = memmem::Finder::new(first);
+    for start in first_finder.find_iter(haystack) {
+        if let Some(span) = ordered_literal_match_at(haystack, literals, start) {
+            spans.push(span);
+        }
+    }
+    spans
+}
+
+fn ordered_literal_match_at(
+    line: &[u8],
+    literals: &[Vec<u8>],
+    start: usize,
+) -> Option<(usize, usize)> {
+    let first = literals.first()?;
+    if start + first.len() > line.len() || &line[start..start + first.len()] != first.as_slice() {
+        return None;
+    }
+    let mut pos = start + first.len();
+    let mut last_end = pos;
+    for literal in literals.iter().skip(1) {
+        let found = memmem::find(&line[pos..], literal)?;
+        let literal_start = pos + found;
+        last_end = literal_start + literal.len();
+        pos = last_end;
+    }
+    Some((start, last_end))
+}
+
 fn search_ordered_wordspan_rendered(
     content: &[u8],
     path: &str,
@@ -9240,6 +10364,40 @@ fn search_ordered_wordspan_rendered(
     }
 
     finish_rendered_match_output(output, match_count, path, options, show_path)
+}
+
+fn ordered_wordspan_line_spans(
+    line: &[u8],
+    literals: &[Vec<u8>],
+    finder: Option<&memmem::Finder<'_>>,
+    ignore_case: bool,
+) -> Vec<(usize, usize)> {
+    let Some(first) = literals.first() else {
+        return Vec::new();
+    };
+    let lowered;
+    let haystack = if ignore_case {
+        lowered = lower_bytes(line);
+        lowered.as_slice()
+    } else {
+        line
+    };
+    let mut spans = Vec::new();
+    if !ignore_case && let Some(finder) = finder {
+        for start in finder.find_iter(line) {
+            if let Some(span) = find_ordered_wordspan_match_at(haystack, start, literals) {
+                spans.push(span);
+            }
+        }
+        return spans;
+    }
+    let first_finder = memmem::Finder::new(first);
+    for start in first_finder.find_iter(haystack) {
+        if let Some(span) = find_ordered_wordspan_match_at(haystack, start, literals) {
+            spans.push(span);
+        }
+    }
+    spans
 }
 
 fn find_ordered_wordspan_match(content: &[u8], literals: &[Vec<u8>]) -> Option<(usize, usize)> {
@@ -10390,10 +11548,18 @@ fn render_match_to<W: Write>(
         write_styled_display(out, column, color, "32")?;
         write!(out, ":")?;
     }
-    if options.only_matching {
+    let (display_line, display_match_start, display_match_len) =
+        display_line_match(line, column.saturating_sub(1), matched.len(), options.trim);
+    if options.only_matching && !matched.is_empty() {
         write_styled(out, matched, color, "1;31")?;
     } else {
-        write_line_with_match(out, line, column.saturating_sub(1), matched.len(), color)?;
+        write_line_with_match(
+            out,
+            display_line,
+            display_match_start,
+            display_match_len,
+            color,
+        )?;
     }
     writeln!(out)?;
     Ok(())
@@ -10416,9 +11582,42 @@ fn render_context_line_to<W: Write>(
         write_styled_display(out, line_no, color, "32")?;
         write!(out, "-")?;
     }
-    out.write_all(line)?;
+    out.write_all(display_context_line(line, options.trim))?;
     writeln!(out)?;
     Ok(())
+}
+
+fn display_line_match(
+    line: &[u8],
+    match_start: usize,
+    match_len: usize,
+    trim: bool,
+) -> (&[u8], usize, usize) {
+    if !trim {
+        return (line, match_start, match_len);
+    }
+    let trim_start = line
+        .iter()
+        .position(|byte| !matches!(*byte, b' ' | b'\t'))
+        .unwrap_or(line.len());
+    let display_line = &line[trim_start..];
+    if match_start < trim_start {
+        return (display_line, 0, 0);
+    }
+    let display_start = match_start - trim_start;
+    let display_len = match_len.min(display_line.len().saturating_sub(display_start));
+    (display_line, display_start, display_len)
+}
+
+fn display_context_line(line: &[u8], trim: bool) -> &[u8] {
+    if !trim {
+        return line;
+    }
+    let trim_start = line
+        .iter()
+        .position(|byte| !matches!(*byte, b' ' | b'\t'))
+        .unwrap_or(line.len());
+    &line[trim_start..]
 }
 
 fn write_line_with_match<W: Write>(
@@ -10480,23 +11679,41 @@ fn write_rendered_results<W: Write>(
 }
 
 fn build_path_matcher(options: &Options) -> Result<Option<(MatcherSet, MatcherSet)>> {
-    let positives: Vec<String> = options
+    let mut positives: Vec<String> = options
         .globs
         .iter()
         .filter(|g| !g.starts_with('!'))
         .cloned()
         .collect();
-    let negatives: Vec<String> = options
+    let mut negatives: Vec<String> = options
         .globs
         .iter()
         .filter_map(|g| g.strip_prefix('!').map(ToOwned::to_owned))
         .collect();
+    for ty in &options.type_includes {
+        if let Some(globs) = search_type_globs(ty) {
+            positives.extend(globs.iter().map(|glob| (*glob).to_string()));
+        }
+    }
+    for ty in &options.type_excludes {
+        if let Some(globs) = search_type_globs(ty) {
+            negatives.extend(globs.iter().map(|glob| (*glob).to_string()));
+        }
+    }
+    for ignore_file in &options.ignore_files {
+        let path = resolve_search_path(options, ignore_file);
+        let lines = load_pattern_lines(&path);
+        negatives.extend(lines);
+    }
     if positives.is_empty() && negatives.is_empty() {
         return Ok(None);
     }
     Ok(Some((
-        MatcherSet::new(&positives)?,
-        MatcherSet::new(&negatives)?,
+        MatcherSet::new_with_case(&positives, options.glob_case_insensitive)?,
+        MatcherSet::new_with_case(
+            &negatives,
+            options.glob_case_insensitive || options.ignore_file_case_insensitive,
+        )?,
     )))
 }
 
@@ -10504,11 +11721,15 @@ impl PathFilter {
     fn new(options: &Options, root: &Path) -> Result<Self> {
         let matcher = build_path_matcher(options)?;
         let prefixes = search_path_prefixes(options, root)?;
-        Ok(Self { prefixes, matcher })
+        Ok(Self {
+            prefixes,
+            matcher,
+            max_depth: options.max_depth,
+        })
     }
 
     fn is_unrestricted(&self) -> bool {
-        self.prefixes.is_empty() && self.matcher.is_none()
+        self.prefixes.is_empty() && self.matcher.is_none() && self.max_depth.is_none()
     }
 
     fn allows(&self, rel: &str, excluded_paths: &HashSet<String>) -> bool {
@@ -10526,6 +11747,9 @@ impl PathFilter {
         {
             return false;
         }
+        if !self.allows_depth(rel) {
+            return false;
+        }
         if let Some((positive, negative)) = &self.matcher {
             if positive.set.is_some() && !positive.is_match(rel) {
                 return false;
@@ -10536,12 +11760,40 @@ impl PathFilter {
         }
         true
     }
+
+    fn allows_depth(&self, rel: &str) -> bool {
+        let Some(max_depth) = self.max_depth else {
+            return true;
+        };
+        if self.prefixes.is_empty() {
+            return path_depth(rel) <= max_depth;
+        }
+        self.prefixes.iter().any(|prefix| {
+            if prefix.is_empty() || rel == prefix {
+                return true;
+            }
+            rel.strip_prefix(prefix)
+                .and_then(|tail| tail.strip_prefix('/'))
+                .is_some_and(|tail| path_depth(tail) <= max_depth)
+        })
+    }
 }
 
 fn has_path_restriction(options: &Options, root: &Path) -> bool {
     !options.globs.is_empty()
+        || !options.ignore_files.is_empty()
+        || !options.type_includes.is_empty()
+        || !options.type_excludes.is_empty()
+        || options.max_depth.is_some()
         || !options.paths.is_empty()
         || implicit_cwd_prefix(options, root).is_some()
+}
+
+fn path_depth(rel: &str) -> usize {
+    rel.split('/')
+        .filter(|part| !part.is_empty())
+        .count()
+        .saturating_sub(1)
 }
 
 fn search_path_prefixes(options: &Options, root: &Path) -> Result<Vec<String>> {
@@ -10551,12 +11803,7 @@ fn search_path_prefixes(options: &Options, root: &Path) -> Result<Vec<String>> {
     let mut prefixes = Vec::with_capacity(options.paths.len());
     for raw in &options.paths {
         let abs = resolve_search_path(options, raw);
-        let abs = fs::canonicalize(&abs).unwrap_or(abs);
-        let prefix = abs
-            .strip_prefix(root)
-            .ok()
-            .map(|candidate| candidate.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|| raw.replace('\\', "/"));
+        let prefix = rel_path_for_filter(root, &abs).unwrap_or_else(|| raw.replace('\\', "/"));
         if prefix.is_empty() {
             return Ok(Vec::new());
         }
@@ -10566,11 +11813,19 @@ fn search_path_prefixes(options: &Options, root: &Path) -> Result<Vec<String>> {
 }
 
 fn implicit_cwd_prefix(options: &Options, root: &Path) -> Option<String> {
-    if options.cwd.as_os_str().is_empty() || options.cwd == root {
+    if options.cwd.as_os_str().is_empty() || same_clean_root(&options.cwd, root) {
         return None;
     }
-    let rel = rel_path(root, &options.cwd)?;
+    let rel = rel_path_for_filter(root, &options.cwd)?;
     (!rel.is_empty()).then_some(rel)
+}
+
+fn rel_path_for_filter(root: &Path, path: &Path) -> Option<String> {
+    rel_path(root, path).or_else(|| {
+        let root = fs::canonicalize(root).ok()?;
+        let path = fs::canonicalize(path).ok()?;
+        rel_path(&root, &path)
+    })
 }
 
 fn resolve_search_path(options: &Options, raw: &str) -> PathBuf {
@@ -11297,25 +12552,30 @@ fn install_executable(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn install_alias(exe_path: &Path, alias_path: &Path) -> Result<()> {
     if alias_path.exists() {
         let _ = fs::remove_file(alias_path);
     }
+    std::os::unix::fs::symlink(
+        exe_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("indexsearch"),
+        alias_path,
+    )?;
+    Ok(())
+}
+
+fn install_search_alias(frontend_path: &Path, alias_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(
-            exe_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("indexsearch"),
-            alias_path,
-        )?;
+        install_alias(frontend_path, alias_path)
     }
     #[cfg(windows)]
     {
-        install_executable(exe_path, alias_path)?;
+        install_executable(frontend_path, alias_path)
     }
-    Ok(())
 }
 
 #[cfg(windows)]
@@ -11456,13 +12716,26 @@ fn search_daemon_fingerprint_matches(record: &SearchDaemonRecord) -> bool {
     if record_exe_meta.len() != record.exe_size || mtime_ns(&record_exe_meta) != record.exe_mtime {
         return false;
     }
-    if record.service_name != SEARCH_DAEMON_SERVICE_NAME {
-        return true;
+    record.service_name != SEARCH_DAEMON_SERVICE_NAME
+        || search_daemon_client_exe_candidates()
+            .into_iter()
+            .any(|candidate| same_clean_root(&candidate, &record.exe_path))
+}
+
+fn search_daemon_client_exe_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(executable_name(&format!(
+                "is-daemon-{}",
+                env!("CARGO_PKG_VERSION")
+            ))));
+            candidates.push(dir.join(executable_name("is-daemon")));
+            candidates.push(dir.join(executable_name("istool")));
+        }
+        candidates.push(exe);
     }
-    let Ok(exe) = env::current_exe() else {
-        return false;
-    };
-    exe == record.exe_path
+    candidates
 }
 
 fn read_search_daemon_record(path: &Path) -> Result<SearchDaemonRecord> {
@@ -11784,8 +13057,11 @@ fn append_windows_arg(out: &mut Vec<u16>, arg: &std::ffi::OsStr) {
 
 fn print_timings(timings: &Timings) {
     println!(
-        "timing: git={:.3}s scan={:.3}s process={:.3}s write={:.3}s",
-        timings.git, timings.scan, timings.process, timings.write
+        "timing: git={} scan={} process={} write={}",
+        format_elapsed_secs(timings.git),
+        format_elapsed_secs(timings.scan),
+        format_elapsed_secs(timings.process),
+        format_elapsed_secs(timings.write)
     );
 }
 
@@ -11836,7 +13112,7 @@ fn append_index_profile<W: Write>(out: &mut W, timings: &Timings) -> Result<()> 
     ];
     for (name, secs) in events {
         if secs > 0.0 {
-            writeln!(out, "profile: {name}={:.3}ms", secs * 1000.0)?;
+            writeln!(out, "profile: {name}={}", format_elapsed_secs(secs))?;
         }
     }
     let counters = [
@@ -11858,8 +13134,11 @@ fn append_index_profile<W: Write>(out: &mut W, timings: &Timings) -> Result<()> 
 
 fn timing_summary(timings: &Timings) -> String {
     format!(
-        "git={:.3}s scan={:.3}s process={:.3}s write={:.3}s",
-        timings.git, timings.scan, timings.process, timings.write
+        "git={} scan={} process={} write={}",
+        format_elapsed_secs(timings.git),
+        format_elapsed_secs(timings.scan),
+        format_elapsed_secs(timings.process),
+        format_elapsed_secs(timings.write)
     )
 }
 
@@ -12024,4 +13303,132 @@ fn write_padding(writer: &mut impl Write, from: u64, to: u64) -> Result<()> {
         current += n;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn unsupported_rg_flags_are_recorded_and_ignored() {
+        let options =
+            parse_search_args(&args(["--pcre2", "--pre", "cat", "Needle", "."].as_slice()))
+                .unwrap();
+
+        assert_eq!(options.pattern, "Needle");
+        assert_eq!(options.paths, vec![".".to_string()]);
+        assert!(
+            options
+                .compatibility_notes
+                .iter()
+                .any(|note| note.flag == "--pcre2")
+        );
+        assert!(
+            options
+                .compatibility_notes
+                .iter()
+                .any(|note| note.flag == "--pre")
+        );
+    }
+
+    #[test]
+    fn type_and_max_depth_filters_restrict_paths() {
+        let mut options =
+            parse_search_args(&args(["-tcpp", "--max-depth", "0", "Needle"].as_slice())).unwrap();
+        let root = env::current_dir().unwrap();
+        options.cwd = root.clone();
+        let filter = PathFilter::new(&options, &root).unwrap();
+        let excluded = HashSet::default();
+
+        assert!(filter.allows("Foo.cpp", &excluded));
+        assert!(!filter.allows("Source/Foo.cpp", &excluded));
+        assert!(!filter.allows("Foo.py", &excluded));
+    }
+
+    #[test]
+    fn glob_case_insensitive_matches_paths_without_global_cost() {
+        let mut options = parse_search_args(&args(
+            ["--glob-case-insensitive", "-g", "*.CPP", "Needle"].as_slice(),
+        ))
+        .unwrap();
+        let root = env::current_dir().unwrap();
+        options.cwd = root.clone();
+        let filter = PathFilter::new(&options, &root).unwrap();
+        let excluded = HashSet::default();
+
+        assert!(filter.allows("Source/Foo.cpp", &excluded));
+    }
+
+    #[test]
+    fn ignore_file_adds_negative_path_filters() {
+        let ignore_path = env::temp_dir().join(format!(
+            "indexsearch-ignore-{}-{}.txt",
+            std::process::id(),
+            1
+        ));
+        fs::write(&ignore_path, "Generated/\n").unwrap();
+
+        let mut options = parse_search_args(&args(
+            ["--ignore-file", ignore_path.to_str().unwrap(), "Needle"].as_slice(),
+        ))
+        .unwrap();
+        let root = env::current_dir().unwrap();
+        options.cwd = root.clone();
+        let filter = PathFilter::new(&options, &root).unwrap();
+        let excluded = HashSet::default();
+
+        assert!(!filter.allows("Generated/Foo.cpp", &excluded));
+        assert!(filter.allows("Source/Foo.cpp", &excluded));
+
+        let _ = fs::remove_file(ignore_path);
+    }
+
+    #[test]
+    fn implicit_cwd_filter_matches_explicit_dot_filter() {
+        let root = env::current_dir().unwrap();
+        let canonical_root = fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        let mut options = parse_search_args(&args(["Needle"].as_slice())).unwrap();
+        options.cwd = root.join("tests");
+
+        let filter = PathFilter::new(&options, &canonical_root).unwrap();
+        let excluded = HashSet::default();
+
+        assert!(filter.allows("tests/smoke.sh", &excluded));
+        assert!(!filter.allows("src/main.rs", &excluded));
+    }
+
+    #[test]
+    fn rg_line_flags_render_expected_results() {
+        let options = parse_search_args(&args(["--count-matches", "-F", "e"].as_slice())).unwrap();
+        let matcher = QueryMatcher::new(&options).unwrap();
+        let rendered = matcher
+            .search_file_rendered(b"needle nested\n", "a.txt", &options, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(String::from_utf8(rendered.output).unwrap(), "a.txt:5\n");
+
+        let options = parse_search_args(&args(["-x", "-F", "needle"].as_slice())).unwrap();
+        let matcher = QueryMatcher::new(&options).unwrap();
+        assert!(matcher.search_file_has_match(b"needle\n", &options));
+        assert!(!matcher.search_file_has_match(b"needle here\n", &options));
+
+        let options =
+            parse_search_args(&args(["--files-without-match", "-F", "needle"].as_slice())).unwrap();
+        let matcher = QueryMatcher::new(&options).unwrap();
+        let rendered = matcher
+            .search_file_rendered(b"other\n", "b.txt", &options, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(String::from_utf8(rendered.output).unwrap(), "b.txt\n");
+        assert!(
+            matcher
+                .search_file_rendered(b"needle\n", "b.txt", &options, true)
+                .unwrap()
+                .is_none()
+        );
+    }
 }

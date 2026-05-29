@@ -20,7 +20,6 @@ const RESPONSE_MAGIC: &[u8; 8] = b"ISDRES1\n";
 const STDOUT_FRAME: u8 = 1;
 const STDERR_FRAME: u8 = 2;
 const DONE_FRAME: u8 = 3;
-const CONTROL_FALLBACK_CODE: i32 = 75;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(20);
 #[cfg(windows)]
 const START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -34,7 +33,12 @@ const FRAME_COPY_BUFFER_SIZE: usize = 64 * 1024;
 #[derive(Default)]
 struct FrontendProfile {
     enabled: bool,
-    events: Vec<(&'static str, f64)>,
+    events: Vec<FrontendProfileEvent>,
+}
+
+enum FrontendProfileEvent {
+    DurationMillis(&'static str, f64),
+    Value(&'static str, f64),
 }
 
 impl FrontendProfile {
@@ -52,14 +56,16 @@ impl FrontendProfile {
 
     fn record(&mut self, name: &'static str, start: Instant) {
         if self.enabled {
-            self.events
-                .push((name, start.elapsed().as_secs_f64() * 1000.0));
+            self.events.push(FrontendProfileEvent::DurationMillis(
+                name,
+                start.elapsed().as_secs_f64() * 1000.0,
+            ));
         }
     }
 
     fn record_value(&mut self, name: &'static str, value: f64) {
         if self.enabled {
-            self.events.push((name, value));
+            self.events.push(FrontendProfileEvent::Value(name, value));
         }
     }
 
@@ -69,10 +75,25 @@ impl FrontendProfile {
         }
         let stderr = io::stderr();
         let mut err = io::BufWriter::new(stderr.lock());
-        for (name, ms) in &self.events {
-            let _ = writeln!(err, "profile: {name}={ms:.3}ms");
+        for event in &self.events {
+            match event {
+                FrontendProfileEvent::DurationMillis(name, ms) => {
+                    let _ = writeln!(err, "profile: {name}={}", format_elapsed_millis(*ms));
+                }
+                FrontendProfileEvent::Value(name, value) => {
+                    let _ = writeln!(err, "profile: {name}={value:.3}");
+                }
+            }
         }
         let _ = err.flush();
+    }
+}
+
+fn format_elapsed_millis(ms: f64) -> String {
+    if ms > 5_000.0 {
+        format!("{:.3}s", ms / 1000.0)
+    } else {
+        format!("{ms:.3}ms")
     }
 }
 
@@ -94,30 +115,32 @@ fn main() {
 }
 
 fn run(args: &[String]) -> Result<i32, String> {
-    if should_delegate(args) {
-        return run_backend(args);
+    let first = first_search_flag(args);
+    if args.is_empty() || first.is_some_and(|arg| matches!(arg, "-h" | "--help")) {
+        return run_backend_search_help();
+    }
+    if first.is_some_and(|arg| matches!(arg, "-V" | "--version")) {
+        println!("indexsearch {}", env!("CARGO_PKG_VERSION"));
+        return Ok(0);
     }
     let total_timer = Instant::now();
     let mut profile = FrontendProfile::new(args);
     let prepare_timer = Instant::now();
-    let search_args = strip_search_command(args);
+    let search_args = args.to_vec();
     profile.record("frontend_prepare_args", prepare_timer);
-    if env::var_os("INDEXSEARCH_NO_DAEMON").is_some() {
-        return run_backend(args);
+    if search_args.iter().any(|arg| arg == "--auto-update") {
+        return run_backend_search(&search_args);
     }
-    if search_args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "--no-daemon" | "--auto-update"))
-    {
-        return run_backend(args);
+    if search_args.iter().any(|arg| arg == "--type-list") {
+        return run_backend_search(&search_args);
     }
     let path_timer = Instant::now();
     let Some(search_paths) = search_path_args(&search_args) else {
-        return run_backend(args);
+        return run_backend_search(&search_args);
     };
     profile.record("frontend_resolve_search_paths", path_timer);
     if search_args.iter().any(|arg| arg == "--no-auto-index") {
-        return run_backend(args);
+        return run_backend_search(&search_args);
     }
     if agent_auto_project_mode()
         && search_paths
@@ -136,7 +159,7 @@ fn run(args: &[String]) -> Result<i32, String> {
                 return handle_missing_project(args);
             }
             return Err(format!(
-                "no IndexSearch project found above {}; run `is index` in that project first",
+                "no IndexSearch project found above {}; run `istool index` in that project first",
                 display_path(&search_paths[0].abs)
             ));
         };
@@ -151,7 +174,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         Err(MissingProject::Single) => return handle_missing_project(args),
         Err(MissingProject::Path(path)) => {
             return Err(format!(
-                "no IndexSearch project found above {}; run `is index` in that project first",
+                "no IndexSearch project found above {}; run `istool index` in that project first",
                 display_path(&path)
             ));
         }
@@ -170,85 +193,43 @@ fn run(args: &[String]) -> Result<i32, String> {
     return Ok(final_code);
 }
 
-fn run_search_group(
-    group_args: &[String],
-    mut root: PathBuf,
-    profile: &mut FrontendProfile,
-) -> Result<i32, String> {
-    let daemon_args = search_daemon_args(group_args);
-    let ready_record;
-    let ensure_timer = Instant::now();
-    (root, ready_record) = ensure_project_service(&root, profile)?;
-    profile.record("frontend_ensure_project_service", ensure_timer);
-    let record_timer = Instant::now();
-    if let Some(record) = ready_record.or_else(|| read_valid_record(&root)) {
-        profile.record("frontend_read_daemon_record", record_timer);
-        if let Ok(code) = request_daemon(&record, &daemon_args, profile) {
-            if code == CONTROL_FALLBACK_CODE {
-                stop_process(record.pid);
-                let _ = fs::remove_file(record_path(&root));
-                return run_backend_no_daemon(group_args);
-            }
-            return Ok(code);
-        }
-        stop_process(record.pid);
-        let _ = fs::remove_file(record_path(&root));
-    } else {
-        profile.record("frontend_read_daemon_record", record_timer);
-    }
-    run_backend_no_daemon(group_args)
-}
-
-fn should_delegate(args: &[String]) -> bool {
-    if args.is_empty() {
-        return true;
-    }
-    let first = first_command_arg(args).unwrap_or(args[0].as_str());
-    if matches!(first, "-h" | "--help" | "-V" | "--version") {
-        return true;
-    }
-    is_command_name(first)
-}
-
-fn first_command_arg(args: &[String]) -> Option<&str> {
+fn first_search_flag(args: &[String]) -> Option<&str> {
     let mut i = 0;
     while args
         .get(i)
-        .is_some_and(|arg| matches!(arg.as_str(), "--profile" | "--instrument"))
+        .is_some_and(|arg| {
+            matches!(
+                arg.as_str(),
+                "--profile" | "--instrument" | "--profile-search"
+            )
+        })
     {
         i += 1;
     }
     args.get(i).map(String::as_str)
 }
 
-fn is_command_name(arg: &str) -> bool {
-    matches!(
-        arg,
-        "index"
-            | "update"
-            | "compact"
-            | "clean"
-            | "search-daemon"
-            | "install"
-            | "install-skills"
-            | "status"
-            | "version"
-            | "projects"
-            | "stop"
-            | "project-log"
-    )
-}
-
-fn strip_search_command(args: &[String]) -> Vec<String> {
-    if args.first().is_some_and(|arg| arg == "search") {
-        args[1..].to_vec()
-    } else {
-        args.to_vec()
-    }
+fn run_search_group(
+    group_args: &[String],
+    mut root: PathBuf,
+    profile: &mut FrontendProfile,
+) -> Result<i32, String> {
+    let daemon_args = search_daemon_args(group_args);
+    let record;
+    let ensure_timer = Instant::now();
+    (root, record) = ensure_project_service(&root, profile)?;
+    profile.record("frontend_ensure_project_service", ensure_timer);
+    request_daemon(&record, &daemon_args, profile).map_err(|err| {
+        stop_process(record.pid);
+        let _ = fs::remove_file(record_path(&root));
+        format!(
+            "project service request failed for {}: {err}",
+            display_path(&root)
+        )
+    })
 }
 
 fn search_daemon_args(args: &[String]) -> Vec<String> {
-    let args = strip_search_command(args);
     let resolved_color = if stdout_supports_color() {
         "always"
     } else {
@@ -501,13 +482,46 @@ fn option_takes_value(arg: &str) -> bool {
             | "--max-count"
             | "--max-filesize"
             | "--color"
+            | "--colors"
+            | "-j"
+            | "--threads"
             | "--sort"
             | "--sortr"
+            | "--engine"
+            | "--encoding"
+            | "-t"
+            | "--type"
+            | "-T"
+            | "--type-not"
+            | "--max-depth"
+            | "--ignore-file"
+            | "--pre"
+            | "--pre-glob"
+            | "--replace"
+            | "--path-separator"
+            | "--field-context-separator"
+            | "--field-match-separator"
+            | "--context-separator"
+            | "--dfa-size-limit"
+            | "--hyperlink-format"
+            | "--hostname-bin"
+            | "--max-columns"
+            | "--regex-size-limit"
+            | "--type-add"
+            | "--type-clear"
     )
 }
 
 fn short_option_with_attached_value(arg: &str) -> bool {
-    (arg.starts_with("-A") || arg.starts_with("-B") || arg.starts_with("-C")) && arg.len() > 2
+    (arg.starts_with("-A")
+        || arg.starts_with("-B")
+        || arg.starts_with("-C")
+        || arg.starts_with("-g")
+        || arg.starts_with("-m")
+        || arg.starts_with("-t")
+        || arg.starts_with("-T")
+        || arg.starts_with("-j"))
+        && arg.len() > 2
 }
 
 fn find_project_root(start: &Path) -> Option<PathBuf> {
@@ -549,7 +563,7 @@ fn handle_missing_project(args: &[String]) -> Result<i32, String> {
         }
     }
     eprintln!(
-        "is: no IndexSearch project found; run `is index .` at the project root"
+        "is: no IndexSearch project found; run `istool index .` at the project root"
     );
     Ok(2)
 }
@@ -583,11 +597,11 @@ fn agent_auto_project_root(paths: &[SearchPathArg]) -> Result<PathBuf, String> {
 fn ensure_project_service(
     root: &Path,
     profile: &mut FrontendProfile,
-) -> Result<(PathBuf, Option<DaemonRecord>), String> {
+) -> Result<(PathBuf, DaemonRecord), String> {
     let ready_timer = Instant::now();
     if let Some(record) = ready_project_record(root) {
         profile.record("frontend_ready_project_record", ready_timer);
-        return Ok((root.to_path_buf(), Some(record)));
+        return Ok((root.to_path_buf(), record));
     }
     profile.record("frontend_ready_project_record", ready_timer);
 
@@ -601,7 +615,9 @@ fn ensure_project_service(
     let wait_timer = Instant::now();
     let ready_record = wait_for_ready_project_record(root, START_TIMEOUT);
     profile.record("frontend_wait_project_record", wait_timer);
-    Ok((root.to_path_buf(), ready_record))
+    ready_record
+        .map(|record| (root.to_path_buf(), record))
+        .ok_or_else(|| format!("project service did not become ready for {}", display_path(root)))
 }
 
 fn ready_project_record(root: &Path) -> Option<DaemonRecord> {
@@ -687,21 +703,20 @@ fn read_valid_record(root: &Path) -> Option<DaemonRecord> {
 }
 
 fn record_matches(record: &DaemonRecord) -> bool {
-    let backend = backend_path().ok();
-    let Some(backend) = backend.as_ref() else {
-        return false;
-    };
-    let Ok(backend_meta) = fs::metadata(backend) else {
-        return false;
-    };
     let Ok(index_meta) = fs::metadata(index_path(&record.root)) else {
         return false;
     };
-    same_fileish(backend, &record.exe_path)
-        && backend_meta.len() == record.exe_size
-        && mtime_ns(&backend_meta) == record.exe_mtime
-        && index_meta.len() == record.index_size
-        && mtime_ns(&index_meta) == record.index_mtime
+    if index_meta.len() != record.index_size || mtime_ns(&index_meta) != record.index_mtime {
+        return false;
+    }
+    backend_candidate_paths().into_iter().any(|backend| {
+        let Ok(backend_meta) = fs::metadata(&backend) else {
+            return false;
+        };
+        same_fileish(&backend, &record.exe_path)
+            && backend_meta.len() == record.exe_size
+            && mtime_ns(&backend_meta) == record.exe_mtime
+    })
 }
 
 fn same_fileish(left: &Path, right: &Path) -> bool {
@@ -850,22 +865,31 @@ fn send_stdout_handle(_stream: &mut TcpStream, _record: &DaemonRecord) -> io::Re
     Ok(())
 }
 
-fn run_backend(args: &[String]) -> Result<i32, String> {
-    run_backend_owned(args.iter().map(String::as_str))
+fn run_backend_search(args: &[String]) -> Result<i32, String> {
+    let mut owned = Vec::with_capacity(args.len() + 1);
+    owned.push("search".to_string());
+    owned.extend(args.iter().cloned());
+    run_backend_owned(owned.iter().map(String::as_str))
 }
 
-fn run_backend_no_daemon(args: &[String]) -> Result<i32, String> {
-    if args.iter().any(|arg| arg == "--no-daemon") {
-        return run_backend(args);
-    }
-    let mut owned = args.to_vec();
-    let insert_pos = if owned.first().is_some_and(|arg| arg == "search") {
-        1
-    } else {
-        0
-    };
-    owned.insert(insert_pos, "--no-daemon".to_string());
-    run_backend_owned(owned.iter().map(String::as_str))
+fn run_backend_search_help() -> Result<i32, String> {
+    let backend = backend_path()?;
+    let mut command = Command::new(backend);
+    command
+        .args(["search", "--help"])
+        .env("INDEXSEARCH_FRONTEND_HELP_NAME", frontend_command_name());
+    exec_or_status(command)
+}
+
+fn frontend_command_name() -> String {
+    env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "is".to_string())
 }
 
 fn run_backend_owned<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<i32, String> {
@@ -890,12 +914,7 @@ fn exec_or_status(mut command: Command) -> Result<i32, String> {
 
 fn backend_path() -> Result<PathBuf, String> {
     let exe = env::current_exe().map_err(|err| err.to_string())?;
-    let dir = exe
-        .parent()
-        .ok_or_else(|| "current executable has no parent".to_string())?;
-    let versioned_daemon = format!("is-daemon-{}", env!("CARGO_PKG_VERSION"));
-    for name in [versioned_daemon.as_str(), "is-daemon", "indexsearch"] {
-        let sibling = dir.join(executable_name(name));
+    for sibling in backend_candidate_paths() {
         if sibling.is_file() && fs::canonicalize(&sibling).ok() != fs::canonicalize(&exe).ok() {
             return Ok(sibling);
         }
@@ -903,7 +922,7 @@ fn backend_path() -> Result<PathBuf, String> {
     if exe
         .file_stem()
         .and_then(|stem| stem.to_str())
-        .is_some_and(|stem| stem == "is-daemon")
+        .is_some_and(|stem| stem == "is-daemon" || stem == "istool")
     {
         return Ok(exe);
     }
@@ -912,6 +931,20 @@ fn backend_path() -> Result<PathBuf, String> {
         executable_name("is-daemon"),
         display_path(&exe)
     ))
+}
+
+fn backend_candidate_paths() -> Vec<PathBuf> {
+    let Ok(exe) = env::current_exe() else {
+        return Vec::new();
+    };
+    let Some(dir) = exe.parent() else {
+        return Vec::new();
+    };
+    let versioned_daemon = format!("is-daemon-{}", env!("CARGO_PKG_VERSION"));
+    [versioned_daemon.as_str(), "is-daemon", "istool"]
+        .into_iter()
+        .map(|name| dir.join(executable_name(name)))
+        .collect()
 }
 
 fn executable_name(stem: &str) -> String {

@@ -52,17 +52,18 @@ Direct downloads:
 After extracting a direct-download archive, run:
 
 ```bash
-./indexsearch install
+./istool install
 ```
 
-The installer places `indexsearch`, `is`, and `is-daemon` in a user-writable bin
-directory. On Windows, `is` is a native `is.exe`, not an `is.cmd` wrapper.
+The installer places `istool`, `indexsearch`, `is`, and `is-daemon` in a
+user-writable bin directory. On Windows, `is` is a native `is.exe`, not an
+`is.cmd` wrapper.
 
 ## Quick Start
 
 ```bash
 cd /path/to/large/repo
-is index .
+istool index .
 is -n "SomeSymbol" .
 ```
 
@@ -71,7 +72,7 @@ daemon. That daemon keeps the index mmaped, watches filesystem changes, serves
 future searches, and can compact deltas while idle.
 
 If no IndexSearch project exists above the current directory, interactive `is`
-asks whether to create one in the current directory. `is index .` always
+asks whether to create one in the current directory. `istool index .` always
 rebuilds the base index explicitly.
 
 When `is` is used non-interactively by coding agents, missing project config is
@@ -81,14 +82,26 @@ results.
 Manage project services:
 
 ```bash
-is projects
-is project-log .
-is stop .
-is stop --all
+istool projects
+istool log .
+istool stop .
+istool stop --all
 ```
 
 `stop --all` stops registered project services and also makes a best-effort pass
 over stale `is-daemon` / `search-daemon` processes left by older versions.
+
+Shell completion scripts can be generated from `istool`:
+
+```powershell
+istool completions powershell >> $PROFILE
+```
+
+```bash
+istool completions bash > ~/.local/share/bash-completion/completions/istool
+istool completions zsh > ~/.zfunc/_istool
+istool completions fish > ~/.config/fish/completions/istool.fish
+```
 
 ## Configuration
 
@@ -112,7 +125,7 @@ For Unreal Engine source trees, copy the bundled template:
 ```bash
 cp templates/unreal-engine/index-search-project.txt /path/to/UnrealEngine/index-search-project.txt
 cd /path/to/UnrealEngine
-is index .
+istool index .
 ```
 
 If the first interactive search discovers an Unreal Engine root or a `.uproject`
@@ -121,9 +134,9 @@ root, the generated config uses the UE template automatically.
 ## Updating
 
 ```bash
-is update .
-is update --git .
-is compact .
+istool update .
+istool update --git .
+istool compact .
 ```
 
 `update` refreshes an existing index. If the daemon is running, it first flushes
@@ -144,29 +157,33 @@ is -w Actor .
 is -g "*.cpp" Nanite .
 is -n -C 3 "SomeSymbol" .
 is --json "SomeSymbol" .
-is --no-daemon "SomeSymbol" .
+is -v -F "exclude this line" .
+is --files-without-match "TODO" .
+is --count-matches -F "Tick" .
+is -x -F "exact whole line" .
 ```
 
 When stdout is a terminal, output is grouped by file like `rg --heading`. When
 stdout is captured or piped, output uses flat `path:line:match` rows. Use
 `--heading`, `--no-heading`, `-n`, and `-N` to override.
 
-For a pattern that is also a command name, use `--` or explicit `search`:
+For a pattern that starts with punctuation or looks like an option, use `--`:
 
 ```bash
-is -- "status" .
-is search "projects" .
+is -- "--help" .
 ```
 
-Use `rg` for unsupported flags or PCRE-specific behavior.
+Unsupported rg flags are logged in the project log and ignored when that is
+safe, so agent and editor integrations can keep running. Use `rg` for PCRE-only
+patterns, multiline matching, preprocessors, archive search, or other behavior
+that must exactly match ripgrep.
 
 ## Profiling
 
 ```bash
-is index --profile .
-is update --profile .
+istool index --profile .
+istool update --profile .
 is --profile -n -g "*.cpp" Nanite .
-is --profile --no-daemon Nanite .
 ```
 
 `profile:` lines are printed to stderr and are intended for sharing performance
@@ -199,7 +216,7 @@ python3 scripts/benchmark-ue.py /path/to/UnrealEngine --prepare-qgrep \
 cargo build --release
 cargo test --locked
 ./tests/smoke.sh
-./target/release/indexsearch --version
+./target/release/istool --version
 ```
 
 Tagged pushes create GitHub Releases with Linux, macOS, and Windows archives.
@@ -210,8 +227,8 @@ Bundled instructions for Codex, Claude Code, OpenCode, and Cursor can be
 installed with:
 
 ```bash
-is install-skills
-is install-skills --target all --scope project --project /path/to/project --ue-template
+istool install-skills
+istool install-skills --target all --scope project --project /path/to/project --ue-template
 ```
 
 ## License

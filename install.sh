@@ -25,11 +25,11 @@ curl -fsSL "$url" -o "$tmp/$asset"
 tar -xzf "$tmp/$asset" -C "$tmp"
 
 payload="$(find "$tmp" -mindepth 1 -maxdepth 1 -type d -name 'indexsearch-*' | head -n 1)"
-if [ -z "$payload" ] && [ -x "$tmp/indexsearch" ]; then
+if [ -z "$payload" ] && [ -x "$tmp/istool" ]; then
   payload="$tmp"
 fi
 if [ -z "$payload" ]; then
-  exe="$(find "$tmp" -type f -name indexsearch -perm -111 | head -n 1)"
+  exe="$(find "$tmp" -type f -name istool -perm -111 | head -n 1)"
   if [ -n "$exe" ]; then
     payload="$(dirname "$exe")"
   fi
@@ -40,11 +40,12 @@ if [ -z "$payload" ]; then
 fi
 
 mkdir -p "$install_dir"
-"$payload/indexsearch" install --dir "$install_dir"
+"$payload/istool" install --dir "$install_dir"
 
 echo
+"$install_dir/istool" --version
 "$install_dir/indexsearch" --version
-echo "installed indexsearch, is, and is-daemon to $install_dir"
+echo "installed istool, indexsearch, is, and is-daemon to $install_dir"
 case ":$PATH:" in
   *":$install_dir:"*) ;;
   *) echo "note: add $install_dir to PATH if your shell cannot find is" ;;

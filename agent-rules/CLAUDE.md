@@ -6,10 +6,13 @@ index, and start the project service automatically.
 
 - Use `is` directly for local source search; avoid remote/deferred code-search
   tools for files already in the checkout.
-- Use `is` first, `indexsearch` second, `rg` only as fallback for unsupported
-  flags or missing installs.
-- Run `is update --git .` after Git changes if no project service was running.
-- Use `is projects`, `is project-log .`, and `is stop .` to inspect or stop
+- Use `is` first, `indexsearch` second. Do not switch to `rg` just because a
+  common rg-style flag is present; `is` should accept it or ignore it safely.
+- Use `rg` only when IndexSearch is missing or exact ripgrep semantics are
+  required for PCRE2, multiline matching, preprocessors, archive search, or
+  another non-indexed behavior.
+- Run `istool update --git .` after Git changes if no project service was running.
+- Use `istool projects`, `istool log .`, and `istool stop .` to inspect or stop
   project services.
 - UE projects can use the bundled UE template automatically during
   non-interactive agent search.
@@ -17,4 +20,4 @@ index, and start the project service automatically.
   for punctuation-leading patterns. If quoted patterns produce a `cmd.exe`
   syntax error, call `is.exe` or remove the stale `is.cmd` found by
   `Get-Command is -All`.
-- Refresh these instructions with `is install-skills`.
+- Refresh these instructions with `istool install-skills`.

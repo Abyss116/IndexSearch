@@ -25,10 +25,10 @@ try {
     $Payload = Get-ChildItem -Path $Temp -Directory -Filter "indexsearch-*" | Select-Object -First 1
     if ($Payload) {
         $PayloadDir = $Payload.FullName
-    } elseif (Test-Path (Join-Path $Temp "indexsearch.exe")) {
+    } elseif (Test-Path (Join-Path $Temp "istool.exe")) {
         $PayloadDir = $Temp
     } else {
-        $Exe = Get-ChildItem -Path $Temp -Recurse -File -Filter "indexsearch.exe" | Select-Object -First 1
+        $Exe = Get-ChildItem -Path $Temp -Recurse -File -Filter "istool.exe" | Select-Object -First 1
         if ($Exe) {
             $PayloadDir = $Exe.DirectoryName
         }
@@ -38,7 +38,7 @@ try {
     }
 
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    & (Join-Path $PayloadDir "indexsearch.exe") install --dir $InstallDir
+    & (Join-Path $PayloadDir "istool.exe") install --dir $InstallDir
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
@@ -56,8 +56,9 @@ try {
     }
 
     Write-Host ""
+    & (Join-Path $InstallDir "istool.exe") --version
     & (Join-Path $InstallDir "indexsearch.exe") --version
-    Write-Host "installed indexsearch.exe, is.exe, and is-daemon.exe to $InstallDir"
+    Write-Host "installed istool.exe, indexsearch.exe, is.exe, and is-daemon.exe to $InstallDir"
 } finally {
     Remove-Item -Recurse -Force $Temp -ErrorAction SilentlyContinue
 }

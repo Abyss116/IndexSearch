@@ -1,6 +1,6 @@
 [package]
 name = "indexsearch"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
 description = "Persistent-index rg-like search for large source trees"
 repository = "https://github.com/Abyss116/IndexSearch"
@@ -51,3 +51,7 @@ path = "src/bin/indexsearch.rs"
 [[bin]]
 name = "is"
 path = "src/bin/is.rs"
+
+[[bin]]
+name = "istool"
+path = "src/bin/istool.rs"
