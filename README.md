@@ -143,8 +143,10 @@ istool compact .
 pending filesystem events, so normal edit-and-search workflows stay current
 without a full tree scan.
 
-`update --git` is useful after `git pull`, checkout, or rebase. `compact` folds
-delta indexes back into the base index.
+By default, `update` reconciles against the filesystem for correctness across
+Git and non-Git trees. `update --git` remains an explicit fast path after
+`git pull`, checkout, or rebase. `compact` folds delta indexes back into the
+base index.
 
 ## rg-Like Usage
 

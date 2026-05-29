@@ -23,8 +23,8 @@ cleanup() {
     "${home_registry_tmp:-}" "${outside_log_tmp:-}" "${multi_root_tmp:-}" "${git_tmp:-}" "${watch_tmp:-}" \
     "${compact_watch_tmp:-}" "${config_watch_tmp:-}" "${offline_watch_tmp:-}" \
     "${implicit_watch_tmp:-}" "${clean_tmp:-}" "${all_home:-}" "${all_watch_a:-}" \
-    "${all_watch_b:-}" "${registry_home:-}" "${install_tmp:-}" "${skills_home:-}" \
-    "${skills_project:-}" "$test_home"
+    "${all_watch_b:-}" "${registry_home:-}" "${install_tmp:-}" "${install_project:-}" \
+    "${skills_home:-}" "${skills_project:-}" "$test_home"
 }
 
 assert_daemon_capabilities() {
@@ -71,7 +71,15 @@ printf 'auto_config_symbol\n' > "$no_cfg_tmp/a.txt"
 help_out="$("$bin" --help)"
 grep -q 'search the indexed tree' <<<"$help_out"
 grep -q 'Options' <<<"$help_out"
+grep -q -- '--files-without-match' <<<"$help_out"
+grep -q -- '--count-matches' <<<"$help_out"
+grep -q -- '--type-list' <<<"$help_out"
+grep -q 'istool <COMMAND>' <<<"$help_out"
 ! grep -q '<init|' <<<"$help_out"
+tool_help="$("$tool_bin" --help)"
+grep -q 'Search Frontends' <<<"$tool_help"
+grep -q 'istool search --help' <<<"$tool_help"
+grep -q 'always expects a subcommand' <<<"$tool_help"
 install_help="$("$tool_bin" install --help)"
 grep -q 'install the daemon backend and user-facing commands' <<<"$install_help"
 grep -q -- '--dir PATH' <<<"$install_help"
@@ -128,6 +136,8 @@ printf 'needle ignored\n' > "$tmp/out/d.cc"
 
 "$tool_bin" index "$tmp" >/dev/null
 "$bin" -q -F needle "$tmp"
+grep -q 'project-service-listen' "$tmp/.indexsearch/project.log"
+daemon_pid_after_index="$(sed -n 's/^pid=//p' "$tmp/.indexsearch/search-daemon.txt")"
 result="$("$bin" -n -i needle "$tmp")"
 grep -q "$tmp/src/a.cc:2:needle here" <<<"$result"
 grep -q "$tmp/src/b.txt:1:Needle there" <<<"$result"
@@ -138,6 +148,14 @@ sorted_result="$("$bin" --sort path -n -i needle "$tmp")"
 mkdir -p "$tmp/src/sub"
 printf 'needle nested\n' > "$tmp/src/sub/nested.txt"
 "$tool_bin" update --force-scan "$tmp" >/dev/null
+daemon_pid_after_delta="$(sed -n 's/^pid=//p' "$tmp/.indexsearch/search-daemon.txt")"
+[[ "$daemon_pid_after_delta" == "$daemon_pid_after_index" ]]
+"$bin" -q -F 'needle nested' "$tmp"
+"$tool_bin" compact "$tmp" >/dev/null
+daemon_pid_after_compact="$(sed -n 's/^pid=//p' "$tmp/.indexsearch/search-daemon.txt")"
+[[ "$daemon_pid_after_compact" == "$daemon_pid_after_index" ]]
+"$bin" -q -F 'needle nested' "$tmp"
+grep -q 'project-service-reload reason=index-replaced' "$tmp/.indexsearch/project.log"
 subdir_result="$(cd "$tmp/src/sub" && "$bin" -n -F needle)"
 [[ "$subdir_result" == 'nested.txt:1:needle nested' ]]
 subdir_dot_result="$(cd "$tmp/src/sub" && "$bin" -n -F needle .)"
@@ -239,6 +257,7 @@ grep -q "$tmp/src/new.cc:1:fresh_symbol added" <<<"$fresh"
 
 status="$("$tool_bin" status "$tmp")"
 grep -q 'config_stale: false' <<<"$status"
+grep -q 'index_size:' <<<"$status"
 
 git_tmp="$(mktemp -d)"
 
@@ -321,6 +340,10 @@ assert_daemon_capabilities "$watch_tmp/.indexsearch/search-daemon.txt"
 watch_pid="$(awk -F= '$1 == "pid" { print $2 }' "$watch_tmp/.indexsearch/search-daemon.txt")"
 listed_watch="$("$tool_bin" projects)"
 grep -q "pid=$watch_pid" <<<"$listed_watch"
+grep -q 'service=is-daemon' <<<"$listed_watch"
+grep -q 'protocol=1' <<<"$listed_watch"
+grep -q 'capabilities=.*search' <<<"$listed_watch"
+grep -q 'capabilities=.*update' <<<"$listed_watch"
 mkdir -p "$watch_tmp/sub"
 "$bin" -q -F watch_first "$watch_tmp/sub" || true
 listed_watch_after_sub="$("$tool_bin" projects)"
@@ -505,9 +528,10 @@ grep -q "$all_watch_b" <<<"$all_stop"
 [[ -z "$(HOME="$all_home" "$tool_bin" projects)" ]]
 
 install_tmp="$(mktemp -d)"
+install_project="$(mktemp -d)"
 skills_home="$(mktemp -d)"
 skills_project="$(mktemp -d)"
-"$tool_bin" install --dir "$install_tmp" >/dev/null
+INDEXSEARCH_SKIP_STALE_DAEMON_KILL=1 "$tool_bin" install --dir "$install_tmp" >/dev/null
 install_exe="$install_tmp/indexsearch"
 install_alias="$install_tmp/is"
 install_daemon="$install_tmp/is-daemon"
@@ -525,6 +549,18 @@ fi
 [[ -x "$install_alias" || -L "$install_alias" ]]
 [[ -x "$install_daemon" || -L "$install_daemon" ]]
 [[ -x "$install_tool" || -L "$install_tool" ]]
+cat > "$install_project/index-search-project.txt" <<'CFG'
+[IndexSearch.files.include]
+*.txt
+CFG
+printf 'install_reinstall_symbol\n' > "$install_project/a.txt"
+"$install_alias" -q -F install_reinstall_symbol "$install_project"
+install_projects_before="$("$install_tool" projects)"
+grep -q "$install_project" <<<"$install_projects_before"
+grep -q 'alive=true' <<<"$install_projects_before"
+install_reinstall_out="$(INDEXSEARCH_SKIP_STALE_DAEMON_KILL=1 "$tool_bin" install --dir "$install_tmp")"
+grep -q 'stopped [0-9][0-9]* running project service' <<<"$install_reinstall_out"
+"$install_alias" --version >/dev/null
 HOME="$skills_home" "$tool_bin" install-skills --target all --scope user >/dev/null
 [[ -f "$skills_home/.codex/skills/indexsearch/SKILL.md" ]]
 [[ -f "$skills_home/.claude/skills/indexsearch/SKILL.md" ]]

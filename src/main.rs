@@ -80,9 +80,10 @@ const SEARCH_DAEMON_START_TIMEOUT: Duration = Duration::from_millis(250);
 const SEARCH_DAEMON_STREAM_BUFFER_SIZE: usize = 256 * 1024;
 #[cfg(not(windows))]
 const SEARCH_DAEMON_STREAM_BUFFER_SIZE: usize = 64 * 1024;
-const RECENT_SYNC_NO_SCAN_WINDOW: Duration = Duration::from_secs(30);
 const STREAMING_PIPELINE_MIN_CANDIDATES: usize = 50_000;
 const POSTING_BUILD_CHUNK_FILES: usize = 4096;
+const POSTING_MERGE_MAX_SHARDS: usize = 64;
+const INDEX_PROCESS_PROGRESS_GRANULARITY: u64 = 8 * 1024 * 1024;
 const DEFAULT_PROJECT_CONFIG: &str = "[IndexSearch.paths.ignore]\n.git/\n.hg/\n.svn/\n.indexsearch/\n\n\
 [IndexSearch.files.ignore]\nindex-search-project.txt\n*.png\n*.jpg\n*.jpeg\n*.gif\n*.pdf\n*.zip\n*.gz\n*.dll\n*.exe\n*.pdb\n*.o\n*.obj\n\n\
 [IndexSearch.files.include]\n*\n";
@@ -277,6 +278,9 @@ struct Timings {
     sort: f64,
     select_fragments: f64,
     postings: f64,
+    postings_build_chunks: f64,
+    postings_merge: f64,
+    postings_merge_shards: u64,
     write_prepare_files: f64,
     write_prepare_postings: f64,
     write_prepare_chunks: f64,
@@ -448,7 +452,6 @@ struct ChangedPath {
 #[derive(Default)]
 struct IndexState {
     git_head: Option<String>,
-    updated_ns: Option<u128>,
 }
 
 struct TrigramScratch {
@@ -482,6 +485,8 @@ struct PostingView<'a> {
 
 struct MappedIndex {
     mmap: Mmap,
+    index_size: u64,
+    index_mtime: i64,
     version: u32,
     root: PathBuf,
     config_hash: u64,
@@ -779,11 +784,7 @@ fn run() -> Result<()> {
             println!("{} {}", cli_binary_name(), env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        value => {
-            bail!(
-                "unknown command `{value}`; use `istool search {value}` to search for that pattern"
-            )
-        }
+        value => bail_unknown_command(value),
     }
 }
 
@@ -886,6 +887,22 @@ fn command_spec(name: &str) -> Option<&'static CommandSpec> {
     ISTOOL_COMMANDS.iter().find(|command| command.name == name)
 }
 
+fn bail_unknown_command(value: &str) -> Result<()> {
+    let tool_search = if value.starts_with('-') {
+        format!("istool search -- {value}")
+    } else {
+        format!("istool search {value}")
+    };
+    let short_search = if value.starts_with('-') {
+        format!("is -- {value}")
+    } else {
+        format!("is {value}")
+    };
+    bail!(
+        "unknown command or misplaced option `{value}`; `istool` requires a subcommand; use `{tool_search}` or `{short_search}` to search"
+    )
+}
+
 #[derive(Default)]
 struct WatchState {
     pending: Mutex<HashSet<String>>,
@@ -931,6 +948,19 @@ fn print_help() {
     for command in ISTOOL_COMMANDS {
         help_command(&style, command.usage, command.description);
     }
+    println!();
+
+    help_section(&style, "Search Frontends");
+    help_command(
+        &style,
+        "is PATTERN [PATH ...]",
+        "rg-like shorthand for istool search",
+    );
+    help_command(
+        &style,
+        "indexsearch PATTERN [PATH ...]",
+        "same search frontend with a longer name",
+    );
     println!();
 
     help_section(&style, "Common Search Options");
@@ -1005,7 +1035,7 @@ fn print_help() {
     );
     println!();
 
-    help_section(&style, "Indexing Options");
+    help_section(&style, "Indexing and Freshness Options");
     help_option(
         &style,
         "--max-filesize SIZE",
@@ -1016,7 +1046,7 @@ fn print_help() {
     help_option(
         &style,
         "--git",
-        "update from Git changed paths, local changes, and untracked files",
+        "explicit Git changed-path update, including local and untracked files",
     );
     help_option(
         &style,
@@ -1031,7 +1061,7 @@ fn print_help() {
     help_option(
         &style,
         "--auto-update",
-        "search performs a fast Git refresh, including untracked files",
+        "search reconciles the index before running",
     );
     help_option(
         &style,
@@ -1045,8 +1075,13 @@ fn print_help() {
         style.cmd("istool <COMMAND> --help")
     );
     println!(
-        "Use {} to search for a pattern that is also a command name.",
-        style.cmd("istool search -- PATTERN [PATH ...]")
+        "Run {} for the full search option list.",
+        style.cmd("istool search --help")
+    );
+    println!(
+        "`istool` always expects a subcommand; use {} or {} for searches.",
+        style.cmd("istool search PATTERN [PATH ...]"),
+        style.cmd("is PATTERN [PATH ...]")
     );
 }
 
@@ -1121,7 +1156,7 @@ fn print_update_help() {
     help_option(
         &style,
         "--git",
-        "update from Git changed paths, local changes, and untracked files",
+        "explicit Git changed-path update, including local and untracked files",
     );
     help_option(
         &style,
@@ -1328,9 +1363,25 @@ fn print_search_help() {
         "treat following arguments as pattern and paths",
     );
     help_option(&style, "-g, --glob GLOB", "include or exclude path glob");
+    help_option(
+        &style,
+        "--iglob GLOB",
+        "case insensitive include or exclude path glob",
+    );
+    help_option(
+        &style,
+        "--glob-case-insensitive",
+        "match subsequent globs case insensitively",
+    );
+    help_option(
+        &style,
+        "--glob-case-sensitive",
+        "match subsequent globs case sensitively",
+    );
     help_option(&style, "-n, --line-number", "show line numbers");
     help_option(&style, "-N, --no-line-number", "suppress line numbers");
     help_option(&style, "--column", "show columns");
+    help_option(&style, "--no-column", "suppress columns");
     help_option(
         &style,
         "-A, --after-context NUM",
@@ -1359,19 +1410,39 @@ fn print_search_help() {
         "-l, --files-with-matches",
         "print matching file paths",
     );
+    help_option(
+        &style,
+        "--files-without-match",
+        "print non-matching file paths",
+    );
     help_option(&style, "-c, --count", "print match counts per file");
+    help_option(
+        &style,
+        "--count-matches",
+        "print match occurrence counts per file",
+    );
     help_option(&style, "-o, --only-matching", "print only matching text");
+    help_option(&style, "-v, --invert-match", "print non-matching lines");
+    help_option(&style, "-x, --line-regexp", "match whole lines only");
+    help_option(
+        &style,
+        "--trim",
+        "trim leading whitespace from printed lines",
+    );
+    help_option(&style, "--no-trim", "preserve leading whitespace");
     help_option(&style, "-q, --quiet", "suppress normal output");
     help_option(&style, "--files", "print indexed searchable files");
     help_option(&style, "--json", "print JSON Lines matches");
     help_option(&style, "--vimgrep", "print path:line:column:line");
     help_option(&style, "--sort path", "sort matches by path");
+    help_option(&style, "--sort-files", "sort file-oriented output by path");
     help_option(
         &style,
         "--color WHEN",
         "colorize matches: auto, always, never",
     );
     help_option(&style, "-m, --max-count NUM", "max matching lines per file");
+    help_option(&style, "--max-depth NUM", "descend at most NUM path levels");
     help_option(
         &style,
         "--max-filesize SIZE",
@@ -1387,6 +1458,28 @@ fn print_search_help() {
         "-L, --follow",
         "follow symlinks while auto-indexing",
     );
+    help_option(&style, "-t, --type TYPE", "include a built-in file type");
+    help_option(
+        &style,
+        "-T, --type-not TYPE",
+        "exclude a built-in file type",
+    );
+    help_option(&style, "--type-list", "print built-in file types");
+    help_option(
+        &style,
+        "--ignore-file PATH",
+        "add ignore patterns from PATH",
+    );
+    help_option(
+        &style,
+        "--ignore-file-case-insensitive",
+        "match ignore-file patterns case insensitively",
+    );
+    help_option(
+        &style,
+        "-u, -uu, --unrestricted",
+        "relax ignore filtering within indexed files",
+    );
     help_option(
         &style,
         "--no-auto-index",
@@ -1395,14 +1488,49 @@ fn print_search_help() {
     help_option(
         &style,
         "--auto-update",
-        "fast Git refresh before search, including untracked files",
+        "reconcile filesystem changes before search",
     );
+    help_option(
+        &style,
+        "--encoding ENCODING",
+        "accept rg encoding option; non-UTF-8 decoding is not supported",
+    );
+    help_option(
+        &style,
+        "--engine ENGINE",
+        "accept rg regex engine option; default/auto are supported",
+    );
+    help_option(
+        &style,
+        "--no-require-git",
+        "accepted for editor compatibility",
+    );
+    help_option(
+        &style,
+        "--no-ignore-parent",
+        "accepted for editor compatibility",
+    );
+    help_option(
+        &style,
+        "--no-ignore-global",
+        "accepted for editor compatibility",
+    );
+    help_option(&style, "--no-config", "accepted for editor compatibility");
+    help_option(&style, "--crlf", "accepted for editor compatibility");
     help_option(&style, "--stats", "print search stats");
     help_option(
         &style,
         "--profile, --instrument",
         "print internal timing breakdown to stderr",
     );
+    if env::var("INDEXSEARCH_FRONTEND_HELP_NAME").is_ok() {
+        println!();
+        help_section(&style, "Related Commands");
+        println!(
+            "  Use {} for index, update, service, install, and log commands.",
+            style.cmd("istool <COMMAND> [ARGS]")
+        );
+    }
 }
 
 fn command_usage(style: &HelpStyle, command: &str, args: &str, description: &str) {
@@ -1526,6 +1654,12 @@ fn stdout_supports_search_decoration() -> bool {
 struct ProgressLine {
     done: Arc<AtomicBool>,
     label: Arc<Mutex<String>>,
+    current: Arc<AtomicU64>,
+    total: Arc<AtomicU64>,
+    determinate: Arc<AtomicBool>,
+    completed: Arc<AtomicBool>,
+    output_lock: Arc<Mutex<()>>,
+    stage_started: Arc<Mutex<Instant>>,
     started: Instant,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -1536,62 +1670,199 @@ impl ProgressLine {
             return Self {
                 done: Arc::new(AtomicBool::new(true)),
                 label: Arc::new(Mutex::new(label.to_string())),
+                current: Arc::new(AtomicU64::new(0)),
+                total: Arc::new(AtomicU64::new(0)),
+                determinate: Arc::new(AtomicBool::new(false)),
+                completed: Arc::new(AtomicBool::new(true)),
+                output_lock: Arc::new(Mutex::new(())),
+                stage_started: Arc::new(Mutex::new(Instant::now())),
                 started: Instant::now(),
                 handle: None,
             };
         }
         let done = Arc::new(AtomicBool::new(false));
         let label = Arc::new(Mutex::new(label.to_string()));
+        let current = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+        let determinate = Arc::new(AtomicBool::new(false));
+        let completed = Arc::new(AtomicBool::new(false));
+        let output_lock = Arc::new(Mutex::new(()));
+        let stage_started = Arc::new(Mutex::new(Instant::now()));
         let thread_done = Arc::clone(&done);
         let thread_label = Arc::clone(&label);
+        let thread_current = Arc::clone(&current);
+        let thread_total = Arc::clone(&total);
+        let thread_determinate = Arc::clone(&determinate);
+        let thread_completed = Arc::clone(&completed);
+        let thread_output_lock = Arc::clone(&output_lock);
+        let thread_stage_started = Arc::clone(&stage_started);
         let started = Instant::now();
         let handle = std::thread::spawn(move || {
             let frames = ["|", "/", "-", "\\"];
             let width = 28usize;
             let mut tick = 0usize;
             while !thread_done.load(AtomicOrdering::Relaxed) {
+                if thread_completed.load(AtomicOrdering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(80));
+                    continue;
+                }
                 let text = thread_label
                     .lock()
                     .map(|label| label.clone())
                     .unwrap_or_else(|_| "Working".to_string());
-                let bar = progress_bar(tick, width);
-                let elapsed = format_elapsed_duration(started.elapsed());
-                eprint!(
-                    "\r  {} {:<18} {} {:>9}",
-                    color_progress(frames[tick % frames.len()]),
-                    text,
-                    bar,
-                    elapsed
-                );
-                let _ = std::io::stderr().flush();
+                let is_determinate = thread_determinate.load(AtomicOrdering::Relaxed);
+                let current = thread_current.load(AtomicOrdering::Relaxed);
+                let total = thread_total.load(AtomicOrdering::Relaxed);
+                let (bar, percent) = if is_determinate && total != 0 {
+                    (
+                        progress_bar_fraction(current, total, width),
+                        progress_percent(current, total),
+                    )
+                } else {
+                    (progress_bar(tick, width), 0.0)
+                };
+                let elapsed = thread_stage_started
+                    .lock()
+                    .map(|started| format_progress_duration(started.elapsed()))
+                    .unwrap_or_else(|_| format_progress_duration(started.elapsed()));
+                if let Ok(_guard) = thread_output_lock.lock() {
+                    if is_determinate && total != 0 {
+                        eprint!(
+                            "\r│ {} {:<18} {} {:>5.1}% {:>10}",
+                            color_progress(frames[tick % frames.len()]),
+                            text,
+                            bar,
+                            percent,
+                            elapsed
+                        );
+                    } else {
+                        eprint!(
+                            "\r│ {} {:<18} {} {:>10}",
+                            color_progress(frames[tick % frames.len()]),
+                            text,
+                            bar,
+                            elapsed
+                        );
+                    }
+                    clear_progress_line_suffix();
+                    let _ = std::io::stderr().flush();
+                }
                 tick = tick.wrapping_add(1);
                 std::thread::sleep(Duration::from_millis(80));
             }
-            clear_progress_line();
+            if let Ok(_guard) = thread_output_lock.lock() {
+                clear_progress_line();
+            }
         });
         Self {
             done,
             label,
+            current,
+            total,
+            determinate,
+            completed,
+            output_lock,
+            stage_started,
             started,
             handle: Some(handle),
         }
     }
 
-    fn update(&self, label: &str) {
+    fn update(&self, label: &str) -> bool {
         if let Ok(mut text) = self.label.lock() {
+            let changed = text.as_str() != label;
             *text = label.to_string();
+            changed
+        } else {
+            true
+        }
+    }
+
+    fn begin_indeterminate(&self, label: &str) {
+        let was_completed = self.completed.load(AtomicOrdering::Relaxed);
+        if self.update(label) || was_completed {
+            self.reset_stage_timer();
+        }
+        self.current.store(0, AtomicOrdering::Relaxed);
+        self.total.store(0, AtomicOrdering::Relaxed);
+        self.determinate.store(false, AtomicOrdering::Relaxed);
+        self.completed.store(false, AtomicOrdering::Relaxed);
+    }
+
+    fn begin_determinate(&self, label: &str, total: u64) {
+        let was_completed = self.completed.load(AtomicOrdering::Relaxed);
+        if self.update(label) || was_completed {
+            self.reset_stage_timer();
+        }
+        self.current.store(0, AtomicOrdering::Relaxed);
+        self.total.store(total, AtomicOrdering::Relaxed);
+        self.determinate.store(total != 0, AtomicOrdering::Relaxed);
+        self.completed.store(false, AtomicOrdering::Relaxed);
+    }
+
+    fn set_indeterminate(&self, label: &str) {
+        self.complete_stage();
+        self.begin_indeterminate(label);
+    }
+
+    fn set_total(&self, label: &str, total: u64) {
+        self.complete_stage();
+        self.begin_determinate(label, total);
+    }
+
+    fn advance(&self, delta: u64) {
+        if delta != 0 {
+            self.current.fetch_add(delta, AtomicOrdering::Relaxed);
+        }
+    }
+
+    fn as_active(&self) -> Option<&Self> {
+        self.handle.is_some().then_some(self)
+    }
+
+    fn reset_stage_timer(&self) {
+        if let Ok(mut started) = self.stage_started.lock() {
+            *started = Instant::now();
+        }
+    }
+
+    fn complete_stage(&self) {
+        if self.handle.is_none() || self.completed.swap(true, AtomicOrdering::Relaxed) {
+            return;
+        }
+        let text = self
+            .label
+            .lock()
+            .map(|label| label.clone())
+            .unwrap_or_else(|_| "Working".to_string());
+        let width = 28usize;
+        let elapsed = self
+            .stage_started
+            .lock()
+            .map(|started| format_progress_duration(started.elapsed()))
+            .unwrap_or_else(|_| format_progress_duration(self.started.elapsed()));
+        if let Ok(_guard) = self.output_lock.lock() {
+            clear_progress_line();
+            eprintln!(
+                "│ {} {:<18} {} {:>5.1}% {:>10}",
+                color_success("◆"),
+                text,
+                progress_bar_fraction(1, 1, width),
+                100.0,
+                elapsed
+            );
         }
     }
 
     fn finish(mut self, label: &str) {
+        self.complete_stage();
         self.stop();
         if stderr_supports_progress() {
-            eprintln!("│");
             eprintln!(
                 "{} {} — done ({})",
                 color_success("◆"),
                 label,
-                format_elapsed_duration(self.started.elapsed())
+                format_progress_duration(self.started.elapsed())
             );
         }
     }
@@ -1627,31 +1898,31 @@ impl ConsoleFlow {
 
     fn step_done(&self, label: impl AsRef<str>) {
         if self.enabled {
-            eprintln!("│");
             eprintln!("{} {} — done", color_success("◆"), label.as_ref());
         }
     }
 
     fn summary(&self, text: impl AsRef<str>) {
         if self.enabled {
-            eprintln!("│");
             eprintln!("{} {}", color_success("◆"), text.as_ref());
         }
     }
 
     fn detail(&self, text: impl AsRef<str>) {
         if self.enabled {
-            eprintln!("│");
             eprintln!("{} {}", color_info("●"), text.as_ref());
         }
     }
 
+    fn compact_stdout(&self) -> bool {
+        self.enabled && stdout_supports_search_decoration()
+    }
+
     fn done(&self) {
         if self.enabled {
-            eprintln!("│");
             eprintln!(
                 "└ Done in {}",
-                format_elapsed_duration(self.started.elapsed())
+                format_progress_duration(self.started.elapsed())
             );
         }
     }
@@ -1677,6 +1948,29 @@ fn progress_bar(tick: usize, width: usize) -> String {
     out
 }
 
+fn progress_bar_fraction(current: u64, total: u64, width: usize) -> String {
+    let filled = if total == 0 {
+        width
+    } else {
+        ((current.min(total) as u128 * width as u128) / total as u128) as usize
+    };
+    let mut out = String::with_capacity(width + 2);
+    out.push('[');
+    for idx in 0..width {
+        out.push(if idx < filled { '#' } else { '.' });
+    }
+    out.push(']');
+    out
+}
+
+fn progress_percent(current: u64, total: u64) -> f64 {
+    if total == 0 {
+        100.0
+    } else {
+        (current.min(total) as f64 * 100.0) / total as f64
+    }
+}
+
 fn stderr_supports_progress() -> bool {
     std::io::stderr().is_terminal()
         && env::var("TERM").map(|term| term != "dumb").unwrap_or(true)
@@ -1684,8 +1978,20 @@ fn stderr_supports_progress() -> bool {
 }
 
 fn clear_progress_line() {
-    eprint!("\r{}\r", " ".repeat(80));
+    if stdout_supports_ansi() {
+        eprint!("\r\x1b[K");
+    } else {
+        eprint!("\r{}\r", " ".repeat(120));
+    }
     let _ = std::io::stderr().flush();
+}
+
+fn clear_progress_line_suffix() {
+    if stdout_supports_ansi() {
+        eprint!("\x1b[K");
+    } else {
+        eprint!("{}", " ".repeat(16));
+    }
 }
 
 fn color_progress(text: &str) -> String {
@@ -1716,6 +2022,10 @@ fn format_elapsed_duration(elapsed: Duration) -> String {
     format_elapsed_secs(elapsed.as_secs_f64())
 }
 
+fn format_progress_duration(elapsed: Duration) -> String {
+    format!("{:.3}s", elapsed.as_secs_f64())
+}
+
 fn format_elapsed_secs(secs: f64) -> String {
     if secs > 5.0 {
         format!("{secs:.3}s")
@@ -1742,6 +2052,20 @@ fn format_count(value: u64) -> String {
         out.push(ch);
     }
     out.chars().rev().collect()
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.3} {} ({} bytes)", UNITS[unit], format_count(bytes))
 }
 
 fn stderr_supports_color() -> bool {
@@ -1771,14 +2095,18 @@ fn command_index(args: &[String]) -> Result<i32> {
         &mut scanned,
         &mut skipped,
         Some(&mut timings),
+        progress.as_active(),
     )?;
+    progress.set_indeterminate("Writing index");
+    let path = index_path(&cfg.root);
     let write_timer = Instant::now();
-    save_index_profiled(&index, &index_path(&cfg.root), Some(&mut timings))?;
+    save_index_profiled_with_progress(&index, &path, Some(&mut timings), progress.as_active())?;
     remove_delta_dir(&cfg.root)?;
     let state_timer = Instant::now();
     save_index_state(&cfg.root)?;
     timings.write_state += state_timer.elapsed().as_secs_f64();
     timings.write += write_timer.elapsed().as_secs_f64();
+    let index_size = index_storage_size(&cfg.root, &path);
     let elapsed = timer.elapsed().as_secs_f64();
     progress.finish("Indexed code");
     flow.summary(format!(
@@ -1786,27 +2114,32 @@ fn command_index(args: &[String]) -> Result<i32> {
         format_count(index.files.len() as u64)
     ));
     flow.detail(format!(
-        "{} scanned, {} skipped in {}",
+        "{} scanned, {} skipped",
         format_count(scanned),
-        format_count(skipped),
-        format_elapsed_secs(elapsed)
+        format_count(skipped)
     ));
-    flow.detail(timing_summary(&timings));
+    flow.detail(format!("index size {}", format_bytes(index_size)));
     flow.done();
-    println!(
-        "indexed {} files ({} skipped, {} scanned) in {}",
-        index.files.len(),
-        skipped,
-        scanned,
-        format_elapsed_secs(elapsed)
-    );
-    print_timings(&timings);
+    if !flow.compact_stdout() {
+        println!(
+            "indexed {} files ({} skipped, {} scanned) in {}",
+            index.files.len(),
+            skipped,
+            scanned,
+            format_elapsed_secs(elapsed)
+        );
+        print_timings(&timings);
+    }
     if options.profile {
         print_index_profile(&timings);
     }
     println!("root: {}", display_path(&cfg.root));
-    println!("index: {}", display_path(&index_path(&cfg.root)));
-    invalidate_search_daemon_for_root(&cfg.root);
+    println!("index: {}", display_path(&path));
+    if !flow.compact_stdout() {
+        println!("index_size: {}", format_bytes(index_size));
+    }
+    drop(_lock);
+    refresh_or_start_search_daemon_after_index(&cfg.root)?;
     std::mem::forget(index);
     Ok(0)
 }
@@ -1833,23 +2166,7 @@ fn command_update(args: &[String]) -> Result<i32> {
     timings.open_index += open_timer.elapsed().as_secs_f64();
     let index = if let Some(ref old_index) = old {
         if old_index.config_hash == cfg.hash {
-            if !options.force_scan
-                && !options.git_update
-                && index_state_recently_synced(&cfg.root, &path).unwrap_or(false)
-            {
-                return update_from_recent_state(
-                    &cfg,
-                    &path,
-                    old_index.file_count,
-                    &timer,
-                    &mut timings,
-                    progress,
-                    &flow,
-                    options.profile,
-                );
-            }
-            let try_git_update =
-                !options.force_scan && (options.git_update || is_git_root(&cfg.root)?);
+            let try_git_update = !options.force_scan && options.git_update;
             if try_git_update {
                 let include_untracked = true;
                 let git_timer = Instant::now();
@@ -1866,14 +2183,15 @@ fn command_update(args: &[String]) -> Result<i32> {
                             format_count(old_index.file_count as u64)
                         ));
                         flow.detail("0 changed by git");
-                        flow.detail(timing_summary(&timings));
                         flow.done();
-                        println!(
-                            "updated {} files (0 changed by git) in {}",
-                            old_index.file_count,
-                            format_elapsed_duration(timer.elapsed())
-                        );
-                        print_timings(&timings);
+                        if !flow.compact_stdout() {
+                            println!(
+                                "updated {} files (0 changed by git) in {}",
+                                old_index.file_count,
+                                format_elapsed_duration(timer.elapsed())
+                            );
+                            print_timings(&timings);
+                        }
                         if options.profile {
                             print_index_profile(&timings);
                         }
@@ -1912,27 +2230,27 @@ fn command_update(args: &[String]) -> Result<i32> {
                             format_count(stats.updated as u64),
                             format_count(stats.removed as u64)
                         ));
-                        flow.detail(timing_summary(&timings));
                         flow.done();
-                        println!(
-                            "updated {} files ({} reused, {} added, {} modified, {} removed, {} skipped, {} scanned) in {}",
-                            visible_count,
-                            stats.reused,
-                            stats.added,
-                            stats.updated,
-                            stats.removed,
-                            skipped,
-                            scanned,
-                            format_elapsed_secs(elapsed)
-                        );
-                        print_timings(&timings);
+                        if !flow.compact_stdout() {
+                            println!(
+                                "updated {} files ({} reused, {} added, {} modified, {} removed, {} skipped, {} scanned) in {}",
+                                visible_count,
+                                stats.reused,
+                                stats.added,
+                                stats.updated,
+                                stats.removed,
+                                skipped,
+                                scanned,
+                                format_elapsed_secs(elapsed)
+                            );
+                            print_timings(&timings);
+                        }
                         if options.profile {
                             print_index_profile(&timings);
                         }
                         println!("root: {}", display_path(&cfg.root));
                         println!("index: {}", display_path(&path));
                         println!("delta: {}", display_path(&delta_dir(&cfg.root)));
-                        invalidate_search_daemon_for_root(&cfg.root);
                         return Ok(0);
                     }
                     None => {
@@ -1966,6 +2284,7 @@ fn command_update(args: &[String]) -> Result<i32> {
                 &mut scanned,
                 &mut skipped,
                 Some(&mut timings),
+                progress.as_active(),
             )?
         }
     } else {
@@ -1975,16 +2294,19 @@ fn command_update(args: &[String]) -> Result<i32> {
             &mut scanned,
             &mut skipped,
             Some(&mut timings),
+            progress.as_active(),
         )?
     };
     drop(old);
+    progress.set_indeterminate("Writing index");
     let write_timer = Instant::now();
-    save_index_profiled(&index, &path, Some(&mut timings))?;
+    save_index_profiled_with_progress(&index, &path, Some(&mut timings), progress.as_active())?;
     remove_delta_dir(&cfg.root)?;
     let state_timer = Instant::now();
     save_index_state(&cfg.root)?;
     timings.write_state += state_timer.elapsed().as_secs_f64();
     timings.write += write_timer.elapsed().as_secs_f64();
+    let index_size = index_storage_size(&cfg.root, &path);
     let elapsed = timer.elapsed().as_secs_f64();
     progress.finish("Indexed code");
     flow.summary(format!(
@@ -1992,27 +2314,32 @@ fn command_update(args: &[String]) -> Result<i32> {
         format_count(index.files.len() as u64)
     ));
     flow.detail(format!(
-        "{} scanned, {} skipped in {}",
+        "{} scanned, {} skipped",
         format_count(scanned),
-        format_count(skipped),
-        format_elapsed_secs(elapsed)
+        format_count(skipped)
     ));
-    flow.detail(timing_summary(&timings));
+    flow.detail(format!("index size {}", format_bytes(index_size)));
     flow.done();
-    println!(
-        "indexed {} files ({} skipped, {} scanned) in {}",
-        index.files.len(),
-        skipped,
-        scanned,
-        format_elapsed_secs(elapsed)
-    );
-    print_timings(&timings);
+    if !flow.compact_stdout() {
+        println!(
+            "indexed {} files ({} skipped, {} scanned) in {}",
+            index.files.len(),
+            skipped,
+            scanned,
+            format_elapsed_secs(elapsed)
+        );
+        print_timings(&timings);
+    }
     if options.profile {
         print_index_profile(&timings);
     }
     println!("root: {}", display_path(&cfg.root));
     println!("index: {}", display_path(&path));
-    invalidate_search_daemon_for_root(&cfg.root);
+    if !flow.compact_stdout() {
+        println!("index_size: {}", format_bytes(index_size));
+    }
+    drop(_lock);
+    refresh_or_start_search_daemon_after_index(&cfg.root)?;
     std::mem::forget(index);
     Ok(0)
 }
@@ -2035,6 +2362,7 @@ fn update_from_filesystem_scan(
         let state_timer = Instant::now();
         save_index_state(&cfg.root)?;
         timings.write_state += state_timer.elapsed().as_secs_f64();
+        let index_size = index_storage_size(&cfg.root, path);
         let elapsed = timer.elapsed().as_secs_f64();
         progress.finish("Index already current");
         flow.summary(format!(
@@ -2042,27 +2370,31 @@ fn update_from_filesystem_scan(
             format_count(visible_before as u64)
         ));
         flow.detail(format!(
-            "{} scanned, {} skipped in {}",
+            "{} scanned, {} skipped",
             format_count(scanned),
-            format_count(skipped),
-            format_elapsed_secs(elapsed)
+            format_count(skipped)
         ));
-        flow.detail(timing_summary(timings));
+        flow.detail(format!("index size {}", format_bytes(index_size)));
         flow.done();
-        println!(
-            "updated {} files ({} reused, 0 added, 0 modified, 0 removed, {} skipped, {} scanned) in {}",
-            visible_before,
-            visible_before,
-            skipped,
-            scanned,
-            format_elapsed_secs(elapsed)
-        );
-        print_timings(timings);
+        if !flow.compact_stdout() {
+            println!(
+                "updated {} files ({} reused, 0 added, 0 modified, 0 removed, {} skipped, {} scanned) in {}",
+                visible_before,
+                visible_before,
+                skipped,
+                scanned,
+                format_elapsed_secs(elapsed)
+            );
+            print_timings(timings);
+        }
         if options.profile {
             print_index_profile(timings);
         }
         println!("root: {}", display_path(&cfg.root));
         println!("index: {}", display_path(path));
+        if !flow.compact_stdout() {
+            println!("index_size: {}", format_bytes(index_size));
+        }
         return Ok(0);
     }
 
@@ -2096,6 +2428,7 @@ fn update_from_filesystem_scan(
     }
 
     let elapsed = timer.elapsed().as_secs_f64();
+    let index_size = index_storage_size(&cfg.root, path);
     let visible_count = stats.reused + stats.updated + stats.added;
     progress.finish("Updated index");
     flow.summary(format!(
@@ -2110,67 +2443,37 @@ fn update_from_filesystem_scan(
         format_count(stats.removed as u64)
     ));
     flow.detail(format!(
-        "{} scanned, {} skipped in {}",
+        "{} scanned, {} skipped",
         format_count(scanned),
-        format_count(skipped),
-        format_elapsed_secs(elapsed)
+        format_count(skipped)
     ));
-    flow.detail(timing_summary(timings));
+    flow.detail(format!("index size {}", format_bytes(index_size)));
     flow.done();
-    println!(
-        "updated {} files ({} reused, {} added, {} modified, {} removed, {} skipped, {} scanned) in {}",
-        visible_count,
-        stats.reused,
-        stats.added,
-        stats.updated,
-        stats.removed,
-        skipped,
-        scanned,
-        format_elapsed_secs(elapsed)
-    );
-    print_timings(timings);
+    if !flow.compact_stdout() {
+        println!(
+            "updated {} files ({} reused, {} added, {} modified, {} removed, {} skipped, {} scanned) in {}",
+            visible_count,
+            stats.reused,
+            stats.added,
+            stats.updated,
+            stats.removed,
+            skipped,
+            scanned,
+            format_elapsed_secs(elapsed)
+        );
+        print_timings(timings);
+    }
     if options.profile {
         print_index_profile(timings);
     }
     println!("root: {}", display_path(&cfg.root));
     println!("index: {}", display_path(path));
+    if !flow.compact_stdout() {
+        println!("index_size: {}", format_bytes(index_size));
+    }
     if stats.added != 0 || stats.updated != 0 || stats.removed != 0 {
         println!("delta: {}", display_path(&delta_dir(&cfg.root)));
-        invalidate_search_daemon_for_root(&cfg.root);
     }
-    Ok(0)
-}
-
-fn update_from_recent_state(
-    cfg: &ProjectConfig,
-    path: &Path,
-    file_count: usize,
-    timer: &Instant,
-    timings: &mut Timings,
-    progress: ProgressLine,
-    flow: &ConsoleFlow,
-    profile: bool,
-) -> Result<i32> {
-    let state_timer = Instant::now();
-    save_index_state(&cfg.root)?;
-    timings.write_state += state_timer.elapsed().as_secs_f64();
-    let elapsed = timer.elapsed().as_secs_f64();
-    progress.finish("Index already current");
-    flow.summary(format!("Checked {}", format_count(file_count as u64)));
-    flow.detail("recent sync state; no filesystem scan");
-    flow.detail(timing_summary(timings));
-    flow.done();
-    println!(
-        "updated {} files (recent sync state) in {}",
-        file_count,
-        format_elapsed_secs(elapsed)
-    );
-    print_timings(timings);
-    if profile {
-        print_index_profile(timings);
-    }
-    println!("root: {}", display_path(&cfg.root));
-    println!("index: {}", display_path(path));
     Ok(0)
 }
 
@@ -2226,12 +2529,15 @@ fn sync_index_before_service(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<
             &mut scanned,
             &mut skipped,
             Some(&mut timings),
+            progress.as_active(),
         )?;
+        progress.set_indeterminate("Writing index");
         let write_timer = Instant::now();
-        save_index(&index, &path)?;
+        save_index_with_progress(&index, &path, progress.as_active())?;
         remove_delta_dir(&cfg.root)?;
         save_index_state(&cfg.root)?;
         timings.write += write_timer.elapsed().as_secs_f64();
+        let index_size = index_storage_size(&cfg.root, &path);
         append_project_log(
             &cfg.root,
             &format!(
@@ -2249,12 +2555,11 @@ fn sync_index_before_service(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<
             format_count(index.files.len() as u64)
         ));
         flow.detail(format!(
-            "{} scanned, {} skipped in {}",
+            "{} scanned, {} skipped",
             format_count(scanned),
-            format_count(skipped),
-            format_elapsed_duration(timer.elapsed())
+            format_count(skipped)
         ));
-        flow.detail(timing_summary(&timings));
+        flow.detail(format!("index size {}", format_bytes(index_size)));
         std::mem::forget(index);
         return Ok(());
     }
@@ -2265,6 +2570,7 @@ fn sync_index_before_service(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<
         collect_filesystem_changes(cfg, &options, &mut scanned, &mut skipped, &mut timings)?;
     if changes.is_empty() {
         save_index_state(&cfg.root)?;
+        let index_size = index_storage_size(&cfg.root, &path);
         append_project_log(
             &cfg.root,
             &format!(
@@ -2283,12 +2589,11 @@ fn sync_index_before_service(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<
             format_count(visible_before as u64)
         ));
         flow.detail(format!(
-            "{} scanned, {} skipped in {}",
+            "{} scanned, {} skipped",
             format_count(scanned),
-            format_count(skipped),
-            format_elapsed_duration(timer.elapsed())
+            format_count(skipped)
         ));
-        flow.detail(timing_summary(&timings));
+        flow.detail(format!("index size {}", format_bytes(index_size)));
         return Ok(());
     }
 
@@ -2314,6 +2619,7 @@ fn sync_index_before_service(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<
         save_index_state(&cfg.root)?;
         timings.write += write_timer.elapsed().as_secs_f64();
     }
+    let index_size = index_storage_size(&cfg.root, &path);
     append_project_log(
         &cfg.root,
         &format!(
@@ -2341,7 +2647,7 @@ fn sync_index_before_service(cfg: &ProjectConfig, flow: &ConsoleFlow) -> Result<
         format_count(stats.updated as u64),
         format_count(stats.removed as u64)
     ));
-    flow.detail(timing_summary(&timings));
+    flow.detail(format!("index size {}", format_bytes(index_size)));
     Ok(())
 }
 
@@ -2359,11 +2665,28 @@ fn command_list_projects(_args: &[String]) -> Result<i32> {
     records.sort_by(|a, b| a.1.root.cmp(&b.1.root));
     for (path, record) in records {
         let alive = process_alive(record.pid);
+        let daemon = read_search_daemon_record(&search_daemon_record_path(&record.root)).ok();
+        let service = daemon
+            .as_ref()
+            .map(|record| record.service_name.as_str())
+            .unwrap_or("unknown");
+        let protocol = daemon
+            .as_ref()
+            .map(|record| record.protocol.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let capabilities = daemon
+            .as_ref()
+            .map(SearchDaemonRecord::capabilities_text)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
         println!(
-            "{}\tpid={}\talive={}\t{}",
+            "{}\tpid={}\talive={}\tservice={}\tprotocol={}\tcapabilities={}\t{}",
             record.id,
             record.pid,
             alive,
+            service,
+            protocol,
+            capabilities,
             display_path(&record.root)
         );
         if !alive {
@@ -2487,6 +2810,37 @@ fn command_stop_projects(args: &[String]) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+fn stop_all_project_services_quiet() -> Result<usize> {
+    fs::create_dir_all(project_registry_dir())?;
+    let mut stopped = HashSet::default();
+    let mut count = 0usize;
+    for entry in fs::read_dir(project_registry_dir())?.flatten() {
+        let path = entry.path();
+        if !path.extension().is_some_and(|ext| ext == "project") {
+            continue;
+        }
+        let Ok(record) = read_project_record(&path) else {
+            let _ = fs::remove_file(path);
+            continue;
+        };
+        if process_alive(record.pid)
+            && record.pid != std::process::id()
+            && stopped.insert(record.pid)
+        {
+            stop_process(record.pid);
+            count += 1;
+        }
+        let _ = fs::remove_file(path);
+        let _ = stop_search_daemon_for_root(&record.root, &mut stopped);
+        let _ = append_project_log(
+            &record.root,
+            &format!("project-service-stop pid={} reason=install", record.pid),
+        );
+    }
+    count += stop_stale_daemon_processes(&mut stopped);
+    Ok(count)
 }
 
 fn stop_target_roots(target: &Path) -> Vec<PathBuf> {
@@ -2787,6 +3141,10 @@ fn command_install(args: &[String]) -> Result<i32> {
     let tool_path = dir.join(executable_name("istool"));
     let exe_path = dir.join(executable_name("indexsearch"));
     let alias_path = dir.join(executable_name("is"));
+    let stopped = stop_all_project_services_quiet()?;
+    if stopped != 0 {
+        println!("stopped {stopped} running project service(s) before install");
+    }
     #[cfg(windows)]
     let installed_backend_path = {
         let versioned_daemon_path = dir.join(executable_name(&format!(
@@ -3430,6 +3788,7 @@ fn flush_watch_batch(cfg: &ProjectConfig, paths: &HashSet<String>) -> Result<boo
             &mut scanned,
             &mut skipped,
             Some(&mut timings),
+            None,
         )?;
         let write_timer = Instant::now();
         save_index(&index, &index_path(&cfg.root))?;
@@ -3583,9 +3942,10 @@ fn command_compact(args: &[String]) -> Result<i32> {
     }
     let deltas = load_deltas(&cfg.root)?;
     if deltas.is_empty() {
+        let index_size = index_storage_size(&cfg.root, &path);
         progress.finish("No deltas to compact");
         flow.summary("Compacted 0 delta indexes");
-        flow.detail(timing_summary(&timings));
+        flow.detail(format!("index size {}", format_bytes(index_size)));
         flow.done();
         println!(
             "compacted 0 delta indexes in {}",
@@ -3597,6 +3957,7 @@ fn command_compact(args: &[String]) -> Result<i32> {
         }
         println!("root: {}", display_path(&cfg.root));
         println!("index: {}", display_path(&path));
+        println!("index_size: {}", format_bytes(index_size));
         return Ok(0);
     }
     let process_timer = Instant::now();
@@ -3610,6 +3971,7 @@ fn command_compact(args: &[String]) -> Result<i32> {
     retire_delta_dir(&cfg.root)?;
     save_index_state(&cfg.root)?;
     timings.write += write_timer.elapsed().as_secs_f64();
+    let index_size = index_storage_size(&cfg.root, &path);
     progress.finish("Compacted index");
     flow.summary(format!(
         "Compacted {} files into base index",
@@ -3619,7 +3981,7 @@ fn command_compact(args: &[String]) -> Result<i32> {
         "{} delta indexes merged",
         format_count(delta_count as u64)
     ));
-    flow.detail(timing_summary(&timings));
+    flow.detail(format!("index size {}", format_bytes(index_size)));
     flow.done();
     println!(
         "compacted {} files into base index in {}",
@@ -3632,6 +3994,9 @@ fn command_compact(args: &[String]) -> Result<i32> {
     }
     println!("root: {}", display_path(&cfg.root));
     println!("index: {}", display_path(&path));
+    println!("index_size: {}", format_bytes(index_size));
+    drop(_lock);
+    refresh_search_daemon_after_base_index_replaced(&cfg.root, false)?;
     std::mem::forget(compacted);
     Ok(0)
 }
@@ -3771,14 +4136,6 @@ fn stop_services_for_root(root: &Path) -> Result<usize> {
     Ok(stopped.len())
 }
 
-fn invalidate_search_daemon_for_root(root: &Path) {
-    let path = search_daemon_record_path(root);
-    if let Ok(record) = read_search_daemon_record(&path) {
-        stop_process(record.pid);
-    }
-    let _ = fs::remove_file(path);
-}
-
 fn same_clean_root(left: &Path, right: &Path) -> bool {
     fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf())
         == fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf())
@@ -3793,6 +4150,9 @@ fn command_status(args: &[String]) -> Result<i32> {
     let _lock = acquire_shared_lock(&cfg.root)?;
     let path = index_path(&cfg.root);
     let loaded = MappedIndex::open(&path);
+    if stdout_supports_search_decoration() {
+        return command_status_pretty(&cfg, &path, loaded);
+    }
     println!("root: {}", display_path(&cfg.root));
     println!(
         "config: {}",
@@ -3805,10 +4165,12 @@ fn command_status(args: &[String]) -> Result<i32> {
     match loaded {
         Ok(index) => {
             let deltas = load_deltas(&cfg.root).unwrap_or_default();
+            let index_size = index_storage_size(&cfg.root, &path);
             let visible_files = current_visible_paths(&cfg.root)
                 .map(|paths| paths.len())
                 .unwrap_or(index.file_count);
             println!("exists: true");
+            println!("index_size: {}", format_bytes(index_size));
             println!("files: {}", visible_files);
             println!("base_files: {}", index.file_count);
             println!("trigrams: {}", index.posting_count);
@@ -3821,6 +4183,73 @@ fn command_status(args: &[String]) -> Result<i32> {
             Ok(1)
         }
     }
+}
+
+fn command_status_pretty(
+    cfg: &ProjectConfig,
+    path: &Path,
+    loaded: Result<MappedIndex>,
+) -> Result<i32> {
+    println!("{:<9} {}", "root", display_path(&cfg.root));
+    println!(
+        "{:<9} {}",
+        "config",
+        cfg.path
+            .as_ref()
+            .map(|p| display_path(p))
+            .unwrap_or_default()
+    );
+    println!("{:<9} {}", "index", display_path(path));
+    match loaded {
+        Ok(index) => {
+            let deltas = load_deltas(&cfg.root).unwrap_or_default();
+            let index_size = index_storage_size(&cfg.root, path);
+            let visible_files = current_visible_paths(&cfg.root)
+                .map(|paths| paths.len())
+                .unwrap_or(index.file_count);
+            println!("{:<9} ready", "state");
+            println!(
+                "{:<9} {} visible, {} base",
+                "files",
+                format_count(visible_files as u64),
+                format_count(index.file_count as u64)
+            );
+            println!(
+                "{:<9} {}",
+                "trigrams",
+                format_count(index.posting_count as u64)
+            );
+            println!("{:<9} {}", "deltas", format_count(deltas.len() as u64));
+            println!("{:<9} {}", "size", format_bytes(index_size));
+            println!(
+                "{:<9} {}",
+                "fresh",
+                if index.config_hash == cfg.hash {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
+            Ok(0)
+        }
+        Err(_) => {
+            println!("{:<9} missing", "state");
+            Ok(1)
+        }
+    }
+}
+
+fn index_storage_size(root: &Path, index_path: &Path) -> u64 {
+    let base_size = fs::metadata(index_path)
+        .ok()
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    let delta_size = delta_files(root)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|path| fs::metadata(path).ok().map(|meta| meta.len()))
+        .sum::<u64>();
+    base_size + delta_size
 }
 
 fn command_search(args: &[String]) -> Result<i32> {
@@ -3916,20 +4345,19 @@ fn command_search(args: &[String]) -> Result<i32> {
         let progress = ProgressLine::start("Indexing code");
         let mut scanned = 0;
         let mut skipped = 0;
-        let mut timings = Timings::default();
         let built = build_index(
             &cfg,
             &options,
             &mut scanned,
             &mut skipped,
-            Some(&mut timings),
+            None,
+            progress.as_active(),
         )?;
-        progress.update("Writing index");
-        let write_timer = Instant::now();
-        save_index(&built, &path)?;
+        progress.set_indeterminate("Writing index");
+        save_index_with_progress(&built, &path, progress.as_active())?;
         remove_delta_dir(&cfg.root)?;
         save_index_state(&cfg.root)?;
-        timings.write += write_timer.elapsed().as_secs_f64();
+        let index_size = index_storage_size(&cfg.root, &path);
         progress.finish("Indexed code");
         flow.summary(format!(
             "Indexed {} files",
@@ -3940,7 +4368,7 @@ fn command_search(args: &[String]) -> Result<i32> {
             format_count(scanned),
             format_count(skipped)
         ));
-        flow.detail(timing_summary(&timings));
+        flow.detail(format!("index size {}", format_bytes(index_size)));
         flow.done();
         std::mem::forget(built);
         index = MappedIndex::open(&path);
@@ -4595,6 +5023,69 @@ fn start_search_daemon(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn start_search_daemon_from_current_index(root: &Path) -> Result<()> {
+    spawn_search_daemon_detached(root, WatchOptions::default())?;
+    wait_for_search_daemon_ready(root)
+}
+
+fn wait_for_search_daemon_ready(root: &Path) -> Result<()> {
+    let start = Instant::now();
+    while start.elapsed() < SEARCH_DAEMON_START_TIMEOUT {
+        if let Some(record) = read_valid_search_daemon_record(root, None)? {
+            if record.supports_search() {
+                return Ok(());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    bail!(
+        "project service did not become ready for {}",
+        display_path(root)
+    )
+}
+
+fn refresh_or_start_search_daemon_after_index(root: &Path) -> Result<()> {
+    refresh_search_daemon_after_base_index_replaced(root, true)
+}
+
+fn refresh_search_daemon_after_base_index_replaced(
+    root: &Path,
+    start_if_missing: bool,
+) -> Result<()> {
+    if let Some(record) = read_valid_search_daemon_record(root, None)? {
+        if record.supports_update() {
+            let args = vec![
+                SEARCH_DAEMON_CONTROL_ARG.to_string(),
+                SEARCH_DAEMON_CONTROL_UPDATE.to_string(),
+            ];
+            match request_search_daemon_quiet(&record, &args) {
+                Ok(0) => return Ok(()),
+                Ok(code) => {
+                    let _ = append_project_log(
+                        root,
+                        &format!("project-service-refresh-failed code={code}"),
+                    );
+                }
+                Err(err) => {
+                    let _ = append_project_log(
+                        root,
+                        &format!(
+                            "project-service-refresh-failed error={}",
+                            log_quote(&format!("{err:#}"), 512)
+                        ),
+                    );
+                }
+            }
+        }
+        stop_process(record.pid);
+        let _ = fs::remove_file(search_daemon_record_path(root));
+    }
+    if start_if_missing {
+        start_search_daemon_from_current_index(root)?;
+    }
+    Ok(())
+}
+
 fn command_search_daemon(args: &[String]) -> Result<i32> {
     let mut detach = false;
     let mut skip_startup_sync = false;
@@ -5149,7 +5640,7 @@ fn handle_search_daemon_client(
         } else {
             None
         };
-        sync_daemon_index_before_search(record, watch_state)?;
+        sync_daemon_index_before_search(record, &index_state, watch_state)?;
         if let Some(sync_timer) = sync_timer {
             profile.record("daemon_sync_before_search", sync_timer.elapsed());
         }
@@ -5207,14 +5698,69 @@ fn is_daemon_update_request(args: &[String]) -> bool {
 }
 
 fn sync_daemon_index_before_search(
-    record: &SearchDaemonRecord,
+    _record: &SearchDaemonRecord,
+    _index_state: &Arc<RwLock<MappedIndex>>,
     watch_state: &WatchState,
 ) -> Result<()> {
     if watch_state.restart_required.load(AtomicOrdering::Relaxed) {
         bail!("project configuration changed; project service is restarting");
     }
-    let _ = record;
     Ok(())
+}
+
+fn reload_daemon_index_if_changed(
+    record: &SearchDaemonRecord,
+    index_state: &Arc<RwLock<MappedIndex>>,
+    watch_state: &WatchState,
+) -> Result<bool> {
+    if watch_state.restart_required.load(AtomicOrdering::Relaxed) {
+        bail!("project configuration changed; project service is restarting");
+    }
+    let _lock = acquire_shared_lock(&record.root)?;
+    let path = index_path(&record.root);
+    let meta = match fs::metadata(&path) {
+        Ok(meta) => meta,
+        Err(err) => {
+            watch_state
+                .restart_required
+                .store(true, AtomicOrdering::Relaxed);
+            bail!("project index unavailable; project service is restarting: {err}");
+        }
+    };
+    let mapped_mtime = mtime_ns(&meta);
+    let current_hash = {
+        let index = index_state.read().unwrap();
+        if index.index_size == meta.len() && index.index_mtime == mapped_mtime {
+            return Ok(false);
+        }
+        index.config_hash
+    };
+    let new_index = MappedIndex::open(&path)?;
+    let cfg = load_config(&record.root)?;
+    if new_index.config_hash != cfg.hash || new_index.config_hash != current_hash {
+        watch_state
+            .restart_required
+            .store(true, AtomicOrdering::Relaxed);
+        bail!("project configuration changed; project service is restarting");
+    }
+    let file_count = new_index.file_count;
+    let index_size = new_index.index_size;
+    {
+        let mut index = index_state.write().unwrap();
+        if index.index_size == new_index.index_size && index.index_mtime == new_index.index_mtime {
+            return Ok(false);
+        }
+        *index = new_index;
+    }
+    let _ = refresh_search_daemon_record(record);
+    append_project_log(
+        &record.root,
+        &format!(
+            "project-service-reload reason=index-replaced files={} index_size={}",
+            file_count, index_size
+        ),
+    )?;
+    Ok(true)
 }
 
 fn handle_search_daemon_update_client(
@@ -5223,18 +5769,28 @@ fn handle_search_daemon_update_client(
     index_state: &Arc<RwLock<MappedIndex>>,
     watch_state: &WatchState,
 ) -> Result<()> {
+    let reload_result = reload_daemon_index_if_changed(record, index_state, watch_state);
     write_search_daemon_response_begin(stream)?;
+    if let Err(err) = reload_result {
+        let message = format!("indexsearch: {err:#}\n");
+        write_search_daemon_chunk(stream, SEARCH_DAEMON_STDERR_FRAME, message.as_bytes())?;
+        return write_search_daemon_done(stream, 2);
+    }
     let cfg = load_config(&record.root)?;
-    let index = index_state.read().unwrap();
-    if cfg.hash != index.config_hash {
+    let config_matches = {
+        let index = index_state.read().unwrap();
+        cfg.hash == index.config_hash
+    };
+    if !config_matches {
         watch_state
             .restart_required
             .store(true, AtomicOrdering::Relaxed);
-        write_search_daemon_error(
+        write_search_daemon_chunk(
             stream,
-            "indexsearch: project configuration changed; project service is restarting\n",
+            SEARCH_DAEMON_STDERR_FRAME,
+            b"indexsearch: project configuration changed; project service is restarting\n",
         )?;
-        return Ok(());
+        return write_search_daemon_done(stream, 2);
     }
     let timer = Instant::now();
     let outcome = flush_watch_state(&cfg, watch_state)?;
@@ -5499,6 +6055,13 @@ fn request_search_daemon(
     Ok(code)
 }
 
+fn request_search_daemon_quiet(record: &SearchDaemonRecord, args: &[String]) -> Result<i32> {
+    let mut stream = SearchDaemonStream::connect(record)?;
+    write_search_daemon_request(&mut stream, record, args)?;
+    stream.send_stdout_fd(record)?;
+    read_search_daemon_response_to_sink(&mut stream)
+}
+
 fn write_search_daemon_request(
     stream: &mut SearchDaemonStream,
     record: &SearchDaemonRecord,
@@ -5599,6 +6162,26 @@ fn read_search_daemon_response_to_stdio(stream: &mut SearchDaemonStream) -> Resu
     }
 }
 
+fn read_search_daemon_response_to_sink(stream: &mut SearchDaemonStream) -> Result<i32> {
+    let mut magic = [0u8; 8];
+    stream.read_exact(&mut magic)?;
+    if &magic != SEARCH_DAEMON_RESPONSE_MAGIC {
+        bail!("invalid search daemon response");
+    }
+    let mut sink = std::io::sink();
+    loop {
+        let mut tag = [0u8; 1];
+        stream.read_exact(&mut tag)?;
+        match tag[0] {
+            SEARCH_DAEMON_STDOUT_FRAME | SEARCH_DAEMON_STDERR_FRAME => {
+                copy_bytes_frame(stream, &mut sink)?
+            }
+            SEARCH_DAEMON_DONE_FRAME => return Ok(read_u32_from_reader(stream)? as i32),
+            _ => bail!("invalid search daemon response frame"),
+        }
+    }
+}
+
 fn refresh_index_for_search(cfg: &ProjectConfig, options: &Options) -> Result<()> {
     let _lock = acquire_exclusive_lock(&cfg.root)?;
     let path = index_path(&cfg.root);
@@ -5613,14 +6196,19 @@ fn refresh_index_for_search(cfg: &ProjectConfig, options: &Options) -> Result<()
         let progress = ProgressLine::start("Indexing code");
         let mut scanned = 0;
         let mut skipped = 0;
-        let mut timings = Timings::default();
-        let built = build_index(cfg, options, &mut scanned, &mut skipped, Some(&mut timings))?;
-        progress.update("Writing index");
-        let write_timer = Instant::now();
-        save_index(&built, &path)?;
+        let built = build_index(
+            cfg,
+            options,
+            &mut scanned,
+            &mut skipped,
+            None,
+            progress.as_active(),
+        )?;
+        progress.set_indeterminate("Writing index");
+        save_index_with_progress(&built, &path, progress.as_active())?;
         remove_delta_dir(&cfg.root)?;
         save_index_state(&cfg.root)?;
-        timings.write += write_timer.elapsed().as_secs_f64();
+        let index_size = index_storage_size(&cfg.root, &path);
         progress.finish("Indexed code");
         flow.summary(format!(
             "Indexed {} files",
@@ -5631,41 +6219,30 @@ fn refresh_index_for_search(cfg: &ProjectConfig, options: &Options) -> Result<()
             format_count(scanned),
             format_count(skipped)
         ));
-        flow.detail(timing_summary(&timings));
+        flow.detail(format!("index size {}", format_bytes(index_size)));
         flow.done();
         std::mem::forget(built);
         return Ok(());
     }
 
-    let Some(changes) = collect_git_changes(&cfg.root, true)? else {
-        return Ok(());
-    };
+    let mut timings = Timings::default();
+    let mut scanned = 0;
+    let mut skipped = 0;
+    let (changes, _) =
+        collect_filesystem_changes(cfg, options, &mut scanned, &mut skipped, &mut timings)?;
     if changes.is_empty() {
         save_index_state(&cfg.root)?;
         return Ok(());
     }
 
-    let mut scanned = 0;
-    let mut skipped = 0;
     let flow = ConsoleFlow::start();
     flow.step_done(format!("Resolved project {}", display_path(&cfg.root)));
     let progress = ProgressLine::start("Updating index");
-    let mut timings = Timings::default();
-    let process_timer = Instant::now();
-    let (delta, meta, stats) = build_delta_index(
-        cfg,
-        options,
-        &changes,
-        &mut scanned,
-        &mut skipped,
-        Some(&mut timings),
-    )?;
-    timings.process += process_timer.elapsed().as_secs_f64();
+    let (delta, meta, stats) =
+        build_delta_index(cfg, options, &changes, &mut scanned, &mut skipped, None)?;
     if stats.added != 0 || stats.updated != 0 || stats.removed != 0 {
         progress.update("Writing update");
-        let write_timer = Instant::now();
         save_delta(&cfg.root, &delta, &meta)?;
-        timings.write += write_timer.elapsed().as_secs_f64();
     }
     save_index_state(&cfg.root)?;
     progress.finish("Updated index");
@@ -5680,7 +6257,6 @@ fn refresh_index_for_search(cfg: &ProjectConfig, options: &Options) -> Result<()
         format_count(stats.updated as u64),
         format_count(stats.removed as u64)
     ));
-    flow.detail(timing_summary(&timings));
     flow.done();
     Ok(())
 }
@@ -6484,16 +7060,23 @@ fn build_index(
     scanned: &mut u64,
     skipped: &mut u64,
     mut timings: Option<&mut Timings>,
+    progress: Option<&ProgressLine>,
 ) -> Result<BuiltIndex> {
+    if let Some(progress) = progress {
+        progress.begin_indeterminate("Scanning files");
+    }
     let scan_timer = Instant::now();
     let entries = scan_indexable_files(cfg, options, scanned, skipped)?;
     if let Some(timings) = timings.as_deref_mut() {
         timings.scan += scan_timer.elapsed().as_secs_f64();
     }
+    if let Some(progress) = progress {
+        progress.set_total("Processing files", processing_progress_total(&entries));
+    }
     let process_timer = Instant::now();
     let index_pool = build_index_thread_pool()?;
     let build_stats = IndexBuildStats::default();
-    let mut built_files = build_index_file_entries(entries, options, &build_stats);
+    let mut built_files = build_index_file_entries(entries, options, &build_stats, progress);
     if let Some(timings) = timings.as_deref_mut() {
         timings.index_cpu_threads = build_stats.cpu_threads.load(AtomicOrdering::Relaxed);
         timings.index_io_threads = build_stats.io_threads.load(AtomicOrdering::Relaxed);
@@ -6524,11 +7107,17 @@ fn build_index(
         timings.compress += ns_to_secs(build_stats.compress_ns.load(AtomicOrdering::Relaxed));
     }
     let sort_timer = Instant::now();
+    if let Some(progress) = progress {
+        progress.set_indeterminate("Sorting files");
+    }
     built_files.files.sort_by_key(|file| file.ordinal);
     if let Some(timings) = timings.as_deref_mut() {
         timings.sort += sort_timer.elapsed().as_secs_f64();
     }
 
+    if let Some(progress) = progress {
+        progress.set_indeterminate("Selecting terms");
+    }
     let fragments_timer = Instant::now();
     let selected_fragments = selected_word_fragments(
         built_files
@@ -6540,13 +7129,23 @@ fn build_index(
         timings.select_fragments += fragments_timer.elapsed().as_secs_f64();
     }
     let postings_timer = Instant::now();
-    let postings = match &index_pool {
-        Some(pool) => pool.install(|| build_postings_parallel(&built_files, &selected_fragments)),
-        None => build_postings_parallel(&built_files, &selected_fragments),
+    let posting_chunks = posting_build_chunk_count(built_files.files.len());
+    if let Some(progress) = progress {
+        progress.set_total("Building postings", posting_chunks as u64);
+    }
+    let posting_build = match &index_pool {
+        Some(pool) => {
+            pool.install(|| build_postings_parallel(&built_files, &selected_fragments, progress))
+        }
+        None => build_postings_parallel(&built_files, &selected_fragments, progress),
     };
     if let Some(timings) = timings.as_deref_mut() {
         timings.postings += postings_timer.elapsed().as_secs_f64();
+        timings.postings_build_chunks += posting_build.build_chunks;
+        timings.postings_merge += posting_build.merge;
+        timings.postings_merge_shards = posting_build.shards as u64;
     }
+    let postings = posting_build.postings;
     let out_files = built_files
         .files
         .into_iter()
@@ -6568,6 +7167,7 @@ fn build_index_file_entries(
     entries: Vec<CurrentFile>,
     options: &Options,
     stats: &IndexBuildStats,
+    progress: Option<&ProgressLine>,
 ) -> BuiltIndexFiles {
     if entries.is_empty() {
         return BuiltIndexFiles::default();
@@ -6598,11 +7198,13 @@ fn build_index_file_entries(
                     files: Vec::with_capacity(worker_file_capacity),
                     ..Default::default()
                 };
+                let mut progressed = 0u64;
                 loop {
                     let read_file = match rx.lock().expect("index receiver poisoned").recv() {
                         Ok(read_file) => read_file,
                         Err(_) => break,
                     };
+                    let progress_units = index_file_progress_units(read_file.bytes.len() as u64);
                     process_index_file(
                         read_file,
                         &mut scratch,
@@ -6611,6 +7213,16 @@ fn build_index_file_entries(
                         count_profile_keys,
                         profile_tokenize_steps,
                     );
+                    if let Some(progress) = progress {
+                        progressed += progress_units;
+                        if progressed >= INDEX_PROCESS_PROGRESS_GRANULARITY {
+                            progress.advance(progressed);
+                            progressed = 0;
+                        }
+                    }
+                }
+                if let Some(progress) = progress {
+                    progress.advance(progressed);
                 }
                 output
             }));
@@ -6623,6 +7235,9 @@ fn build_index_file_entries(
                 for entry in chunk {
                     let read_timer = Instant::now();
                     let Ok(bytes) = read_index_file_bytes(&entry.path, entry.size) else {
+                        if let Some(progress) = progress {
+                            progress.advance(index_file_progress_units(entry.size));
+                        }
                         continue;
                     };
                     stats
@@ -6635,6 +7250,9 @@ fn build_index_file_entries(
                         bytes,
                     };
                     if tx.send(read_file).is_err() {
+                        if let Some(progress) = progress {
+                            progress.advance(index_file_progress_units(entry.size));
+                        }
                         break;
                     }
                 }
@@ -6656,6 +7274,17 @@ fn build_index_file_entries(
         }
         built
     })
+}
+
+fn processing_progress_total(entries: &[CurrentFile]) -> u64 {
+    entries
+        .iter()
+        .map(|entry| index_file_progress_units(entry.size))
+        .sum()
+}
+
+fn index_file_progress_units(size: u64) -> u64 {
+    size.max(1)
 }
 
 fn process_index_file(
@@ -6878,49 +7507,163 @@ fn read_current_file_entry(
     )))
 }
 
+struct PostingBuildResult {
+    postings: HashMap<u32, Vec<u32>>,
+    build_chunks: f64,
+    merge: f64,
+    shards: usize,
+}
+
+struct PostingPartial {
+    shards: Vec<HashMap<u32, Vec<u32>>>,
+}
+
+impl PostingPartial {
+    fn new(shard_count: usize) -> Self {
+        Self {
+            shards: (0..shard_count).map(|_| HashMap::default()).collect(),
+        }
+    }
+
+    fn push(&mut self, key: u32, id: u32) {
+        let shard = posting_key_shard(key, self.shards.len());
+        self.shards[shard]
+            .entry(key)
+            .or_insert_with(Vec::new)
+            .push(id);
+    }
+}
+
 fn build_postings_parallel(
     files: &BuiltIndexFiles,
     selected_fragments: &HashSet<u32>,
-) -> HashMap<u32, Vec<u32>> {
+    progress: Option<&ProgressLine>,
+) -> PostingBuildResult {
     let chunk_files = posting_build_chunk_files();
-    let partials: Vec<HashMap<u32, Vec<u32>>> = files
+    let shard_count = posting_merge_shard_count();
+    let build_timer = Instant::now();
+    let partials: Vec<PostingPartial> = files
         .files
         .par_chunks(chunk_files)
         .enumerate()
         .map(|(chunk_idx, chunk)| {
-            let mut local = HashMap::default();
+            let mut local = PostingPartial::new(shard_count);
             let base_id = chunk_idx * chunk_files;
             for (idx, file) in chunk.iter().enumerate() {
                 let id = (base_id + idx) as u32;
                 for &gram in files.grams(file) {
-                    local.entry(gram).or_insert_with(Vec::new).push(id);
+                    local.push(gram, id);
                 }
                 for &fragment in files.fragments(file) {
                     if selected_fragments.contains(&fragment) {
-                        local.entry(fragment).or_insert_with(Vec::new).push(id);
+                        local.push(fragment, id);
                     }
                 }
+            }
+            if let Some(progress) = progress {
+                progress.advance(1);
             }
             local
         })
         .collect();
+    let build_chunks = build_timer.elapsed().as_secs_f64();
 
+    if let Some(progress) = progress {
+        progress.set_indeterminate("Merging postings");
+    }
+    let merge_timer = Instant::now();
+    let postings = merge_posting_partials(partials, shard_count);
+    PostingBuildResult {
+        postings,
+        build_chunks,
+        merge: merge_timer.elapsed().as_secs_f64(),
+        shards: shard_count,
+    }
+}
+
+fn merge_posting_partials(
+    partials: Vec<PostingPartial>,
+    shard_count: usize,
+) -> HashMap<u32, Vec<u32>> {
+    let partial_count = partials.len();
+    let mut per_shard: Vec<Vec<HashMap<u32, Vec<u32>>>> = (0..shard_count)
+        .map(|_| Vec::with_capacity(partial_count))
+        .collect();
+    for partial in partials {
+        for (idx, shard) in partial.shards.into_iter().enumerate() {
+            if !shard.is_empty() {
+                per_shard[idx].push(shard);
+            }
+        }
+    }
+    let merged_shards: Vec<HashMap<u32, Vec<u32>>> = per_shard
+        .into_par_iter()
+        .map(merge_posting_maps_exact)
+        .collect();
+    let total_keys = merged_shards.iter().map(HashMap::len).sum();
     let mut postings = HashMap::default();
+    postings.reserve(total_keys);
+    for shard in merged_shards {
+        postings.extend(shard);
+    }
+    postings
+}
+
+fn merge_posting_maps_exact(mut partials: Vec<HashMap<u32, Vec<u32>>>) -> HashMap<u32, Vec<u32>> {
+    if partials.len() <= 1 {
+        return partials.pop().unwrap_or_default();
+    }
+    let mut counts: HashMap<u32, usize> = HashMap::default();
+    for partial in &partials {
+        for (&key, ids) in partial {
+            *counts.entry(key).or_insert(0) += ids.len();
+        }
+    }
+    let mut postings = HashMap::default();
+    postings.reserve(counts.len());
+    for (key, count) in counts {
+        postings.insert(key, Vec::with_capacity(count));
+    }
     for partial in partials {
         for (key, mut ids) in partial {
             postings
-                .entry(key)
-                .or_insert_with(Vec::new)
+                .get_mut(&key)
+                .expect("posting count was not reserved")
                 .append(&mut ids);
         }
     }
     postings
 }
 
+fn posting_build_chunk_count(file_count: usize) -> usize {
+    if file_count == 0 {
+        0
+    } else {
+        file_count.div_ceil(posting_build_chunk_files())
+    }
+}
+
 fn posting_build_chunk_files() -> usize {
     thread_count_env("INDEXSEARCH_POSTING_CHUNK_FILES")
         .unwrap_or(POSTING_BUILD_CHUNK_FILES)
         .max(1)
+}
+
+fn posting_merge_shard_count() -> usize {
+    let requested =
+        thread_count_env("INDEXSEARCH_POSTING_MERGE_SHARDS").unwrap_or_else(index_cpu_thread_count);
+    requested
+        .max(1)
+        .next_power_of_two()
+        .min(POSTING_MERGE_MAX_SHARDS)
+}
+
+fn posting_key_shard(key: u32, shard_count: usize) -> usize {
+    if shard_count <= 1 {
+        return 0;
+    }
+    let mixed = (key as usize).wrapping_mul(0x9E37_79B1);
+    mixed & (shard_count - 1)
 }
 
 fn build_delta_index(
@@ -7382,40 +8125,14 @@ fn read_index_state(root: &Path) -> Result<IndexState> {
         };
         if key == "git_head" && !value.is_empty() {
             state.git_head = Some(value.to_string());
-        } else if key == "updated_ns" && !value.is_empty() {
-            state.updated_ns = value.parse().ok();
         }
     }
     Ok(state)
 }
 
-fn index_state_recently_synced(root: &Path, index: &Path) -> Result<bool> {
-    let state = read_index_state(root)?;
-    let Some(updated_ns) = state.updated_ns else {
-        return Ok(false);
-    };
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    if now_ns.saturating_sub(updated_ns) > RECENT_SYNC_NO_SCAN_WINDOW.as_nanos() {
-        return Ok(false);
-    }
-    let state_meta = fs::metadata(state_path(root))?;
-    let index_meta = fs::metadata(index)?;
-    Ok(mtime_ns(&state_meta) >= mtime_ns(&index_meta))
-}
-
 fn save_index_state(root: &Path) -> Result<()> {
     fs::create_dir_all(root.join(INDEX_DIR))?;
     let mut text = String::from("version=1\n");
-    let updated_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    text.push_str("updated_ns=");
-    text.push_str(&updated_ns.to_string());
-    text.push('\n');
     if let Some(head) = current_git_head(root)? {
         text.push_str("git_head=");
         text.push_str(&head);
@@ -7902,13 +8619,39 @@ fn bytecount_newlines(bytes: &[u8]) -> usize {
 }
 
 fn save_index(index: &BuiltIndex, path: &Path) -> Result<()> {
-    save_index_profiled(index, path, None)
+    save_index_profiled_inner(index, path, None, None)
+}
+
+fn save_index_with_progress(
+    index: &BuiltIndex,
+    path: &Path,
+    progress: Option<&ProgressLine>,
+) -> Result<()> {
+    save_index_profiled_inner(index, path, None, progress)
 }
 
 fn save_index_profiled(
     index: &BuiltIndex,
     path: &Path,
+    timings: Option<&mut Timings>,
+) -> Result<()> {
+    save_index_profiled_inner(index, path, timings, None)
+}
+
+fn save_index_profiled_with_progress(
+    index: &BuiltIndex,
+    path: &Path,
+    timings: Option<&mut Timings>,
+    progress: Option<&ProgressLine>,
+) -> Result<()> {
+    save_index_profiled_inner(index, path, timings, progress)
+}
+
+fn save_index_profiled_inner(
+    index: &BuiltIndex,
+    path: &Path,
     mut timings: Option<&mut Timings>,
+    progress: Option<&ProgressLine>,
 ) -> Result<()> {
     fs::create_dir_all(path.parent().context("index path has no parent")?)?;
     let file_name = path
@@ -7998,6 +8741,10 @@ fn save_index_profiled(
         cursor += chunk_extension.bloom_data.len() as u64 + CHUNK_FOOTER_SIZE as u64;
     }
 
+    if let Some(progress) = progress {
+        progress.begin_determinate("Writing index", cursor);
+    }
+    let mut written_progress = 0u64;
     let file = File::create(&tmp_path)?;
     file.set_len(cursor)?;
     let mut writer = BufWriter::with_capacity(1024 * 1024, file);
@@ -8048,16 +8795,29 @@ fn save_index_profiled(
     if let Some(timings) = timings.as_deref_mut() {
         timings.write_header_tables += header_timer.elapsed().as_secs_f64();
     }
+    advance_write_progress(progress, &mut written_progress, postings_data_offset);
     let postings_paths_timer = Instant::now();
     writer.write_all(&posting_data)?;
     writer.write_all(&path_blob)?;
+    advance_write_progress(
+        progress,
+        &mut written_progress,
+        posting_data.len() as u64 + path_blob.len() as u64,
+    );
     if let Some(timings) = timings.as_deref_mut() {
         timings.write_postings_paths += postings_paths_timer.elapsed().as_secs_f64();
     }
     let content_timer = Instant::now();
+    let mut pending_content_progress = 0u64;
     for file in &index.files {
         writer.write_all(&file.compressed_content)?;
+        pending_content_progress += file.compressed_content.len() as u64;
+        if pending_content_progress >= WRITE_PROGRESS_GRANULARITY {
+            advance_write_progress(progress, &mut written_progress, pending_content_progress);
+            pending_content_progress = 0;
+        }
     }
+    advance_write_progress(progress, &mut written_progress, pending_content_progress);
     if let Some(timings) = timings.as_deref_mut() {
         timings.write_content += content_timer.elapsed().as_secs_f64();
     }
@@ -8089,6 +8849,7 @@ fn save_index_profiled(
         write_u64(&mut writer, chunk_posting_data_offset)?;
         write_u64(&mut writer, chunk_blob_offset)?;
     }
+    flush_write_progress(progress, &mut written_progress, cursor);
     if let Some(timings) = timings.as_deref_mut() {
         timings.write_prepare_chunks += chunk_write_timer.elapsed().as_secs_f64();
     }
@@ -8108,6 +8869,24 @@ fn save_index_profiled(
         timings.write_flush_publish += publish_timer.elapsed().as_secs_f64();
     }
     Ok(())
+}
+
+const WRITE_PROGRESS_GRANULARITY: u64 = 8 * 1024 * 1024;
+
+fn advance_write_progress(progress: Option<&ProgressLine>, written: &mut u64, amount: u64) {
+    if amount == 0 {
+        return;
+    }
+    *written = written.saturating_add(amount);
+    if let Some(progress) = progress {
+        progress.advance(amount);
+    }
+}
+
+fn flush_write_progress(progress: Option<&ProgressLine>, written: &mut u64, total: u64) {
+    if total > *written {
+        advance_write_progress(progress, written, total - *written);
+    }
 }
 
 fn save_compacted_index(index: &BuiltIndex, path: &Path) -> Result<()> {
@@ -8154,6 +8933,7 @@ fn publish_compacted_index(compact_path: &Path, path: &Path) -> Result<()> {
 impl MappedIndex {
     fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
+        let meta = file.metadata()?;
         let mmap = unsafe { Mmap::map(&file)? };
         let header = parse_header(&mmap)?;
         let chunk_info = parse_chunk_info(&mmap, header.version)?;
@@ -8161,6 +8941,8 @@ impl MappedIndex {
         let root = PathBuf::from(String::from_utf8_lossy(root_bytes).to_string());
         Ok(Self {
             mmap,
+            index_size: meta.len(),
+            index_mtime: mtime_ns(&meta),
             version: header.version,
             root,
             config_hash: header.config_hash,
@@ -12704,10 +13486,7 @@ fn search_daemon_fingerprint_matches(record: &SearchDaemonRecord) -> bool {
     if record.protocol != SEARCH_DAEMON_PROTOCOL {
         return false;
     }
-    let Ok(index_meta) = fs::metadata(index_path(&record.root)) else {
-        return false;
-    };
-    if index_meta.len() != record.index_size || mtime_ns(&index_meta) != record.index_mtime {
+    if !process_alive(record.pid) {
         return false;
     }
     let Ok(record_exe_meta) = fs::metadata(&record.exe_path) else {
@@ -13095,6 +13874,8 @@ fn append_index_profile<W: Write>(out: &mut W, timings: &Timings) -> Result<()> 
         ("index_sort_files", timings.sort),
         ("index_select_fragments", timings.select_fragments),
         ("index_build_postings", timings.postings),
+        ("index_build_posting_chunks", timings.postings_build_chunks),
+        ("index_merge_postings", timings.postings_merge),
         ("index_process_total", timings.process),
         ("index_write_prepare_files", timings.write_prepare_files),
         (
@@ -13118,6 +13899,7 @@ fn append_index_profile<W: Write>(out: &mut W, timings: &Timings) -> Result<()> 
     let counters = [
         ("index_cpu_threads", timings.index_cpu_threads),
         ("index_io_threads", timings.index_io_threads),
+        ("index_posting_merge_shards", timings.postings_merge_shards),
         ("index_files", timings.indexed_files),
         ("index_bytes", timings.indexed_bytes),
         ("index_gram_keys", timings.gram_keys),

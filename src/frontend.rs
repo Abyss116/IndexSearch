@@ -120,7 +120,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         return run_backend_search_help();
     }
     if first.is_some_and(|arg| matches!(arg, "-V" | "--version")) {
-        println!("indexsearch {}", env!("CARGO_PKG_VERSION"));
+        println!("{} {}", frontend_command_name(), env!("CARGO_PKG_VERSION"));
         return Ok(0);
     }
     let total_timer = Instant::now();
