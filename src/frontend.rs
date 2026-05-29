@@ -6,8 +6,6 @@ use std::net::{SocketAddr, TcpStream};
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-#[cfg(windows)]
-use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -24,7 +22,14 @@ const STDERR_FRAME: u8 = 2;
 const DONE_FRAME: u8 = 3;
 const CONTROL_FALLBACK_CODE: i32 = 75;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(20);
+#[cfg(windows)]
+const START_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(not(windows))]
 const START_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(windows)]
+const FRAME_COPY_BUFFER_SIZE: usize = 256 * 1024;
+#[cfg(not(windows))]
+const FRAME_COPY_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Default)]
 struct FrontendProfile {
@@ -73,6 +78,12 @@ impl FrontendProfile {
 
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--__indexsearch-frontend-noop")
+    {
+        return;
+    }
     match run(&args) {
         Ok(code) => std::process::exit(code),
         Err(message) => {
@@ -830,63 +841,13 @@ fn send_stdout_fd(stream: &UnixStream) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn send_stdout_handle(stream: &mut TcpStream, record: &DaemonRecord) -> io::Result<()> {
-    let handle = if windows_direct_stdout_enabled() {
-        duplicate_stdout_for_process(record.pid)
-            .map(|handle| handle as usize as u64)
-            .unwrap_or(0)
-    } else {
-        0
-    };
-    stream.write_all(&handle.to_le_bytes())
+fn send_stdout_handle(stream: &mut TcpStream, _record: &DaemonRecord) -> io::Result<()> {
+    stream.write_all(&0u64.to_le_bytes())
 }
 
 #[cfg(not(windows))]
 fn send_stdout_handle(_stream: &mut TcpStream, _record: &DaemonRecord) -> io::Result<()> {
     Ok(())
-}
-
-#[cfg(windows)]
-fn duplicate_stdout_for_process(pid: u32) -> io::Result<RawHandle> {
-    use std::ptr;
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
-    };
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE,
-    };
-
-    unsafe {
-        let target_process = OpenProcess(PROCESS_DUP_HANDLE, 0, pid);
-        if target_process.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        let mut target_handle: HANDLE = ptr::null_mut();
-        let ok = DuplicateHandle(
-            GetCurrentProcess(),
-            io::stdout().as_raw_handle() as HANDLE,
-            target_process,
-            &mut target_handle,
-            0,
-            0,
-            DUPLICATE_SAME_ACCESS,
-        );
-        let result = if ok == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(target_handle as RawHandle)
-        };
-        CloseHandle(target_process);
-        result
-    }
-}
-
-#[cfg(windows)]
-fn windows_direct_stdout_enabled() -> bool {
-    !matches!(
-        env::var("INDEXSEARCH_WINDOWS_DIRECT_STDOUT").as_deref(),
-        Ok("0") | Ok("false") | Ok("FALSE") | Ok("no") | Ok("NO")
-    )
 }
 
 fn run_backend(args: &[String]) -> Result<i32, String> {
@@ -1094,7 +1055,7 @@ fn write_frame(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
 
 fn copy_frame(reader: &mut impl Read, writer: &mut impl Write) -> io::Result<()> {
     let mut remaining = read_u64(reader)?;
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = vec![0u8; FRAME_COPY_BUFFER_SIZE];
     while remaining != 0 {
         let take = remaining.min(buffer.len() as u64) as usize;
         reader.read_exact(&mut buffer[..take])?;

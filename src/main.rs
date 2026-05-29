@@ -17,7 +17,7 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 #[cfg(windows)]
-use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+use std::os::windows::io::{FromRawHandle, RawHandle};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
@@ -61,6 +61,7 @@ const SEARCH_DAEMON_SERVICE_NAME: &str = "is-daemon";
 const SEARCH_DAEMON_PROTOCOL: u32 = 1;
 const SEARCH_DAEMON_CAP_SEARCH: &str = "search";
 const SEARCH_DAEMON_CAP_UPDATE: &str = "update";
+#[cfg(unix)]
 const SEARCH_DAEMON_CAP_DIRECT_STDOUT: &str = "direct_stdout";
 const SEARCH_DAEMON_REQUEST_MAGIC: &[u8; 8] = b"ISDREQ1\n";
 const SEARCH_DAEMON_RESPONSE_MAGIC: &[u8; 8] = b"ISDRES1\n";
@@ -69,9 +70,17 @@ const SEARCH_DAEMON_STDERR_FRAME: u8 = 2;
 const SEARCH_DAEMON_DONE_FRAME: u8 = 3;
 const SEARCH_DAEMON_CONTROL_ARG: &str = "--__indexsearch-daemon-control";
 const SEARCH_DAEMON_CONTROL_UPDATE: &str = "update";
+const SEARCH_DAEMON_SKIP_STARTUP_SYNC_ARG: &str = "--__indexsearch-daemon-skip-startup-sync";
 const SEARCH_DAEMON_CONTROL_FALLBACK_CODE: i32 = 75;
 const SEARCH_DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_millis(20);
+#[cfg(windows)]
+const SEARCH_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(not(windows))]
 const SEARCH_DAEMON_START_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(windows)]
+const SEARCH_DAEMON_STREAM_BUFFER_SIZE: usize = 256 * 1024;
+#[cfg(not(windows))]
+const SEARCH_DAEMON_STREAM_BUFFER_SIZE: usize = 64 * 1024;
 const RECENT_SYNC_NO_SCAN_WINDOW: Duration = Duration::from_secs(30);
 const STREAMING_PIPELINE_MIN_CANDIDATES: usize = 50_000;
 const POSTING_BUILD_CHUNK_FILES: usize = 4096;
@@ -239,6 +248,10 @@ struct Timings {
     change_diff: f64,
     file_read: f64,
     tokenize: f64,
+    tokenize_scan_keys: f64,
+    tokenize_qualified_calls: f64,
+    tokenize_sort_extras: f64,
+    tokenize_sort_fragments: f64,
     compress: f64,
     sort: f64,
     select_fragments: f64,
@@ -252,6 +265,13 @@ struct Timings {
     write_flush_publish: f64,
     write_state: f64,
     write_delta_meta: f64,
+    index_cpu_threads: u64,
+    index_io_threads: u64,
+    indexed_files: u64,
+    indexed_bytes: u64,
+    gram_keys: u64,
+    extra_keys: u64,
+    fragment_keys: u64,
 }
 
 struct DeltaSegment {
@@ -308,6 +328,86 @@ struct CurrentFile {
     rel: String,
     mtime: i64,
     size: u64,
+}
+
+struct ReadIndexFile {
+    ordinal: usize,
+    rel: String,
+    mtime: i64,
+    bytes: Vec<u8>,
+}
+
+struct BuiltIndexFile {
+    ordinal: usize,
+    file: FileEntry,
+    gram_arena: usize,
+    gram_start: usize,
+    gram_len: usize,
+    fragment_arena: usize,
+    fragment_start: usize,
+    fragment_len: usize,
+}
+
+#[derive(Default)]
+struct BuiltIndexFiles {
+    files: Vec<BuiltIndexFile>,
+    gram_arenas: Vec<Vec<u32>>,
+    fragment_arenas: Vec<Vec<u32>>,
+}
+
+impl BuiltIndexFiles {
+    fn grams(&self, file: &BuiltIndexFile) -> &[u32] {
+        &self.gram_arenas[file.gram_arena][file.gram_start..file.gram_start + file.gram_len]
+    }
+
+    fn fragments(&self, file: &BuiltIndexFile) -> &[u32] {
+        &self.fragment_arenas[file.fragment_arena]
+            [file.fragment_start..file.fragment_start + file.fragment_len]
+    }
+}
+
+#[derive(Default)]
+struct IndexWorkerOutput {
+    files: Vec<BuiltIndexFile>,
+    grams: Vec<u32>,
+    fragments: Vec<u32>,
+}
+
+struct IndexKeyScratch {
+    trigram: TrigramScratch,
+    grams: Vec<u32>,
+    extras: Vec<u32>,
+    fragments: Vec<u32>,
+}
+
+impl IndexKeyScratch {
+    fn new() -> Self {
+        Self {
+            trigram: TrigramScratch::new(),
+            grams: Vec::new(),
+            extras: Vec::new(),
+            fragments: Vec::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct IndexBuildStats {
+    cpu_threads: AtomicU64,
+    io_threads: AtomicU64,
+    skipped_reads: AtomicU64,
+    indexed_files: AtomicU64,
+    indexed_bytes: AtomicU64,
+    gram_keys: AtomicU64,
+    extra_keys: AtomicU64,
+    fragment_keys: AtomicU64,
+    read_ns: AtomicU64,
+    tokenize_ns: AtomicU64,
+    tokenize_scan_ns: AtomicU64,
+    tokenize_qualified_ns: AtomicU64,
+    tokenize_sort_extras_ns: AtomicU64,
+    tokenize_sort_fragments_ns: AtomicU64,
+    compress_ns: AtomicU64,
 }
 
 #[derive(Default)]
@@ -499,14 +599,12 @@ struct SearchDaemonRecord {
 
 impl SearchDaemonRecord {
     fn current_capabilities() -> Vec<String> {
-        [
-            SEARCH_DAEMON_CAP_SEARCH,
-            SEARCH_DAEMON_CAP_UPDATE,
-            SEARCH_DAEMON_CAP_DIRECT_STDOUT,
-        ]
-        .iter()
-        .map(|capability| capability.to_string())
-        .collect()
+        let mut capabilities = Vec::with_capacity(3);
+        capabilities.push(SEARCH_DAEMON_CAP_SEARCH.to_string());
+        capabilities.push(SEARCH_DAEMON_CAP_UPDATE.to_string());
+        #[cfg(unix)]
+        capabilities.push(SEARCH_DAEMON_CAP_DIRECT_STDOUT.to_string());
+        capabilities
     }
 
     fn legacy_capabilities() -> Vec<String> {
@@ -1567,7 +1665,8 @@ fn command_update(args: &[String]) -> Result<i32> {
                     options.profile,
                 );
             }
-            let try_git_update = options.git_update || is_git_root(&cfg.root)?;
+            let try_git_update =
+                !options.force_scan && (options.git_update || is_git_root(&cfg.root)?);
             if try_git_update {
                 let include_untracked = true;
                 let git_timer = Instant::now();
@@ -3805,6 +3904,10 @@ fn quiet_search_fast_path(options: &Options) -> bool {
     options.quiet && !options.stats && !options.files
 }
 
+fn files_with_matches_can_stop(options: &Options) -> bool {
+    options.files_with_matches && !options.count && !options.stats
+}
+
 #[cold]
 #[inline(never)]
 fn search_quiet_with_index_output(index: &MappedIndex, options: &Options) -> Result<SearchOutput> {
@@ -4085,12 +4188,14 @@ fn start_search_daemon(root: &Path) -> Result<()> {
 
 fn command_search_daemon(args: &[String]) -> Result<i32> {
     let mut detach = false;
+    let mut skip_startup_sync = false;
     let mut watch_options = WatchOptions::default();
     let mut root = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--detach" => detach = true,
+            SEARCH_DAEMON_SKIP_STARTUP_SYNC_ARG => skip_startup_sync = true,
             "--idle-seconds" => {
                 i += 1;
                 let value = args.get(i).context("missing --idle-seconds value")?;
@@ -4113,10 +4218,12 @@ fn command_search_daemon(args: &[String]) -> Result<i32> {
     let root = root.context("search-daemon requires a root")?;
     let cfg = load_or_create_config(&root)?;
     stop_child_project_services(&cfg.root)?;
-    let flow = ConsoleFlow::start();
-    flow.step_done(format!("Resolved project {}", display_path(&cfg.root)));
-    sync_index_before_service(&cfg, &flow)?;
-    flow.done();
+    if !skip_startup_sync {
+        let flow = ConsoleFlow::start();
+        flow.step_done(format!("Resolved project {}", display_path(&cfg.root)));
+        sync_index_before_service(&cfg, &flow)?;
+        flow.done();
+    }
     if detach {
         spawn_search_daemon_detached(&cfg.root, watch_options)?;
         return Ok(0);
@@ -4128,6 +4235,7 @@ fn search_daemon_child_args(root: &Path, options: WatchOptions) -> Vec<OsString>
     vec![
         OsString::from("search-daemon"),
         root.as_os_str().to_os_string(),
+        OsString::from(SEARCH_DAEMON_SKIP_STARTUP_SYNC_ARG),
         OsString::from("--idle-seconds"),
         OsString::from(options.idle_seconds.to_string()),
         OsString::from("--compact-delta-count"),
@@ -4233,11 +4341,13 @@ impl SearchDaemonListener {
             #[cfg(not(unix))]
             Self::Tcp(listener) => {
                 let (stream, _) = listener.accept()?;
+                stream.set_nonblocking(false)?;
                 Ok(SearchDaemonStream::Tcp(stream))
             }
             #[cfg(unix)]
             Self::Unix { listener, .. } => {
                 let (stream, _) = listener.accept()?;
+                stream.set_nonblocking(false)?;
                 Ok(SearchDaemonStream::Unix(stream))
             }
         }
@@ -4273,18 +4383,9 @@ impl SearchDaemonStream {
     }
 
     #[cfg(windows)]
-    fn send_stdout_fd(&mut self, record: &SearchDaemonRecord) -> std::io::Result<()> {
+    fn send_stdout_fd(&mut self, _record: &SearchDaemonRecord) -> std::io::Result<()> {
         match self {
-            Self::Tcp(stream) => {
-                let handle = if windows_direct_stdout_enabled() {
-                    duplicate_stdout_for_process(record.pid)
-                        .map(|handle| handle as usize as u64)
-                        .unwrap_or(0)
-                } else {
-                    0
-                };
-                stream.write_all(&handle.to_le_bytes())
-            }
+            Self::Tcp(stream) => stream.write_all(&0u64.to_le_bytes()),
         }
     }
 
@@ -4427,49 +4528,6 @@ fn receive_fd(stream: &UnixStream) -> std::io::Result<RawFd> {
         }
         Ok(fd)
     }
-}
-
-#[cfg(windows)]
-fn duplicate_stdout_for_process(pid: u32) -> std::io::Result<RawHandle> {
-    use std::ptr;
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE,
-    };
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE,
-    };
-
-    unsafe {
-        let target_process = OpenProcess(PROCESS_DUP_HANDLE, 0, pid);
-        if target_process.is_null() {
-            return Err(std::io::Error::last_os_error());
-        }
-        let mut target_handle: HANDLE = ptr::null_mut();
-        let ok = DuplicateHandle(
-            GetCurrentProcess(),
-            std::io::stdout().as_raw_handle() as HANDLE,
-            target_process,
-            &mut target_handle,
-            0,
-            0,
-            DUPLICATE_SAME_ACCESS,
-        );
-        let result = if ok == 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(target_handle as RawHandle)
-        };
-        CloseHandle(target_process);
-        result
-    }
-}
-
-#[cfg(windows)]
-fn windows_direct_stdout_enabled() -> bool {
-    !matches!(
-        env::var("INDEXSEARCH_WINDOWS_DIRECT_STDOUT").as_deref(),
-        Ok("0") | Ok("false") | Ok("FALSE") | Ok("no") | Ok("NO")
-    )
 }
 
 fn run_search_daemon(root: &Path, watch_options: WatchOptions) -> Result<i32> {
@@ -4876,7 +4934,7 @@ fn search_daemon_output_to_stream(
         #[cfg(windows)]
         {
             let stdout = unsafe { File::from_raw_handle(stdout_fd) };
-            let mut out = BufWriter::with_capacity(64 * 1024, stdout);
+            let mut out = BufWriter::with_capacity(SEARCH_DAEMON_STREAM_BUFFER_SIZE, stdout);
             let stats = execute_search_rendered_segments_to_writer(
                 index,
                 &deltas,
@@ -4897,7 +4955,7 @@ fn search_daemon_output_to_stream(
             stream,
             tag: SEARCH_DAEMON_STDOUT_FRAME,
         };
-        let mut out = BufWriter::with_capacity(64 * 1024, stdout_writer);
+        let mut out = BufWriter::with_capacity(SEARCH_DAEMON_STREAM_BUFFER_SIZE, stdout_writer);
         let stats = execute_search_rendered_segments_to_writer(
             index,
             &deltas,
@@ -5575,77 +5633,67 @@ fn build_index(
     }
     let process_timer = Instant::now();
     let index_pool = build_index_thread_pool()?;
-    let skipped_reads = AtomicU64::new(0);
-    let read_ns = AtomicU64::new(0);
-    let tokenize_ns = AtomicU64::new(0);
-    let compress_ns = AtomicU64::new(0);
-    let build_files = || {
-        entries
-            .par_iter()
-            .map_init(TrigramScratch::new, |scratch, entry| {
-                let read_timer = Instant::now();
-                let bytes = fs::read(&entry.path).ok()?;
-                read_ns.fetch_add(elapsed_ns(read_timer), AtomicOrdering::Relaxed);
-                if is_binary(&bytes) {
-                    skipped_reads.fetch_add(1, AtomicOrdering::Relaxed);
-                    return None;
-                }
-                let tokenize_timer = Instant::now();
-                let (grams, fragments) = index_grams_and_word_fragments(&bytes, scratch);
-                tokenize_ns.fetch_add(elapsed_ns(tokenize_timer), AtomicOrdering::Relaxed);
-                let compress_timer = Instant::now();
-                let compressed_content = lz4_flex::compress_prepend_size(&bytes);
-                compress_ns.fetch_add(elapsed_ns(compress_timer), AtomicOrdering::Relaxed);
-                Some((
-                    entry.ordinal,
-                    FileEntry {
-                        path: entry.rel.clone(),
-                        mtime: entry.mtime,
-                        size: bytes.len() as u64,
-                        content: ENABLE_CHUNK_EXTENSION.then_some(bytes).unwrap_or_default(),
-                        compressed_content,
-                    },
-                    grams,
-                    fragments,
-                ))
-            })
-            .filter_map(|result| result)
-            .collect()
-    };
-    let mut files: Vec<(usize, FileEntry, Vec<u32>, Vec<u32>)> = match &index_pool {
-        Some(pool) => pool.install(build_files),
-        None => build_files(),
-    };
+    let build_stats = IndexBuildStats::default();
+    let mut built_files = build_index_file_entries(entries, options, &build_stats);
     if let Some(timings) = timings.as_deref_mut() {
-        timings.file_read += ns_to_secs(read_ns.load(AtomicOrdering::Relaxed));
-        timings.tokenize += ns_to_secs(tokenize_ns.load(AtomicOrdering::Relaxed));
-        timings.compress += ns_to_secs(compress_ns.load(AtomicOrdering::Relaxed));
+        timings.index_cpu_threads = build_stats.cpu_threads.load(AtomicOrdering::Relaxed);
+        timings.index_io_threads = build_stats.io_threads.load(AtomicOrdering::Relaxed);
+        timings.indexed_files += build_stats.indexed_files.load(AtomicOrdering::Relaxed);
+        timings.indexed_bytes += build_stats.indexed_bytes.load(AtomicOrdering::Relaxed);
+        timings.gram_keys += build_stats.gram_keys.load(AtomicOrdering::Relaxed);
+        timings.extra_keys += build_stats.extra_keys.load(AtomicOrdering::Relaxed);
+        timings.fragment_keys += build_stats.fragment_keys.load(AtomicOrdering::Relaxed);
+        timings.file_read += ns_to_secs(build_stats.read_ns.load(AtomicOrdering::Relaxed));
+        timings.tokenize += ns_to_secs(build_stats.tokenize_ns.load(AtomicOrdering::Relaxed));
+        timings.tokenize_scan_keys +=
+            ns_to_secs(build_stats.tokenize_scan_ns.load(AtomicOrdering::Relaxed));
+        timings.tokenize_qualified_calls += ns_to_secs(
+            build_stats
+                .tokenize_qualified_ns
+                .load(AtomicOrdering::Relaxed),
+        );
+        timings.tokenize_sort_extras += ns_to_secs(
+            build_stats
+                .tokenize_sort_extras_ns
+                .load(AtomicOrdering::Relaxed),
+        );
+        timings.tokenize_sort_fragments += ns_to_secs(
+            build_stats
+                .tokenize_sort_fragments_ns
+                .load(AtomicOrdering::Relaxed),
+        );
+        timings.compress += ns_to_secs(build_stats.compress_ns.load(AtomicOrdering::Relaxed));
     }
     let sort_timer = Instant::now();
-    files.sort_by_key(|(idx, _, _, _)| *idx);
+    built_files.files.sort_by_key(|file| file.ordinal);
     if let Some(timings) = timings.as_deref_mut() {
         timings.sort += sort_timer.elapsed().as_secs_f64();
     }
 
     let fragments_timer = Instant::now();
     let selected_fragments = selected_word_fragments(
-        files
+        built_files
+            .files
             .iter()
-            .map(|(_, _, _, fragments)| fragments.as_slice()),
+            .map(|file| built_files.fragments(file)),
     );
     if let Some(timings) = timings.as_deref_mut() {
         timings.select_fragments += fragments_timer.elapsed().as_secs_f64();
     }
     let postings_timer = Instant::now();
     let postings = match &index_pool {
-        Some(pool) => pool.install(|| build_postings_parallel(&files, &selected_fragments)),
-        None => build_postings_parallel(&files, &selected_fragments),
+        Some(pool) => pool.install(|| build_postings_parallel(&built_files, &selected_fragments)),
+        None => build_postings_parallel(&built_files, &selected_fragments),
     };
     if let Some(timings) = timings.as_deref_mut() {
         timings.postings += postings_timer.elapsed().as_secs_f64();
     }
-    let out_files = files.into_iter().map(|(_, file, _, _)| file).collect();
-    *skipped += skipped_reads.load(AtomicOrdering::Relaxed);
+    let out_files = built_files
+        .files
+        .into_iter()
+        .map(|file| file.file)
+        .collect();
+    *skipped += build_stats.skipped_reads.load(AtomicOrdering::Relaxed);
     if let Some(timings) = timings {
         timings.process += process_timer.elapsed().as_secs_f64();
     }
@@ -5657,21 +5705,235 @@ fn build_index(
     })
 }
 
-fn build_index_thread_pool() -> Result<Option<ThreadPool>> {
-    let threads = index_thread_count();
-    threads
-        .map(|threads| {
-            ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .thread_name(|idx| format!("indexsearch-index-{idx}"))
-                .build()
-                .context("failed to build index worker pool")
-        })
-        .transpose()
+fn build_index_file_entries(
+    entries: Vec<CurrentFile>,
+    options: &Options,
+    stats: &IndexBuildStats,
+) -> BuiltIndexFiles {
+    if entries.is_empty() {
+        return BuiltIndexFiles::default();
+    }
+    let cpu_threads = index_cpu_thread_count().min(entries.len()).max(1);
+    let io_threads = index_io_thread_count(cpu_threads).min(entries.len()).max(1);
+    stats
+        .cpu_threads
+        .store(cpu_threads as u64, AtomicOrdering::Relaxed);
+    stats
+        .io_threads
+        .store(io_threads as u64, AtomicOrdering::Relaxed);
+
+    let count_profile_keys = options.profile;
+    let profile_tokenize_steps = options.profile && index_profile_detail_enabled();
+    let channel_capacity = index_pipeline_channel_capacity(cpu_threads, io_threads);
+    let worker_file_capacity = entries.len().div_ceil(cpu_threads);
+    let (tx, rx) = mpsc::sync_channel::<ReadIndexFile>(channel_capacity);
+    let rx = Arc::new(Mutex::new(rx));
+
+    std::thread::scope(|scope| {
+        let mut cpu_handles = Vec::with_capacity(cpu_threads);
+        for _ in 0..cpu_threads {
+            let rx = Arc::clone(&rx);
+            cpu_handles.push(scope.spawn(move || {
+                let mut scratch = IndexKeyScratch::new();
+                let mut output = IndexWorkerOutput {
+                    files: Vec::with_capacity(worker_file_capacity),
+                    ..Default::default()
+                };
+                loop {
+                    let read_file = match rx.lock().expect("index receiver poisoned").recv() {
+                        Ok(read_file) => read_file,
+                        Err(_) => break,
+                    };
+                    process_index_file(
+                        read_file,
+                        &mut scratch,
+                        &mut output,
+                        stats,
+                        count_profile_keys,
+                        profile_tokenize_steps,
+                    );
+                }
+                output
+            }));
+        }
+
+        let chunk_size = entries.len().div_ceil(io_threads);
+        for chunk in entries.chunks(chunk_size) {
+            let tx = tx.clone();
+            scope.spawn(move || {
+                for entry in chunk {
+                    let read_timer = Instant::now();
+                    let Ok(bytes) = read_index_file_bytes(&entry.path, entry.size) else {
+                        continue;
+                    };
+                    stats
+                        .read_ns
+                        .fetch_add(elapsed_ns(read_timer), AtomicOrdering::Relaxed);
+                    let read_file = ReadIndexFile {
+                        ordinal: entry.ordinal,
+                        rel: entry.rel.clone(),
+                        mtime: entry.mtime,
+                        bytes,
+                    };
+                    if tx.send(read_file).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+
+        let mut built = BuiltIndexFiles::default();
+        for handle in cpu_handles {
+            let mut output = handle.join().expect("index worker panicked");
+            let arena = built.gram_arenas.len();
+            for file in &mut output.files {
+                file.gram_arena = arena;
+                file.fragment_arena = arena;
+            }
+            built.files.extend(output.files);
+            built.gram_arenas.push(output.grams);
+            built.fragment_arenas.push(output.fragments);
+        }
+        built
+    })
 }
 
-fn index_thread_count() -> Option<usize> {
-    if let Ok(value) = env::var("INDEXSEARCH_INDEX_THREADS") {
+fn process_index_file(
+    read_file: ReadIndexFile,
+    scratch: &mut IndexKeyScratch,
+    output: &mut IndexWorkerOutput,
+    stats: &IndexBuildStats,
+    count_profile_keys: bool,
+    profile_tokenize_steps: bool,
+) {
+    let bytes = read_file.bytes;
+    if is_binary(&bytes) {
+        stats.skipped_reads.fetch_add(1, AtomicOrdering::Relaxed);
+        return;
+    }
+    if count_profile_keys {
+        stats.indexed_files.fetch_add(1, AtomicOrdering::Relaxed);
+        stats
+            .indexed_bytes
+            .fetch_add(bytes.len() as u64, AtomicOrdering::Relaxed);
+    }
+
+    let tokenize_timer = Instant::now();
+    let (gram_len, extras_len, fragment_len) = if profile_tokenize_steps {
+        index_grams_and_word_fragments_into_profiled(
+            &bytes,
+            scratch,
+            &stats.tokenize_scan_ns,
+            &stats.tokenize_qualified_ns,
+            &stats.tokenize_sort_extras_ns,
+            &stats.tokenize_sort_fragments_ns,
+        )
+    } else {
+        index_grams_and_word_fragments_into(&bytes, scratch)
+    };
+    stats
+        .tokenize_ns
+        .fetch_add(elapsed_ns(tokenize_timer), AtomicOrdering::Relaxed);
+    if count_profile_keys {
+        if profile_tokenize_steps {
+            stats
+                .gram_keys
+                .fetch_add(gram_len as u64, AtomicOrdering::Relaxed);
+            stats
+                .extra_keys
+                .fetch_add(extras_len as u64, AtomicOrdering::Relaxed);
+        }
+        stats
+            .fragment_keys
+            .fetch_add(fragment_len as u64, AtomicOrdering::Relaxed);
+    }
+
+    let compress_timer = Instant::now();
+    let compressed_content = lz4_flex::compress_prepend_size(&bytes);
+    stats
+        .compress_ns
+        .fetch_add(elapsed_ns(compress_timer), AtomicOrdering::Relaxed);
+    let gram_start = output.grams.len();
+    output.grams.extend_from_slice(&scratch.grams);
+    let fragment_start = output.fragments.len();
+    output.fragments.extend_from_slice(&scratch.fragments);
+    output.files.push(BuiltIndexFile {
+        ordinal: read_file.ordinal,
+        file: FileEntry {
+            path: read_file.rel,
+            mtime: read_file.mtime,
+            size: bytes.len() as u64,
+            content: ENABLE_CHUNK_EXTENSION.then_some(bytes).unwrap_or_default(),
+            compressed_content,
+        },
+        gram_arena: 0,
+        gram_start,
+        gram_len: scratch.grams.len(),
+        fragment_arena: 0,
+        fragment_start,
+        fragment_len: scratch.fragments.len(),
+    });
+}
+
+fn read_index_file_bytes(path: &Path, expected_size: u64) -> std::io::Result<Vec<u8>> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_SEQUENTIAL_SCAN;
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN)
+            .open(path)?;
+        let capacity = usize::try_from(expected_size).unwrap_or(0);
+        let mut bytes = Vec::with_capacity(capacity);
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = expected_size;
+        fs::read(path)
+    }
+}
+
+fn build_index_thread_pool() -> Result<Option<ThreadPool>> {
+    let threads = index_cpu_thread_count();
+    ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|idx| format!("indexsearch-index-{idx}"))
+        .build()
+        .map(Some)
+        .context("failed to build index worker pool")
+}
+
+fn index_cpu_thread_count() -> usize {
+    thread_count_env("INDEXSEARCH_INDEX_CPU_THREADS")
+        .or_else(|| thread_count_env("INDEXSEARCH_INDEX_THREADS"))
+        .unwrap_or_else(default_index_cpu_threads)
+}
+
+fn index_io_thread_count(cpu_threads: usize) -> usize {
+    thread_count_env("INDEXSEARCH_INDEX_IO_THREADS").unwrap_or_else(|| {
+        let available = available_threads();
+        #[cfg(windows)]
+        {
+            (available / 16).clamp(2, 4).min(cpu_threads.max(1))
+        }
+        #[cfg(not(windows))]
+        {
+            (cpu_threads / 4).clamp(2, 8).min(cpu_threads.max(1))
+        }
+    })
+}
+
+fn index_pipeline_channel_capacity(cpu_threads: usize, io_threads: usize) -> usize {
+    ((cpu_threads + io_threads) * 4).clamp(32, 512)
+}
+
+fn thread_count_env(name: &str) -> Option<usize> {
+    if let Ok(value) = env::var(name) {
         let trimmed = value.trim();
         if trimmed == "0" {
             return None;
@@ -5680,17 +5942,33 @@ fn index_thread_count() -> Option<usize> {
             return (threads > 0).then_some(threads);
         }
     }
+    None
+}
+
+fn default_index_cpu_threads() -> usize {
+    let available = available_threads();
     #[cfg(windows)]
     {
-        std::thread::available_parallelism()
-            .ok()
-            .map(|count| count.get().min(16))
-            .filter(|&threads| threads > 0)
+        available.min(16).max(1)
     }
     #[cfg(not(windows))]
     {
-        None
+        available.max(1)
     }
+}
+
+fn available_threads() -> usize {
+    std::thread::available_parallelism()
+        .ok()
+        .map(|count| count.get())
+        .unwrap_or(1)
+}
+
+fn index_profile_detail_enabled() -> bool {
+    matches!(
+        env::var("INDEXSEARCH_INDEX_PROFILE_DETAIL").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
 }
 
 fn read_current_file_entry(
@@ -5711,7 +5989,7 @@ fn read_current_file_entry(
         return Ok(None);
     }
     let read_timer = Instant::now();
-    let bytes = fs::read(&path)?;
+    let bytes = read_index_file_bytes(&path, meta.len())?;
     if let Some(timings) = timings.as_deref_mut() {
         timings.file_read += read_timer.elapsed().as_secs_f64();
     }
@@ -5742,21 +6020,23 @@ fn read_current_file_entry(
 }
 
 fn build_postings_parallel(
-    files: &[(usize, FileEntry, Vec<u32>, Vec<u32>)],
+    files: &BuiltIndexFiles,
     selected_fragments: &HashSet<u32>,
 ) -> HashMap<u32, Vec<u32>> {
+    let chunk_files = posting_build_chunk_files();
     let partials: Vec<HashMap<u32, Vec<u32>>> = files
-        .par_chunks(POSTING_BUILD_CHUNK_FILES)
+        .files
+        .par_chunks(chunk_files)
         .enumerate()
         .map(|(chunk_idx, chunk)| {
             let mut local = HashMap::default();
-            let base_id = chunk_idx * POSTING_BUILD_CHUNK_FILES;
-            for (idx, (_, _, grams, fragments)) in chunk.iter().enumerate() {
+            let base_id = chunk_idx * chunk_files;
+            for (idx, file) in chunk.iter().enumerate() {
                 let id = (base_id + idx) as u32;
-                for &gram in grams {
+                for &gram in files.grams(file) {
                     local.entry(gram).or_insert_with(Vec::new).push(id);
                 }
-                for &fragment in fragments {
+                for &fragment in files.fragments(file) {
                     if selected_fragments.contains(&fragment) {
                         local.entry(fragment).or_insert_with(Vec::new).push(id);
                     }
@@ -5776,6 +6056,12 @@ fn build_postings_parallel(
         }
     }
     postings
+}
+
+fn posting_build_chunk_files() -> usize {
+    thread_count_env("INDEXSEARCH_POSTING_CHUNK_FILES")
+        .unwrap_or(POSTING_BUILD_CHUNK_FILES)
+        .max(1)
 }
 
 fn build_delta_index(
@@ -6656,7 +6942,7 @@ fn mtime_ns(meta: &fs::Metadata) -> i64 {
 fn is_binary(bytes: &[u8]) -> bool {
     bytes
         .get(..bytes.len().min(65536))
-        .is_some_and(|prefix| prefix.contains(&0))
+        .is_some_and(|prefix| memchr(0, prefix).is_some())
 }
 
 #[allow(dead_code)]
@@ -8630,6 +8916,9 @@ fn search_fixed_rendered(
         } else if options.files_with_matches && !path_written {
             writeln!(output, "{path}")?;
             path_written = true;
+            if files_with_matches_can_stop(options) {
+                return Ok(false);
+            }
         }
         last_line_start = cursor.line_start;
         Ok(options.max_count.is_none_or(|max| match_count < max))
@@ -8759,6 +9048,9 @@ fn search_word_prefix_rendered(
         } else if options.files_with_matches && !path_written {
             writeln!(output, "{path}")?;
             path_written = true;
+            if files_with_matches_can_stop(options) {
+                break;
+            }
         }
         last_line_start = cursor.line_start;
         if options.max_count.is_some_and(|max| match_count >= max) {
@@ -8805,6 +9097,9 @@ fn search_literal_set_rendered(
         } else if options.files_with_matches && !path_written {
             writeln!(output, "{path}")?;
             path_written = true;
+            if files_with_matches_can_stop(options) {
+                break;
+            }
         }
         last_line_start = cursor.line_start;
         if options.max_count.is_some_and(|max| match_count >= max) {
@@ -8876,6 +9171,9 @@ fn search_ordered_literals_rendered(
         } else if options.files_with_matches && !path_written {
             writeln!(output, "{path}")?;
             path_written = true;
+            if files_with_matches_can_stop(options) {
+                break;
+            }
         }
         last_line_start = cursor.line_start;
         if options.max_count.is_some_and(|max| match_count >= max) {
@@ -8930,6 +9228,9 @@ fn search_ordered_wordspan_rendered(
             } else if options.files_with_matches && !path_written {
                 writeln!(output, "{path}")?;
                 path_written = true;
+                if files_with_matches_can_stop(options) {
+                    break;
+                }
             }
             last_line_start = cursor.line_start;
             if options.max_count.is_some_and(|max| match_count >= max) {
@@ -9156,6 +9457,9 @@ fn search_qualified_call_rendered(
         } else if options.files_with_matches && !path_written {
             writeln!(output, "{path}")?;
             path_written = true;
+            if files_with_matches_can_stop(options) {
+                break;
+            }
         }
         last_line_start = line_start;
         if options.max_count.is_some_and(|max| match_count >= max) {
@@ -10506,18 +10810,51 @@ fn index_grams(bytes: &[u8], scratch: &mut TrigramScratch) -> Vec<u32> {
     grams
 }
 
-fn index_grams_and_word_fragments(
+fn index_grams_and_word_fragments_into(
     bytes: &[u8],
-    scratch: &mut TrigramScratch,
-) -> (Vec<u32>, Vec<u32>) {
-    let (mut grams, mut extras, mut fragments) = scan_index_keys(bytes, scratch, true);
-    add_qualified_call_postings(bytes, &mut extras);
-    extras.sort_unstable();
-    extras.dedup();
-    grams.extend(extras);
-    fragments.sort_unstable();
-    fragments.dedup();
-    (grams, fragments)
+    scratch: &mut IndexKeyScratch,
+) -> (usize, usize, usize) {
+    scan_index_keys_into(bytes, scratch, true);
+    let gram_len = scratch.grams.len();
+    add_qualified_call_postings(bytes, &mut scratch.extras);
+    scratch.extras.sort_unstable();
+    scratch.extras.dedup();
+    let extras_len = scratch.extras.len();
+    scratch.grams.extend_from_slice(&scratch.extras);
+    scratch.fragments.sort_unstable();
+    scratch.fragments.dedup();
+    (gram_len, extras_len, scratch.fragments.len())
+}
+
+fn index_grams_and_word_fragments_into_profiled(
+    bytes: &[u8],
+    scratch: &mut IndexKeyScratch,
+    scan_ns: &AtomicU64,
+    qualified_ns: &AtomicU64,
+    sort_extras_ns: &AtomicU64,
+    sort_fragments_ns: &AtomicU64,
+) -> (usize, usize, usize) {
+    let scan_timer = Instant::now();
+    scan_index_keys_into(bytes, scratch, true);
+    scan_ns.fetch_add(elapsed_ns(scan_timer), AtomicOrdering::Relaxed);
+    let gram_len = scratch.grams.len();
+
+    let qualified_timer = Instant::now();
+    add_qualified_call_postings(bytes, &mut scratch.extras);
+    qualified_ns.fetch_add(elapsed_ns(qualified_timer), AtomicOrdering::Relaxed);
+
+    let sort_extras_timer = Instant::now();
+    scratch.extras.sort_unstable();
+    scratch.extras.dedup();
+    sort_extras_ns.fetch_add(elapsed_ns(sort_extras_timer), AtomicOrdering::Relaxed);
+    let extras_len = scratch.extras.len();
+    scratch.grams.extend_from_slice(&scratch.extras);
+
+    let sort_fragments_timer = Instant::now();
+    scratch.fragments.sort_unstable();
+    scratch.fragments.dedup();
+    sort_fragments_ns.fetch_add(elapsed_ns(sort_fragments_timer), AtomicOrdering::Relaxed);
+    (gram_len, extras_len, scratch.fragments.len())
 }
 
 fn scan_index_keys(
@@ -10568,6 +10905,51 @@ fn scan_index_keys(
         scratch.bits[word] = 0;
     }
     (grams, extras, fragments)
+}
+
+fn scan_index_keys_into(bytes: &[u8], scratch: &mut IndexKeyScratch, collect_fragments: bool) {
+    scratch.grams.clear();
+    scratch.extras.clear();
+    scratch.fragments.clear();
+    let mut word_start = None;
+
+    let mut prev2 = 0u32;
+    let mut prev1 = 0u32;
+    for (idx, &byte) in bytes.iter().enumerate() {
+        let lower = byte.to_ascii_lowercase();
+        if idx == 0 {
+            prev2 = lower as u32;
+        } else if idx == 1 {
+            prev1 = lower as u32;
+        } else {
+            let gram = (prev2 << 16) | (prev1 << 8) | lower as u32;
+            prev2 = prev1;
+            prev1 = lower as u32;
+            push_unique_trigram(gram, &mut scratch.trigram, &mut scratch.grams);
+        }
+
+        if is_word_byte(byte) {
+            if word_start.is_none() {
+                word_start = Some(idx);
+            }
+        } else if let Some(start) = word_start.take() {
+            let word = &bytes[start..idx];
+            add_word_prefix_postings(word, &mut scratch.extras);
+            if collect_fragments {
+                add_word_fragment_keys(word, &mut scratch.fragments);
+            }
+        }
+    }
+    if let Some(start) = word_start {
+        let word = &bytes[start..];
+        add_word_prefix_postings(word, &mut scratch.extras);
+        if collect_fragments {
+            add_word_fragment_keys(word, &mut scratch.fragments);
+        }
+    }
+    for word in scratch.trigram.touched_words.drain(..) {
+        scratch.trigram.bits[word] = 0;
+    }
 }
 
 fn push_unique_trigram(gram: u32, scratch: &mut TrigramScratch, grams: &mut Vec<u32>) {
@@ -11423,6 +11805,16 @@ fn append_index_profile<W: Write>(out: &mut W, timings: &Timings) -> Result<()> 
         ("index_change_diff", timings.change_diff),
         ("index_file_read", timings.file_read),
         ("index_tokenize", timings.tokenize),
+        ("index_tokenize_scan_keys", timings.tokenize_scan_keys),
+        (
+            "index_tokenize_qualified_calls",
+            timings.tokenize_qualified_calls,
+        ),
+        ("index_tokenize_sort_extras", timings.tokenize_sort_extras),
+        (
+            "index_tokenize_sort_fragments",
+            timings.tokenize_sort_fragments,
+        ),
         ("index_compress", timings.compress),
         ("index_sort_files", timings.sort),
         ("index_select_fragments", timings.select_fragments),
@@ -11445,6 +11837,20 @@ fn append_index_profile<W: Write>(out: &mut W, timings: &Timings) -> Result<()> 
     for (name, secs) in events {
         if secs > 0.0 {
             writeln!(out, "profile: {name}={:.3}ms", secs * 1000.0)?;
+        }
+    }
+    let counters = [
+        ("index_cpu_threads", timings.index_cpu_threads),
+        ("index_io_threads", timings.index_io_threads),
+        ("index_files", timings.indexed_files),
+        ("index_bytes", timings.indexed_bytes),
+        ("index_gram_keys", timings.gram_keys),
+        ("index_extra_keys", timings.extra_keys),
+        ("index_fragment_keys", timings.fragment_keys),
+    ];
+    for (name, value) in counters {
+        if value != 0 {
+            writeln!(out, "profile: {name}={value}")?;
         }
     }
     Ok(())
@@ -11562,7 +11968,7 @@ fn read_bytes_frame(reader: &mut impl Read) -> Result<Vec<u8>> {
 
 fn copy_bytes_frame(reader: &mut impl Read, writer: &mut impl Write) -> Result<()> {
     let mut remaining = read_u64_from_reader(reader)?;
-    let mut buffer = [0u8; 64 * 1024];
+    let mut buffer = vec![0u8; SEARCH_DAEMON_STREAM_BUFFER_SIZE];
     while remaining != 0 {
         let take = remaining.min(buffer.len() as u64) as usize;
         reader.read_exact(&mut buffer[..take])?;

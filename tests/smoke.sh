@@ -26,7 +26,9 @@ assert_daemon_capabilities() {
   grep -q '^protocol=1$' "$record"
   grep -q '^capabilities=.*search' "$record"
   grep -q '^capabilities=.*update' "$record"
-  grep -q '^capabilities=.*direct_stdout' "$record"
+  if [[ "$(uname -s)" != MINGW* && "$(uname -s)" != MSYS* && "$(uname -s)" != CYGWIN* ]]; then
+    grep -q '^capabilities=.*direct_stdout' "$record"
+  fi
 }
 
 tmp="$(mktemp -d)"
