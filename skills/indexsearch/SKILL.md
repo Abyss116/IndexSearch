@@ -75,5 +75,5 @@ If quoted metacharacter patterns fail with a `cmd.exe` syntax error, use
 
 ## UE Template
 
-For a UE tree without config, `is` can create the UE config automatically during
-non-interactive agent search.
+For a UE tree without `.indexsearch/is-project-config.txt`, `is` can create the
+UE config automatically during non-interactive agent search.

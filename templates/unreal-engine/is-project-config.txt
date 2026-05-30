@@ -1,7 +1,7 @@
 # Default IndexSearch configuration for Unreal Engine source and project trees.
 #
-# Copy this file to the UE root as:
-#   index-search-project.txt
+# Copy this file into the UE root's .indexsearch/ directory as:
+#   is-project-config.txt
 #
 # The include list intentionally focuses on source, shader, config, project,
 # plugin, script, and build-rule files. Broaden it to "*" if you want every
@@ -47,7 +47,6 @@ Saved/webcache*/
 Engine/Programs/UnrealBuildTool/obj/
 
 [IndexSearch.files.ignore]
-index-search-project.txt
 *.7z
 *.a
 *.app

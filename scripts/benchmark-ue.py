@@ -63,7 +63,6 @@ EXCLUDES = [
     "**/bin/**",
     "**/enc_temp_folder/**",
     "**/LocalBuilds/**",
-    "index-search-project.txt",
     "Engine/Programs/UnrealBuildTool/Log*",
     "*.bak",
     "*.cpp.txt",
@@ -95,7 +94,6 @@ exclude (^|.*/)obj/
 exclude (^|.*/)bin/
 exclude (^|.*/)enc_temp_folder/
 exclude (^|.*/)LocalBuilds/
-exclude index-search-project\\.txt$
 exclude Engine/Programs/UnrealBuildTool/Log.*
 exclude \\.bak$
 exclude \\.cpp\\.txt$

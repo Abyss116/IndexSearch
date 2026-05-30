@@ -105,7 +105,7 @@ istool completions fish > ~/.config/fish/completions/istool.fish
 
 ## Configuration
 
-Project rules live in `index-search-project.txt`.
+Project rules live in `.indexsearch/is-project-config.txt`.
 
 ```ini
 [IndexSearch.paths.ignore]
@@ -120,13 +120,19 @@ out/
 *
 ```
 
-For Unreal Engine source trees, copy the bundled template:
+For Unreal Engine source trees, copy the bundled template into the project
+root's `.indexsearch/` directory:
 
 ```bash
-cp templates/unreal-engine/index-search-project.txt /path/to/UnrealEngine/index-search-project.txt
+mkdir -p /path/to/UnrealEngine/.indexsearch
+cp templates/unreal-engine/is-project-config.txt /path/to/UnrealEngine/.indexsearch/is-project-config.txt
 cd /path/to/UnrealEngine
 istool index .
 ```
+
+When indexing a Git project, IndexSearch also adds an anchored local ignore to
+`.git/info/exclude`, for example `/.indexsearch/` at the repository root or
+`/nested/project/.indexsearch/` for a project rooted in a subdirectory.
 
 If the first interactive search discovers an Unreal Engine root or a `.uproject`
 root, the generated config uses the UE template automatically.

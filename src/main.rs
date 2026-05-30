@@ -48,8 +48,10 @@ type StdoutFd = RawHandle;
 #[cfg(not(any(unix, windows)))]
 type StdoutFd = i32;
 
-const PROJECT_FILE: &str = "index-search-project.txt";
 const INDEX_DIR: &str = ".indexsearch";
+const PROJECT_CONFIG_FILE: &str = "is-project-config.txt";
+const PROJECT_CONFIG_REL: &str = ".indexsearch/is-project-config.txt";
+const LEGACY_PROJECT_FILE: &str = "index-search-project.txt";
 const INDEX_FILE: &str = "index.bin";
 const DELTA_DIR: &str = "deltas";
 const PROJECTS_DIR: &str = "projects";
@@ -57,6 +59,7 @@ const LOCK_FILE: &str = "index.lock";
 const STATE_FILE: &str = "state.txt";
 const PROJECT_LOG_FILE: &str = "project.log";
 const SEARCH_DAEMON_FILE: &str = "search-daemon.txt";
+const LOCAL_GIT_EXCLUDE_SECTION: &str = "# Local ignore IndexSearch and IndexGraph";
 const SEARCH_DAEMON_SERVICE_NAME: &str = "is-daemon";
 const SEARCH_DAEMON_PROTOCOL: u32 = 1;
 const SEARCH_DAEMON_CAP_SEARCH: &str = "search";
@@ -85,7 +88,7 @@ const POSTING_BUILD_CHUNK_FILES: usize = 4096;
 const POSTING_MERGE_MAX_SHARDS: usize = 64;
 const INDEX_PROCESS_PROGRESS_GRANULARITY: u64 = 8 * 1024 * 1024;
 const DEFAULT_PROJECT_CONFIG: &str = "[IndexSearch.paths.ignore]\n.git/\n.hg/\n.svn/\n.indexsearch/\n\n\
-[IndexSearch.files.ignore]\nindex-search-project.txt\n*.png\n*.jpg\n*.jpeg\n*.gif\n*.pdf\n*.zip\n*.gz\n*.dll\n*.exe\n*.pdb\n*.o\n*.obj\n\n\
+[IndexSearch.files.ignore]\n*.png\n*.jpg\n*.jpeg\n*.gif\n*.pdf\n*.zip\n*.gz\n*.dll\n*.exe\n*.pdb\n*.o\n*.obj\n\n\
 [IndexSearch.files.include]\n*\n";
 const MAGIC: &[u8; 8] = b"ISIDXR02";
 const VERSION: u32 = 4;
@@ -100,7 +103,7 @@ const AGENT_BLOCK_START: &str = "<!-- indexsearch-agent:start -->";
 const AGENT_BLOCK_END: &str = "<!-- indexsearch-agent:end -->";
 const EMBEDDED_CODEX_SKILL: &str = include_str!("../skills/indexsearch/SKILL.md");
 const EMBEDDED_UE_SKILL_CONFIG: &str =
-    include_str!("../skills/indexsearch/assets/unreal-engine-index-search-project.txt");
+    include_str!("../skills/indexsearch/assets/unreal-engine-is-project-config.txt");
 const EMBEDDED_AGENTS_RULE: &str = include_str!("../agent-rules/AGENTS.md");
 const EMBEDDED_CLAUDE_RULE: &str = include_str!("../agent-rules/CLAUDE.md");
 const EMBEDDED_CURSOR_RULE: &str = include_str!("../agent-rules/cursor/indexsearch.mdc");
@@ -828,7 +831,7 @@ const ISTOOL_COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "clean",
-        usage: "clean [PATH]",
+        usage: "clean [OPTIONS] [PATH]",
         description: "stop project services and remove index state",
     },
     CommandSpec {
@@ -1200,6 +1203,7 @@ fn print_clean_help() {
         "-y, --yes",
         "run without an interactive confirmation",
     );
+    help_option(&style, "--full", "remove the entire .indexsearch directory");
     help_option(&style, "--dry-run", "print what would be removed");
 }
 
@@ -1318,7 +1322,7 @@ fn print_install_skills_help() {
     help_option(
         &style,
         "--ue-template",
-        "copy the Unreal Engine index-search-project.txt template",
+        "copy the Unreal Engine is-project-config.txt template",
     );
     help_option(&style, "--force", "replace an existing UE template");
     help_option(&style, "--dry-run", "show what would be installed");
@@ -3432,7 +3436,7 @@ fn install_codex_skill(options: &InstallSkillsOptions, project: Option<&Path>) -
     write_text_file(
         &root
             .join("assets")
-            .join("unreal-engine-index-search-project.txt"),
+            .join("unreal-engine-is-project-config.txt"),
         EMBEDDED_UE_SKILL_CONFIG,
         options.dry_run,
     )
@@ -3450,7 +3454,7 @@ fn install_claude_skill(options: &InstallSkillsOptions, project: Option<&Path>) 
         write_text_file(
             &root
                 .join("assets")
-                .join("unreal-engine-index-search-project.txt"),
+                .join("unreal-engine-is-project-config.txt"),
             EMBEDDED_UE_SKILL_CONFIG,
             options.dry_run,
         )?;
@@ -3472,7 +3476,7 @@ fn install_claude_skill(options: &InstallSkillsOptions, project: Option<&Path>) 
         write_text_file(
             &root
                 .join("assets")
-                .join("unreal-engine-index-search-project.txt"),
+                .join("unreal-engine-is-project-config.txt"),
             EMBEDDED_UE_SKILL_CONFIG,
             options.dry_run,
         )
@@ -3520,11 +3524,13 @@ fn install_agents_rule(options: &InstallSkillsOptions, project: Option<&Path>) -
 }
 
 fn install_ue_template(project: &Path, force: bool, dry_run: bool) -> Result<()> {
-    let dst = project.join(PROJECT_FILE);
-    if dst.exists() && !force {
+    let dst = project_config_path(project);
+    let legacy = legacy_project_config_path(project);
+    if (dst.exists() || legacy.exists()) && !force {
+        let existing = if dst.exists() { &dst } else { &legacy };
         println!(
             "kept existing {}; pass --force to replace it",
-            display_path(&dst)
+            display_path(existing)
         );
         return Ok(());
     }
@@ -3710,14 +3716,14 @@ fn collect_event_paths(
         return;
     }
     for path in event.paths {
-        if path.starts_with(cfg.root.join(INDEX_DIR)) || path.is_dir() {
-            continue;
-        }
         if let Some(rel) = rel_path(&cfg.root, &path) {
-            if rel == PROJECT_FILE {
+            if is_project_config_rel(&rel) {
                 watch_state
                     .restart_required
                     .store(true, AtomicOrdering::Relaxed);
+                continue;
+            }
+            if path.starts_with(cfg.root.join(INDEX_DIR)) || path.is_dir() {
                 continue;
             }
             if path.exists() && (is_hidden(&rel) || !is_searchable(cfg, &rel)) {
@@ -4005,16 +4011,19 @@ struct CleanOptions {
     start: PathBuf,
     yes: bool,
     dry_run: bool,
+    full: bool,
 }
 
 fn parse_clean_args(args: &[String]) -> Result<CleanOptions> {
     let mut start = env::current_dir()?;
     let mut yes = false;
     let mut dry_run = false;
+    let mut full = false;
     for arg in args {
         match arg.as_str() {
             "-y" | "--yes" => yes = true,
             "--dry-run" => dry_run = true,
+            "--full" => full = true,
             value => start = PathBuf::from(value),
         }
     }
@@ -4022,6 +4031,7 @@ fn parse_clean_args(args: &[String]) -> Result<CleanOptions> {
         start,
         yes,
         dry_run,
+        full,
     })
 }
 
@@ -4040,7 +4050,15 @@ fn command_clean(args: &[String]) -> Result<i32> {
             println!("would clean {}", display_path(root));
             let dir = index_state_dir(root);
             if dir.exists() {
-                println!("would remove {}", display_path(&dir));
+                if options.full {
+                    println!("would remove {}", display_path(&dir));
+                } else {
+                    println!(
+                        "would remove index state under {} and keep {}",
+                        display_path(&dir),
+                        PROJECT_CONFIG_FILE
+                    );
+                }
             }
         }
         return Ok(0);
@@ -4054,15 +4072,49 @@ fn command_clean(args: &[String]) -> Result<i32> {
     let mut stopped = 0usize;
     for root in roots {
         stopped += stop_services_for_root(&root)?;
-        let dir = index_state_dir(&root);
-        if dir.exists() {
-            fs::remove_dir_all(&dir)?;
+        if clean_index_state_dir(&root, options.full)? {
             removed_dirs += 1;
-            println!("removed {}", display_path(&dir));
         }
     }
     println!("cleaned {removed_dirs} index directories; stopped {stopped} services");
     Ok(0)
+}
+
+fn clean_index_state_dir(root: &Path, full: bool) -> Result<bool> {
+    let dir = index_state_dir(root);
+    if !dir.exists() {
+        return Ok(false);
+    }
+    if full {
+        fs::remove_dir_all(&dir)?;
+        println!("removed {}", display_path(&dir));
+        return Ok(true);
+    }
+
+    let config_path = project_config_path(root);
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if same_clean_root(&path, &config_path) {
+            continue;
+        }
+        if path.is_dir() {
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+    if fs::read_dir(&dir)?.next().is_none() {
+        fs::remove_dir(&dir)?;
+        println!("removed {}", display_path(&dir));
+    } else {
+        println!(
+            "cleaned index state under {}; kept {}",
+            display_path(&dir),
+            PROJECT_CONFIG_FILE
+        );
+    }
+    Ok(true)
 }
 
 fn discover_clean_roots(start: &Path) -> Vec<PathBuf> {
@@ -4084,11 +4136,31 @@ fn is_cleanable_project_root(root: &Path) -> bool {
     if !state_dir.is_dir() {
         return false;
     }
-    root.join(PROJECT_FILE).is_file() || index_path(root).is_file()
+    project_marker_exists(root)
 }
 
 fn index_state_dir(root: &Path) -> PathBuf {
     root.join(INDEX_DIR)
+}
+
+fn project_config_path(root: &Path) -> PathBuf {
+    root.join(INDEX_DIR).join(PROJECT_CONFIG_FILE)
+}
+
+fn legacy_project_config_path(root: &Path) -> PathBuf {
+    root.join(LEGACY_PROJECT_FILE)
+}
+
+fn project_config_exists(root: &Path) -> bool {
+    project_config_path(root).is_file() || legacy_project_config_path(root).is_file()
+}
+
+fn project_marker_exists(root: &Path) -> bool {
+    project_config_exists(root) || index_path(root).is_file()
+}
+
+fn is_project_config_rel(rel: &str) -> bool {
+    rel == PROJECT_CONFIG_REL || rel == LEGACY_PROJECT_FILE
 }
 
 fn confirm_clean(roots: &[PathBuf]) -> Result<bool> {
@@ -4096,7 +4168,9 @@ fn confirm_clean(roots: &[PathBuf]) -> Result<bool> {
         eprintln!("indexsearch: clean is destructive; pass --yes to run non-interactively");
         return Ok(false);
     }
-    eprintln!("indexsearch: clean will stop services and remove index state:");
+    eprintln!(
+        "indexsearch: clean will stop services and remove index state; pass --full to remove local config too:"
+    );
     for root in roots {
         eprintln!("  {}", display_path(root));
     }
@@ -4855,7 +4929,7 @@ fn find_existing_project_root(start: &Path) -> Option<PathBuf> {
         std::env::current_dir().ok()?.join(start)
     };
     path.ancestors()
-        .find(|ancestor| index_path(ancestor).is_file() || ancestor.join(PROJECT_FILE).is_file())
+        .find(|ancestor| project_marker_exists(ancestor))
         .map(Path::to_path_buf)
 }
 
@@ -6876,9 +6950,17 @@ fn load_config_inner(start: &Path, create_default: bool) -> Result<ProjectConfig
     } else {
         discover_root(start)?
     };
-    let path = root.join(PROJECT_FILE);
-    let text = if path.exists() {
-        fs::read_to_string(&path)?
+    if create_default {
+        ensure_local_git_excludes_for_project(&root)?;
+    }
+    let path = project_config_path(&root);
+    let legacy_path = legacy_project_config_path(&root);
+    let (config_path, text) = if path.exists() {
+        let text = fs::read_to_string(&path)?;
+        (Some(path.clone()), text)
+    } else if legacy_path.exists() {
+        let text = fs::read_to_string(&legacy_path)?;
+        (Some(legacy_path.clone()), text)
     } else {
         let default_config = if is_unreal_root(&root) {
             EMBEDDED_UE_SKILL_CONFIG
@@ -6886,16 +6968,21 @@ fn load_config_inner(start: &Path, create_default: bool) -> Result<ProjectConfig
             DEFAULT_PROJECT_CONFIG
         };
         if create_default {
-            fs::create_dir_all(&root)?;
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
             fs::write(&path, default_config)?;
             eprintln!(
                 "indexsearch: created default config: {}",
                 display_path(&path)
             );
+            (Some(path.clone()), default_config.to_string())
+        } else {
+            (None, default_config.to_string())
         }
-        default_config.to_string()
     };
-    let has_config = path.exists();
+    let has_config = config_path.is_some();
+    let path = config_path.unwrap_or(path);
     let sections = parse_sections(&text);
     let paths_ignore = MatcherSet::new(&clean_section(sections.get("IndexSearch.paths.ignore")))?;
     let files_ignore = MatcherSet::new(&clean_section(sections.get("IndexSearch.files.ignore")))?;
@@ -6921,7 +7008,7 @@ fn discover_root(start: &Path) -> Result<PathBuf> {
     }
     let fallback = path.clone();
     loop {
-        if path.join(PROJECT_FILE).exists() {
+        if project_marker_exists(&path) {
             return Ok(path);
         }
         if !path.pop() {
@@ -6939,7 +7026,7 @@ fn discover_root_for_create(start: &Path) -> Result<PathBuf> {
     let fallback = path.clone();
     let mut current = Some(path.as_path());
     while let Some(candidate) = current {
-        if candidate.join(PROJECT_FILE).exists() {
+        if project_marker_exists(candidate) {
             return Ok(candidate.to_path_buf());
         }
         current = candidate.parent();
@@ -6971,6 +7058,108 @@ fn is_unreal_root(path: &Path) -> bool {
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("uproject"))
         })
+}
+
+fn ensure_local_git_excludes_for_project(root: &Path) -> Result<()> {
+    let Some(target) = git_exclude_target(root)? else {
+        return Ok(());
+    };
+    let existing = fs::read_to_string(&target.exclude_path).unwrap_or_default();
+    if git_exclude_has_pattern(&existing, &target.pattern) {
+        return Ok(());
+    }
+
+    if let Some(parent) = target.exclude_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    if !updated
+        .lines()
+        .any(|line| line.trim() == LOCAL_GIT_EXCLUDE_SECTION)
+    {
+        if !updated.is_empty() {
+            updated.push('\n');
+        }
+        updated.push_str(LOCAL_GIT_EXCLUDE_SECTION);
+        updated.push('\n');
+    }
+    updated.push_str(&target.pattern);
+    updated.push('\n');
+    fs::write(target.exclude_path, updated)?;
+    Ok(())
+}
+
+struct GitExcludeTarget {
+    exclude_path: PathBuf,
+    pattern: String,
+}
+
+fn git_exclude_target(root: &Path) -> Result<Option<GitExcludeTarget>> {
+    let Some(exclude_value) = git_rev_parse(root, &["--git-path", "info/exclude"])? else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(exclude_value);
+    let exclude_path = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    let prefix = git_rev_parse(root, &["--show-prefix"])?.unwrap_or_default();
+    Ok(Some(GitExcludeTarget {
+        exclude_path,
+        pattern: local_git_exclude_pattern(&prefix),
+    }))
+}
+
+fn git_rev_parse(root: &Path, args: &[&str]) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .arg("rev-parse")
+        .args(args)
+        .output();
+    let Ok(output) = output else {
+        return Ok(None);
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
+fn local_git_exclude_pattern(prefix: &str) -> String {
+    let prefix = prefix.trim().replace('\\', "/");
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        "/.indexsearch/".to_string()
+    } else {
+        format!("/{prefix}/.indexsearch/")
+    }
+}
+
+fn git_exclude_has_pattern(text: &str, pattern: &str) -> bool {
+    let expected = normalize_git_exclude_pattern(pattern);
+    text.lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.is_empty()
+            && !trimmed.starts_with('#')
+            && normalize_git_exclude_pattern(trimmed) == expected
+    })
+}
+
+fn normalize_git_exclude_pattern(pattern: &str) -> String {
+    let mut pattern = pattern.trim().replace('\\', "/");
+    while pattern.len() > 1 && pattern.ends_with('/') {
+        pattern.pop();
+    }
+    pattern
 }
 
 fn parse_sections(text: &str) -> BTreeMap<String, Vec<String>> {
