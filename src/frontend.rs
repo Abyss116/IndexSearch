@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 const INDEX_DIR: &str = ".indexsearch";
 const INDEX_FILE: &str = "index.bin";
-const PROJECT_FILE: &str = "index-search-project.txt";
+const PROJECT_CONFIG_FILE: &str = "is-project-config.txt";
+const LEGACY_PROJECT_FILE: &str = "index-search-project.txt";
 const SEARCH_DAEMON_FILE: &str = "search-daemon.txt";
 const PROJECTS_DIR: &str = "projects";
 const REQUEST_MAGIC: &[u8; 8] = b"ISDREQ1\n";
@@ -527,7 +528,7 @@ fn short_option_with_attached_value(arg: &str) -> bool {
 fn find_project_root(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
-        .find(|ancestor| index_path(ancestor).is_file() || ancestor.join(PROJECT_FILE).is_file())
+        .find(|ancestor| project_marker_exists(ancestor))
         .map(Path::to_path_buf)
 }
 
@@ -974,6 +975,22 @@ fn clean_path_string(path: &str) -> String {
 
 fn index_path(root: &Path) -> PathBuf {
     root.join(INDEX_DIR).join(INDEX_FILE)
+}
+
+fn project_config_path(root: &Path) -> PathBuf {
+    root.join(INDEX_DIR).join(PROJECT_CONFIG_FILE)
+}
+
+fn legacy_project_config_path(root: &Path) -> PathBuf {
+    root.join(LEGACY_PROJECT_FILE)
+}
+
+fn project_config_exists(root: &Path) -> bool {
+    project_config_path(root).is_file() || legacy_project_config_path(root).is_file()
+}
+
+fn project_marker_exists(root: &Path) -> bool {
+    project_config_exists(root) || index_path(root).is_file()
 }
 
 fn record_path(root: &Path) -> PathBuf {

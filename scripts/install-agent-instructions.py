@@ -49,11 +49,14 @@ def write_marked_block(path: Path, block: str) -> None:
 
 
 def install_ue_template(root: Path, force: bool) -> None:
-    src = repo_root() / "templates" / "unreal-engine" / "index-search-project.txt"
-    dst = root / "index-search-project.txt"
-    if dst.exists() and not force:
-        print(f"kept existing {dst}; pass --force to replace it")
+    src = repo_root() / "templates" / "unreal-engine" / "is-project-config.txt"
+    dst = root / ".indexsearch" / "is-project-config.txt"
+    legacy = root / "index-search-project.txt"
+    existing = dst if dst.exists() else legacy if legacy.exists() else None
+    if existing is not None and not force:
+        print(f"kept existing {existing}; pass --force to replace it")
         return
+    dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
     print(f"installed {dst}")
 

@@ -20,7 +20,7 @@ export HOME="$test_home"
 cleanup() {
   "$tool_bin" stop --all >/dev/null 2>&1 || "$daemon_bin" stop --all >/dev/null 2>&1 || true
   rm -rf "${tmp:-}" "${no_cfg_tmp:-}" "${search_no_cfg_tmp:-}" "${backend_auto_tmp:-}" \
-    "${home_registry_tmp:-}" "${outside_log_tmp:-}" "${multi_root_tmp:-}" "${git_tmp:-}" "${watch_tmp:-}" \
+    "${home_registry_tmp:-}" "${outside_log_tmp:-}" "${multi_root_tmp:-}" "${git_tmp:-}" "${ue_git_tmp:-}" "${sub_git_tmp:-}" "${watch_tmp:-}" \
     "${compact_watch_tmp:-}" "${config_watch_tmp:-}" "${offline_watch_tmp:-}" \
     "${implicit_watch_tmp:-}" "${clean_tmp:-}" "${all_home:-}" "${all_watch_a:-}" \
     "${all_watch_b:-}" "${registry_home:-}" "${install_tmp:-}" "${install_project:-}" \
@@ -45,12 +45,12 @@ no_cfg_tmp="$(mktemp -d)"
 search_no_cfg_tmp="$(mktemp -d)"
 printf 'no_search_config_symbol\n' > "$search_no_cfg_tmp/a.txt"
 "$bin" -q -F no_search_config_symbol "$search_no_cfg_tmp"
-[[ -f "$search_no_cfg_tmp/index-search-project.txt" ]]
+[[ -f "$search_no_cfg_tmp/.indexsearch/is-project-config.txt" ]]
 if [[ -x "$tool_bin" ]]; then
   backend_auto_tmp="$(mktemp -d)"
   printf 'backend_auto_symbol\n' > "$backend_auto_tmp/a.txt"
   "$tool_bin" search -q -F backend_auto_symbol "$backend_auto_tmp"
-  [[ -f "$backend_auto_tmp/index-search-project.txt" ]]
+  [[ -f "$backend_auto_tmp/.indexsearch/is-project-config.txt" ]]
 fi
 home_registry_tmp="$(mktemp -d)"
 mkdir -p "$home_registry_tmp/.indexsearch/projects" "$home_registry_tmp/work/sub"
@@ -59,15 +59,33 @@ printf 'home_registry_symbol\n' > "$home_registry_tmp/work/sub/a.txt"
   cd "$home_registry_tmp/work/sub"
   HOME="$home_registry_tmp" "$bin" -q -F home_registry_symbol
 )
-[[ -f "$home_registry_tmp/work/sub/index-search-project.txt" ]]
+[[ -f "$home_registry_tmp/work/sub/.indexsearch/is-project-config.txt" ]]
 [[ -f "$home_registry_tmp/work/sub/.indexsearch/index.bin" ]]
-[[ ! -f "$home_registry_tmp/index-search-project.txt" ]]
+[[ ! -f "$home_registry_tmp/.indexsearch/is-project-config.txt" ]]
 [[ ! -f "$home_registry_tmp/.indexsearch/index.bin" ]]
 HOME="$home_registry_tmp" "$tool_bin" stop "$home_registry_tmp/work/sub" >/dev/null 2>&1 || true
 printf 'auto_config_symbol\n' > "$no_cfg_tmp/a.txt"
 "$tool_bin" index "$no_cfg_tmp" >/dev/null
-[[ -f "$no_cfg_tmp/index-search-project.txt" ]]
+[[ -f "$no_cfg_tmp/.indexsearch/is-project-config.txt" ]]
 "$bin" -q -F auto_config_symbol "$no_cfg_tmp"
+
+ue_git_tmp="$(mktemp -d)"
+git -C "$ue_git_tmp" init -q
+"$tool_bin" index "$ue_git_tmp" >/dev/null
+grep -q '# Local ignore IndexSearch and IndexGraph' "$ue_git_tmp/.git/info/exclude"
+grep -qx '/.indexsearch/' "$ue_git_tmp/.git/info/exclude"
+! grep -qx 'index-search-project.txt' "$ue_git_tmp/.git/info/exclude"
+[[ -f "$ue_git_tmp/.indexsearch/is-project-config.txt" ]]
+"$tool_bin" index "$ue_git_tmp" >/dev/null
+[[ "$(grep -cx '/.indexsearch/' "$ue_git_tmp/.git/info/exclude")" -eq 1 ]]
+
+sub_git_tmp="$(mktemp -d)"
+git -C "$sub_git_tmp" init -q
+mkdir -p "$sub_git_tmp/nested/project"
+"$tool_bin" index "$sub_git_tmp/nested/project" >/dev/null
+grep -qx '/nested/project/.indexsearch/' "$sub_git_tmp/.git/info/exclude"
+git -C "$sub_git_tmp" check-ignore -q nested/project/.indexsearch/is-project-config.txt
+
 help_out="$("$bin" --help)"
 grep -q 'search the indexed tree' <<<"$help_out"
 grep -q 'Options' <<<"$help_out"
@@ -420,13 +438,14 @@ CFG
   [[ "$compact_pid_before" == "$compact_pid_after" ]]
   "$tool_bin" stop "$compact_watch_tmp" >/dev/null
 
-  cat > "$config_watch_tmp/index-search-project.txt" <<'CFG'
+  mkdir -p "$config_watch_tmp/.indexsearch"
+  cat > "$config_watch_tmp/.indexsearch/is-project-config.txt" <<'CFG'
 [IndexSearch.files.include]
 *.txt
 CFG
   printf 'config_first\n' > "$config_watch_tmp/a.txt"
   "$bin" -q -F config_first "$config_watch_tmp"
-  cat > "$config_watch_tmp/index-search-project.txt" <<'CFG'
+  cat > "$config_watch_tmp/.indexsearch/is-project-config.txt" <<'CFG'
 [IndexSearch.files.include]
 *.cc
 CFG
@@ -488,7 +507,8 @@ all_home="$(mktemp -d)"
 all_watch_a="$(mktemp -d)"
 all_watch_b="$(mktemp -d)"
 registry_home="$(mktemp -d)"
-cat > "$clean_tmp/index-search-project.txt" <<'CFG'
+mkdir -p "$clean_tmp/.indexsearch"
+cat > "$clean_tmp/.indexsearch/is-project-config.txt" <<'CFG'
 [IndexSearch.files.include]
 *.txt
 CFG
@@ -497,9 +517,12 @@ printf 'clean_symbol\n' > "$clean_tmp/a.txt"
 clean_dry="$("$tool_bin" clean --dry-run "$clean_tmp")"
 grep -q 'would remove' <<<"$clean_dry"
 "$tool_bin" clean --yes "$clean_tmp" >/dev/null
-[[ ! -d "$clean_tmp/.indexsearch" ]]
-[[ -f "$clean_tmp/index-search-project.txt" ]]
+[[ -d "$clean_tmp/.indexsearch" ]]
+[[ -f "$clean_tmp/.indexsearch/is-project-config.txt" ]]
+[[ ! -f "$clean_tmp/.indexsearch/index.bin" ]]
 ! "$tool_bin" projects | grep -q "$clean_tmp"
+"$tool_bin" clean --yes --full "$clean_tmp" >/dev/null
+[[ ! -d "$clean_tmp/.indexsearch" ]]
 
 mkdir -p "$registry_home/.indexsearch/projects" "$registry_home/work/subdir"
 cat > "$registry_home/.indexsearch/projects/fake.project" <<'EOF'
@@ -570,7 +593,7 @@ grep -q 'IndexSearch Agent Instructions' "$skills_home/.config/opencode/AGENTS.m
 [[ -f "$skills_project/CLAUDE.md" ]]
 [[ -f "$skills_project/.claude/skills/indexsearch/SKILL.md" ]]
 [[ -f "$skills_project/.cursor/rules/indexsearch.mdc" ]]
-[[ -f "$skills_project/index-search-project.txt" ]]
+[[ -f "$skills_project/.indexsearch/is-project-config.txt" ]]
 
 "$tool_bin" stop "$no_cfg_tmp" >/dev/null 2>&1 || true
 "$tool_bin" stop "$tmp" >/dev/null 2>&1 || true
