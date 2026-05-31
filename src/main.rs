@@ -160,6 +160,37 @@ impl MatcherSet {
     }
 }
 
+#[derive(Clone)]
+struct PathGlobRule {
+    is_include: bool,
+    matcher: MatcherSet,
+}
+
+#[derive(Clone, Default)]
+struct PathMatcher {
+    ordered_glob_rules: Vec<PathGlobRule>,
+    has_include_glob_rule: bool,
+    include_matcher: MatcherSet,
+    exclude_matcher: MatcherSet,
+}
+
+impl PathMatcher {
+    fn allows(&self, rel: &str) -> bool {
+        if self.include_matcher.set.is_some() && !self.include_matcher.is_match(rel) {
+            return false;
+        }
+        if self.exclude_matcher.is_match(rel) {
+            return false;
+        }
+        for rule in &self.ordered_glob_rules {
+            if rule.matcher.is_match(rel) {
+                return rule.is_include;
+            }
+        }
+        !self.has_include_glob_rule
+    }
+}
+
 #[derive(Default, Clone)]
 struct Options {
     ignore_case: bool,
@@ -473,7 +504,7 @@ impl TrigramScratch {
 
 struct PathFilter {
     prefixes: Vec<String>,
-    matcher: Option<(MatcherSet, MatcherSet)>,
+    matcher: Option<PathMatcher>,
     max_depth: Option<usize>,
 }
 
@@ -12649,43 +12680,58 @@ fn write_rendered_results<W: Write>(
     Ok(())
 }
 
-fn build_path_matcher(options: &Options) -> Result<Option<(MatcherSet, MatcherSet)>> {
-    let mut positives: Vec<String> = options
-        .globs
-        .iter()
-        .filter(|g| !g.starts_with('!'))
-        .cloned()
-        .collect();
-    let mut negatives: Vec<String> = options
-        .globs
-        .iter()
-        .filter_map(|g| g.strip_prefix('!').map(ToOwned::to_owned))
-        .collect();
+fn build_path_matcher(options: &Options) -> Result<Option<PathMatcher>> {
+    let mut ordered_glob_rules = Vec::new();
+    let mut has_include_glob_rule = false;
+    for glob in options.globs.iter().rev() {
+        let (is_include, pattern) = if let Some(pattern) = glob.strip_prefix('!') {
+            (false, pattern)
+        } else {
+            (true, glob.as_str())
+        };
+        if is_include {
+            has_include_glob_rule = true;
+        }
+        ordered_glob_rules.push(PathGlobRule {
+            is_include,
+            matcher: MatcherSet::new_with_case(
+                &[pattern.to_string()],
+                options.glob_case_insensitive,
+            )?,
+        });
+    }
+    let mut include_patterns: Vec<String> = Vec::new();
+    let mut exclude_patterns: Vec<String> = Vec::new();
     for ty in &options.type_includes {
         if let Some(globs) = search_type_globs(ty) {
-            positives.extend(globs.iter().map(|glob| (*glob).to_string()));
+            include_patterns.extend(globs.iter().map(|glob| (*glob).to_string()));
         }
     }
     for ty in &options.type_excludes {
         if let Some(globs) = search_type_globs(ty) {
-            negatives.extend(globs.iter().map(|glob| (*glob).to_string()));
+            exclude_patterns.extend(globs.iter().map(|glob| (*glob).to_string()));
         }
     }
     for ignore_file in &options.ignore_files {
         let path = resolve_search_path(options, ignore_file);
         let lines = load_pattern_lines(&path);
-        negatives.extend(lines);
+        exclude_patterns.extend(lines);
     }
-    if positives.is_empty() && negatives.is_empty() {
+    if ordered_glob_rules.is_empty() && include_patterns.is_empty() && exclude_patterns.is_empty() {
         return Ok(None);
     }
-    Ok(Some((
-        MatcherSet::new_with_case(&positives, options.glob_case_insensitive)?,
-        MatcherSet::new_with_case(
-            &negatives,
+    Ok(Some(PathMatcher {
+        ordered_glob_rules,
+        has_include_glob_rule,
+        include_matcher: MatcherSet::new_with_case(
+            &include_patterns,
+            options.glob_case_insensitive,
+        )?,
+        exclude_matcher: MatcherSet::new_with_case(
+            &exclude_patterns,
             options.glob_case_insensitive || options.ignore_file_case_insensitive,
         )?,
-    )))
+    }))
 }
 
 impl PathFilter {
@@ -12721,11 +12767,8 @@ impl PathFilter {
         if !self.allows_depth(rel) {
             return false;
         }
-        if let Some((positive, negative)) = &self.matcher {
-            if positive.set.is_some() && !positive.is_match(rel) {
-                return false;
-            }
-            if negative.is_match(rel) {
+        if let Some(matcher) = &self.matcher {
+            if !matcher.allows(rel) {
                 return false;
             }
         }
@@ -14332,6 +14375,31 @@ mod tests {
         let excluded = HashSet::default();
 
         assert!(filter.allows("Source/Foo.cpp", &excluded));
+    }
+
+    #[test]
+    fn later_glob_overrides_earlier_glob() {
+        let mut options =
+            parse_search_args(&args(["-g", "!*", "-g", "Engine/", "Needle"].as_slice())).unwrap();
+        let root = env::current_dir().unwrap();
+        options.cwd = root.clone();
+        let filter = PathFilter::new(&options, &root).unwrap();
+        let excluded = HashSet::default();
+
+        assert!(filter.allows("Engine/Foo.cpp", &excluded));
+        assert!(!filter.allows("Source/Foo.cpp", &excluded));
+    }
+
+    #[test]
+    fn later_negative_glob_overrides_earlier_positive_glob() {
+        let mut options =
+            parse_search_args(&args(["-g", "Engine/", "-g", "!*", "Needle"].as_slice())).unwrap();
+        let root = env::current_dir().unwrap();
+        options.cwd = root.clone();
+        let filter = PathFilter::new(&options, &root).unwrap();
+        let excluded = HashSet::default();
+
+        assert!(!filter.allows("Engine/Foo.cpp", &excluded));
     }
 
     #[test]
