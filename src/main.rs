@@ -5113,6 +5113,7 @@ fn append_profile_events<W: Write>(out: &mut W, profile: &SearchProfile) -> Resu
 fn start_search_daemon(root: &Path) -> Result<()> {
     let exe = search_daemon_executable()?;
     let mut command = Command::new(exe);
+    hide_background_command_window(&mut command);
     command
         .arg("search-daemon")
         .arg("--detach")
@@ -5127,6 +5128,17 @@ fn start_search_daemon(root: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(windows)]
+fn hide_background_command_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_background_command_window(_command: &mut Command) {}
 
 fn start_search_daemon_from_current_index(root: &Path) -> Result<()> {
     spawn_search_daemon_detached(root, WatchOptions::default())?;

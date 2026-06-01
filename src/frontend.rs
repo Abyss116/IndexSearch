@@ -675,6 +675,7 @@ fn start_project_service(root: &Path) -> Result<(), String> {
     let backend = backend_path()?;
     let show_progress = stderr_supports_progress();
     let mut command = Command::new(backend);
+    hide_background_command_window(&mut command);
     command.arg("search-daemon").arg("--detach");
     command.arg(root).stdin(Stdio::null()).stdout(Stdio::null());
     if show_progress {
@@ -693,6 +694,17 @@ fn start_project_service(root: &Path) -> Result<(), String> {
         ))
     }
 }
+
+#[cfg(windows)]
+fn hide_background_command_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn hide_background_command_window(_command: &mut Command) {}
 
 fn read_valid_record(root: &Path) -> Option<DaemonRecord> {
     let record = read_record(&record_path(root)).ok()?;
