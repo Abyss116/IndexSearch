@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -74,10 +75,44 @@ def install_claude(scope: str, project: Path | None) -> None:
     if scope == "project":
         if project is None:
             raise SystemExit("--project is required for project scope")
-        copy_tree(repo_root() / "skills" / "indexsearch", project / ".claude" / "skills" / "indexsearch")
+        skill_dir = project / ".claude" / "skills" / "indexsearch"
+        copy_tree(repo_root() / "skills" / "indexsearch", skill_dir)
+        install_claude_hook(
+            project / ".claude" / "settings.json",
+            "${CLAUDE_PROJECT_DIR}/.claude/skills/indexsearch/scripts/prefer-isgrep-hook.py",
+        )
         write_marked_block(project / "CLAUDE.md", read_text(repo_root() / "agent-rules" / "CLAUDE.md"))
         return
-    copy_tree(repo_root() / "skills" / "indexsearch", Path.home() / ".claude" / "skills" / "indexsearch")
+    skill_dir = Path.home() / ".claude" / "skills" / "indexsearch"
+    copy_tree(repo_root() / "skills" / "indexsearch", skill_dir)
+    install_claude_hook(
+        Path.home() / ".claude" / "settings.json",
+        str(skill_dir / "scripts" / "prefer-isgrep-hook.py"),
+    )
+
+
+def install_claude_hook(settings_path: Path, script_path: str) -> None:
+    hook = {
+        "type": "command",
+        "command": "python3",
+        "args": [script_path],
+        "timeout": 5,
+    }
+    if settings_path.exists():
+        settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    else:
+        settings = {}
+    for group in settings.get("hooks", {}).get("PreToolUse", []):
+        for existing in group.get("hooks", []):
+            if existing.get("command") == "python3" and script_path in existing.get("args", []):
+                print(f"kept existing Claude hook in {settings_path}")
+                return
+    settings.setdefault("hooks", {}).setdefault("PreToolUse", []).append(
+        {"matcher": "Bash", "hooks": [hook]}
+    )
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    print(f"updated {settings_path}")
 
 
 def install_opencode(scope: str, project: Path | None) -> None:

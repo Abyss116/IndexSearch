@@ -1,6 +1,6 @@
 [package]
 name = "indexsearch"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2024"
 description = "Persistent-index rg-like search for large source trees"
 repository = "https://github.com/Abyss116/IndexSearch"
@@ -31,6 +31,7 @@ notify = "8.2"
 rayon = "1.10"
 regex = "1.11"
 rustc-hash = "2.1"
+serde_json = "1.0"
 walkdir = "2.5"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
@@ -51,6 +52,10 @@ path = "src/bin/indexsearch.rs"
 [[bin]]
 name = "is"
 path = "src/bin/is.rs"
+
+[[bin]]
+name = "isgrep"
+path = "src/bin/isgrep.rs"
 
 [[bin]]
 name = "istool"

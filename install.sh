@@ -45,7 +45,7 @@ mkdir -p "$install_dir"
 echo
 "$install_dir/istool" --version
 "$install_dir/indexsearch" --version
-echo "installed istool, indexsearch, is, and is-daemon to $install_dir"
+echo "installed istool, indexsearch, is, isgrep, and is-daemon to $install_dir"
 case ":$PATH:" in
   *":$install_dir:"*) ;;
   *) echo "note: add $install_dir to PATH if your shell cannot find is" ;;

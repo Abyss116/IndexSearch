@@ -39,6 +39,7 @@ use rayon::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use regex::bytes::{Regex, RegexBuilder};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use serde_json::{Value as JsonValue, json};
 use walkdir::{DirEntry, WalkDir};
 
 #[cfg(unix)]
@@ -104,6 +105,8 @@ const AGENT_BLOCK_END: &str = "<!-- indexsearch-agent:end -->";
 const EMBEDDED_CODEX_SKILL: &str = include_str!("../skills/indexsearch/SKILL.md");
 const EMBEDDED_UE_SKILL_CONFIG: &str =
     include_str!("../skills/indexsearch/assets/unreal-engine-is-project-config.txt");
+const EMBEDDED_CLAUDE_ISGREP_HOOK: &str =
+    include_str!("../skills/indexsearch/scripts/prefer-isgrep-hook.py");
 const EMBEDDED_AGENTS_RULE: &str = include_str!("../agent-rules/AGENTS.md");
 const EMBEDDED_CLAUDE_RULE: &str = include_str!("../agent-rules/CLAUDE.md");
 const EMBEDDED_CURSOR_RULE: &str = include_str!("../agent-rules/cursor/indexsearch.mdc");
@@ -995,6 +998,11 @@ fn print_help() {
         "indexsearch PATTERN [PATH ...]",
         "same search frontend with a longer name",
     );
+    help_command(
+        &style,
+        "isgrep [GREP_OPTIONS] PATTERN [FILE ...]",
+        "grep-compatible frontend for indexed searches",
+    );
     println!();
 
     help_section(&style, "Common Search Options");
@@ -1354,6 +1362,11 @@ fn print_install_skills_help() {
         &style,
         "--ue-template",
         "copy the Unreal Engine is-project-config.txt template",
+    );
+    help_option(
+        &style,
+        "--target claude",
+        "also install a Claude Code hook that blocks bare grep in Bash",
     );
     help_option(&style, "--force", "replace an existing UE template");
     help_option(&style, "--dry-run", "show what would be installed");
@@ -3176,6 +3189,7 @@ fn command_install(args: &[String]) -> Result<i32> {
     let tool_path = dir.join(executable_name("istool"));
     let exe_path = dir.join(executable_name("indexsearch"));
     let alias_path = dir.join(executable_name("is"));
+    let grep_alias_path = dir.join(executable_name("isgrep"));
     let stopped = stop_all_project_services_quiet()?;
     if stopped != 0 {
         println!("stopped {stopped} running project service(s) before install");
@@ -3212,6 +3226,10 @@ fn command_install(args: &[String]) -> Result<i32> {
         .parent()
         .map(|parent| parent.join(executable_name("is")))
         .filter(|path| path.is_file());
+    let grep_frontend_src = src
+        .parent()
+        .map(|parent| parent.join(executable_name("isgrep")))
+        .filter(|path| path.is_file());
     #[cfg(windows)]
     {
         let legacy_alias_path = dir.join("is.cmd");
@@ -3223,9 +3241,15 @@ fn command_install(args: &[String]) -> Result<i32> {
     if let Some(frontend_src) = frontend_src {
         install_executable(&frontend_src, &exe_path)?;
         install_search_alias(&exe_path, &alias_path)?;
+        if let Some(grep_frontend_src) = grep_frontend_src {
+            install_executable(&grep_frontend_src, &grep_alias_path)?;
+        } else {
+            install_search_alias(&exe_path, &grep_alias_path)?;
+        }
     } else if let Some(short_frontend_src) = short_frontend_src {
         install_executable(&short_frontend_src, &exe_path)?;
         install_search_alias(&exe_path, &alias_path)?;
+        install_search_alias(&exe_path, &grep_alias_path)?;
     } else {
         bail!(
             "cannot find `{}` next to {}; build or package the search frontend first",
@@ -3240,9 +3264,10 @@ fn command_install(args: &[String]) -> Result<i32> {
     println!("tool: {}", display_path(&tool_path));
     println!("frontend: {}", display_path(&exe_path));
     println!("frontend: {}", display_path(&alias_path));
+    println!("frontend: {}", display_path(&grep_alias_path));
     if !path_contains(&dir) {
         println!(
-            "note: add {} to PATH to use istool, indexsearch, and is from any shell",
+            "note: add {} to PATH to use istool, indexsearch, is, and isgrep from any shell",
             display_path(&dir)
         );
     }
@@ -3470,6 +3495,11 @@ fn install_codex_skill(options: &InstallSkillsOptions, project: Option<&Path>) -
             .join("unreal-engine-is-project-config.txt"),
         EMBEDDED_UE_SKILL_CONFIG,
         options.dry_run,
+    )?;
+    write_text_file(
+        &root.join("scripts").join("prefer-isgrep-hook.py"),
+        EMBEDDED_CLAUDE_ISGREP_HOOK,
+        options.dry_run,
     )
 }
 
@@ -3487,6 +3517,16 @@ fn install_claude_skill(options: &InstallSkillsOptions, project: Option<&Path>) 
                 .join("assets")
                 .join("unreal-engine-is-project-config.txt"),
             EMBEDDED_UE_SKILL_CONFIG,
+            options.dry_run,
+        )?;
+        write_text_file(
+            &root.join("scripts").join("prefer-isgrep-hook.py"),
+            EMBEDDED_CLAUDE_ISGREP_HOOK,
+            options.dry_run,
+        )?;
+        install_claude_prefer_isgrep_hook(
+            &project.join(".claude").join("settings.json"),
+            "${CLAUDE_PROJECT_DIR}/.claude/skills/indexsearch/scripts/prefer-isgrep-hook.py",
             options.dry_run,
         )?;
         write_marked_block(
@@ -3510,8 +3550,113 @@ fn install_claude_skill(options: &InstallSkillsOptions, project: Option<&Path>) 
                 .join("unreal-engine-is-project-config.txt"),
             EMBEDDED_UE_SKILL_CONFIG,
             options.dry_run,
+        )?;
+        write_text_file(
+            &root.join("scripts").join("prefer-isgrep-hook.py"),
+            EMBEDDED_CLAUDE_ISGREP_HOOK,
+            options.dry_run,
+        )?;
+        install_claude_prefer_isgrep_hook(
+            &home_dir().join(".claude").join("settings.json"),
+            &root
+                .join("scripts")
+                .join("prefer-isgrep-hook.py")
+                .to_string_lossy(),
+            options.dry_run,
         )
     }
+}
+
+fn install_claude_prefer_isgrep_hook(
+    settings_path: &Path,
+    script_path: &str,
+    dry_run: bool,
+) -> Result<()> {
+    let hook = json!({
+        "type": "command",
+        "command": "python3",
+        "args": [script_path],
+        "timeout": 5
+    });
+    let mut settings = if settings_path.exists() {
+        let text = fs::read_to_string(settings_path)?;
+        serde_json::from_str::<JsonValue>(&text).with_context(|| {
+            format!(
+                "failed to parse Claude settings at {}",
+                display_path(settings_path)
+            )
+        })?
+    } else {
+        json!({})
+    };
+    if claude_hook_already_installed(&settings, script_path) {
+        println!(
+            "kept existing Claude hook in {}",
+            display_path(settings_path)
+        );
+        return Ok(());
+    }
+    let Some(settings_object) = settings.as_object_mut() else {
+        bail!(
+            "Claude settings must be a JSON object: {}",
+            display_path(settings_path)
+        );
+    };
+    let hooks = settings_object.entry("hooks").or_insert_with(|| json!({}));
+    if !hooks.is_object() {
+        bail!(
+            "Claude settings hooks must be a JSON object: {}",
+            display_path(settings_path)
+        );
+    }
+    let pre_tool_use = hooks
+        .as_object_mut()
+        .unwrap()
+        .entry("PreToolUse")
+        .or_insert_with(|| json!([]));
+    if !pre_tool_use.is_array() {
+        bail!(
+            "Claude settings hooks.PreToolUse must be an array: {}",
+            display_path(settings_path)
+        );
+    }
+    pre_tool_use.as_array_mut().unwrap().push(json!({
+        "matcher": "Bash",
+        "hooks": [hook]
+    }));
+    let text = serde_json::to_string_pretty(&settings)?;
+    if dry_run {
+        println!("would update {}", display_path(settings_path));
+        return Ok(());
+    }
+    if let Some(parent) = settings_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(settings_path, format!("{text}\n"))?;
+    println!("updated {}", display_path(settings_path));
+    Ok(())
+}
+
+fn claude_hook_already_installed(settings: &JsonValue, script_path: &str) -> bool {
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .and_then(JsonValue::as_array)
+        .is_some_and(|groups| {
+            groups.iter().any(|group| {
+                group
+                    .get("hooks")
+                    .and_then(JsonValue::as_array)
+                    .is_some_and(|hooks| {
+                        hooks.iter().any(|hook| {
+                            hook.get("command").and_then(JsonValue::as_str) == Some("python3")
+                                && hook.get("args").and_then(JsonValue::as_array).is_some_and(
+                                    |args| args.iter().any(|arg| arg.as_str() == Some(script_path)),
+                                )
+                        })
+                    })
+            })
+        })
 }
 
 fn install_opencode_rule(options: &InstallSkillsOptions, project: Option<&Path>) -> Result<()> {

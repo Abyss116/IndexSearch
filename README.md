@@ -13,6 +13,7 @@ Use the short command:
 is -n "SomeSymbol" .
 is -i -w -g "*.cpp" "render pass" .
 is --files .
+isgrep -n "A\\|B" file.txt
 ```
 
 ## Install
@@ -55,7 +56,7 @@ After extracting a direct-download archive, run:
 ./istool install
 ```
 
-The installer places `istool`, `indexsearch`, `is`, and `is-daemon` in a
+The installer places `istool`, `indexsearch`, `is`, `isgrep`, and `is-daemon` in a
 user-writable bin directory. On Windows, `is` is a native `is.exe`, not an
 `is.cmd` wrapper.
 
@@ -185,6 +186,30 @@ Unsupported rg flags are logged in the project log and ignored when that is
 safe, so agent and editor integrations can keep running. Use `rg` for PCRE-only
 patterns, multiline matching, preprocessors, archive search, or other behavior
 that must exactly match ripgrep.
+
+## grep-Compatible Usage
+
+Use `isgrep` when replacing an existing `grep` command or when you want grep
+option spellings:
+
+```bash
+isgrep -n "IndexGraph\\|agent interface\\|context\\|files" MEMORY.md
+isgrep -E -n "IndexGraph|agent interface|context|files" MEMORY.md
+isgrep -r -n --include="*.rs" "SomeSymbol" .
+```
+
+`isgrep` defaults to grep Basic Regex syntax, so `A\|B` is translated to the
+Rust regex alternation used by IndexSearch. It also maps grep-specific flags
+whose meanings conflict with `is`, such as `grep -h` and `grep -L`. For grep
+semantics that the indexed backend cannot provide, such as PCRE mode,
+backreferences, null-data mode, or piped stdin searches, `isgrep` falls back to
+the system `grep` when available.
+
+Claude Code installs get an additional guardrail: `istool install-skills
+--target claude` copies a `PreToolUse` hook that blocks bare Bash `grep`,
+`egrep`, and `fgrep` commands and tells Claude to retry with `isgrep`. Set
+`INDEXSEARCH_ALLOW_GREP=1` on the Bash command only when exact grep semantics
+are intentionally required.
 
 ## Profiling
 

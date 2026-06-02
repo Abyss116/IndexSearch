@@ -8,11 +8,15 @@ case "$bin" in
 esac
 daemon_bin="$(dirname "$bin")/is-daemon"
 tool_bin="${INDEXSEARCH_TOOL_BIN:-$(dirname "$bin")/istool}"
+grep_bin="${INDEXSEARCH_GREP_BIN:-$(dirname "$bin")/isgrep}"
 if [[ ! -x "$daemon_bin" && -x "$daemon_bin.exe" ]]; then
   daemon_bin="$daemon_bin.exe"
 fi
 if [[ ! -x "$tool_bin" && -x "$tool_bin.exe" ]]; then
   tool_bin="$tool_bin.exe"
+fi
+if [[ ! -x "$grep_bin" && -x "$grep_bin.exe" ]]; then
+  grep_bin="$grep_bin.exe"
 fi
 test_home="$(mktemp -d)"
 export HOME="$test_home"
@@ -97,7 +101,11 @@ grep -q 'istool <COMMAND>' <<<"$help_out"
 tool_help="$("$tool_bin" --help)"
 grep -q 'Search Frontends' <<<"$tool_help"
 grep -q 'istool search --help' <<<"$tool_help"
+grep -q 'isgrep \[GREP_OPTIONS\]' <<<"$tool_help"
 grep -q 'always expects a subcommand' <<<"$tool_help"
+grep_help="$("$grep_bin" --help)"
+grep -q 'grep-compatible frontend' <<<"$grep_help"
+grep -Fq 'A\|B' <<<"$grep_help"
 install_help="$("$tool_bin" install --help)"
 grep -q 'install the daemon backend and user-facing commands' <<<"$install_help"
 grep -q -- '--dir PATH' <<<"$install_help"
@@ -236,6 +244,18 @@ alternation_regex="$("$bin" -n '\b(Render|Shader|Nanite|Lumen)[A-Za-z0-9_]*\b' "
 grep -q "$tmp/src/a.cc:5:RenderThing" <<<"$alternation_regex"
 wordspan_regex="$("$bin" -n 'Skeletal[A-Za-z0-9_]*Component' "$tmp")"
 grep -q "$tmp/src/a.cc:6:SkeletalMeshComponent" <<<"$wordspan_regex"
+
+grep_basic_alt="$("$grep_bin" -n 'hello_world\|Needle' "$tmp/src/a.cc" "$tmp/src/b.txt")"
+grep -q 'a.cc:1:hello_world = 1' <<<"$grep_basic_alt"
+grep -q 'b.txt:1:Needle there' <<<"$grep_basic_alt"
+grep_extended_alt="$("$grep_bin" -E -n 'hello_world|Needle' "$tmp/src/a.cc" "$tmp/src/b.txt")"
+grep -q 'a.cc:1:hello_world = 1' <<<"$grep_extended_alt"
+grep -q 'b.txt:1:Needle there' <<<"$grep_extended_alt"
+grep_no_filename="$("$grep_bin" -h -n 'hello_world' "$tmp/src/a.cc")"
+[[ "$grep_no_filename" == '1:hello_world = 1' ]]
+grep_without_match="$("$grep_bin" -L -F needle "$tmp/src/a.cc" "$tmp/src/b.txt")"
+grep -q "$tmp/src/b.txt" <<<"$grep_without_match"
+! grep -q "$tmp/src/a.cc" <<<"$grep_without_match"
 
 files="$("$bin" --files "$tmp")"
 grep -q 'src/a.cc' <<<"$files"
@@ -557,19 +577,23 @@ skills_project="$(mktemp -d)"
 INDEXSEARCH_SKIP_STALE_DAEMON_KILL=1 "$tool_bin" install --dir "$install_tmp" >/dev/null
 install_exe="$install_tmp/indexsearch"
 install_alias="$install_tmp/is"
+install_grep="$install_tmp/isgrep"
 install_daemon="$install_tmp/is-daemon"
 install_tool="$install_tmp/istool"
 if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* ]]; then
   install_exe="$install_exe.exe"
   install_alias="$install_alias.exe"
+  install_grep="$install_grep.exe"
   install_daemon="$install_daemon.exe"
   install_tool="$install_tool.exe"
 fi
 "$install_tool" --version >/dev/null
 "$install_exe" --version >/dev/null
 "$install_alias" --version >/dev/null
+"$install_grep" --version >/dev/null
 "$install_daemon" --version >/dev/null
 [[ -x "$install_alias" || -L "$install_alias" ]]
+[[ -x "$install_grep" || -L "$install_grep" ]]
 [[ -x "$install_daemon" || -L "$install_daemon" ]]
 [[ -x "$install_tool" || -L "$install_tool" ]]
 cat > "$install_project/index-search-project.txt" <<'CFG'
@@ -586,12 +610,17 @@ grep -q 'stopped [0-9][0-9]* running project service' <<<"$install_reinstall_out
 "$install_alias" --version >/dev/null
 HOME="$skills_home" "$tool_bin" install-skills --target all --scope user >/dev/null
 [[ -f "$skills_home/.codex/skills/indexsearch/SKILL.md" ]]
+[[ -f "$skills_home/.codex/skills/indexsearch/scripts/prefer-isgrep-hook.py" ]]
 [[ -f "$skills_home/.claude/skills/indexsearch/SKILL.md" ]]
+[[ -f "$skills_home/.claude/skills/indexsearch/scripts/prefer-isgrep-hook.py" ]]
+grep -q 'prefer-isgrep-hook.py' "$skills_home/.claude/settings.json"
 grep -q 'IndexSearch Agent Instructions' "$skills_home/.config/opencode/AGENTS.md"
 "$tool_bin" install-skills --target all --scope project --project "$skills_project" --ue-template >/dev/null
 [[ -f "$skills_project/AGENTS.md" ]]
 [[ -f "$skills_project/CLAUDE.md" ]]
 [[ -f "$skills_project/.claude/skills/indexsearch/SKILL.md" ]]
+[[ -f "$skills_project/.claude/skills/indexsearch/scripts/prefer-isgrep-hook.py" ]]
+grep -q 'prefer-isgrep-hook.py' "$skills_project/.claude/settings.json"
 [[ -f "$skills_project/.cursor/rules/indexsearch.mdc" ]]
 [[ -f "$skills_project/.indexsearch/is-project-config.txt" ]]
 

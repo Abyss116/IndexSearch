@@ -58,7 +58,7 @@ try {
     Write-Host ""
     & (Join-Path $InstallDir "istool.exe") --version
     & (Join-Path $InstallDir "indexsearch.exe") --version
-    Write-Host "installed istool.exe, indexsearch.exe, is.exe, and is-daemon.exe to $InstallDir"
+    Write-Host "installed istool.exe, indexsearch.exe, is.exe, isgrep.exe, and is-daemon.exe to $InstallDir"
 } finally {
     Remove-Item -Recurse -Force $Temp -ErrorAction SilentlyContinue
 }

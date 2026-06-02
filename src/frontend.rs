@@ -106,13 +106,483 @@ fn main() {
     {
         return;
     }
-    match run(&args) {
+    let command_name = frontend_command_name();
+    let result = if command_name == "isgrep" {
+        run_grep_frontend(&args)
+    } else {
+        run(&args)
+    };
+    match result {
         Ok(code) => std::process::exit(code),
         Err(message) => {
-            eprintln!("is: {message}");
+            eprintln!("{command_name}: {message}");
             std::process::exit(2);
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GrepRegexMode {
+    Basic,
+    Extended,
+    Fixed,
+}
+
+enum GrepTranslation {
+    Search(Vec<String>),
+    FallbackToGrep,
+}
+
+fn run_grep_frontend(args: &[String]) -> Result<i32, String> {
+    let first = first_search_flag(args);
+    if args.is_empty() {
+        print_isgrep_help();
+        return Ok(2);
+    }
+    if first.is_some_and(|arg| arg == "--help") {
+        print_isgrep_help();
+        return Ok(0);
+    }
+    if first.is_some_and(|arg| matches!(arg, "-V" | "--version")) {
+        println!("{} {}", frontend_command_name(), env!("CARGO_PKG_VERSION"));
+        return Ok(0);
+    }
+    match translate_grep_args(args)? {
+        GrepTranslation::Search(search_args) => run(&search_args),
+        GrepTranslation::FallbackToGrep => run_system_grep(args),
+    }
+}
+
+fn print_isgrep_help() {
+    println!("Usage");
+    println!("  isgrep [GREP_OPTIONS] PATTERN [FILE ...]");
+    println!();
+    println!("Description");
+    println!("  grep-compatible frontend for indexed IndexSearch searches");
+    println!("  Defaults to grep Basic Regex syntax, so `A\\|B` works as alternation.");
+    println!("  Unsupported grep-only semantics fall back to the system grep when available.");
+    println!();
+    println!("Common Options");
+    println!("  -G, --basic-regexp              use grep Basic Regex syntax (default)");
+    println!("  -E, --extended-regexp           use extended regex syntax");
+    println!("  -F, --fixed-strings             treat patterns as literals");
+    println!("  -e, --regexp PATTERN            search pattern");
+    println!("  -f, --file FILE                 read patterns from file");
+    println!("  -i, -v, -w, -x                  ignore-case, invert, word, line match");
+    println!("  -n, -H, -h                      line numbers and filename controls");
+    println!("  -l, -L, -c, -o, -q              file/count/only/quiet modes");
+    println!("  -A NUM, -B NUM, -C NUM          context lines");
+    println!("  -r, -R                          accepted for recursive grep commands");
+}
+
+fn translate_grep_args(args: &[String]) -> Result<GrepTranslation, String> {
+    let mut out = Vec::new();
+    let mut patterns = Vec::new();
+    let mut paths = Vec::new();
+    let mut mode = GrepRegexMode::Basic;
+    let mut positional_only = false;
+    let mut filename_override = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = &args[i];
+        if positional_only {
+            consume_grep_positional(arg, &mut patterns, &mut paths);
+            i += 1;
+            continue;
+        }
+        if arg == "--" {
+            positional_only = true;
+            i += 1;
+            continue;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            if long.is_empty() {
+                positional_only = true;
+                i += 1;
+                continue;
+            }
+            match translate_grep_long_option(
+                args,
+                &mut i,
+                long,
+                &mut out,
+                &mut patterns,
+                &mut mode,
+                &mut filename_override,
+            )? {
+                GrepOptionOutcome::Translated => {
+                    i += 1;
+                    continue;
+                }
+                GrepOptionOutcome::Fallback => return Ok(GrepTranslation::FallbackToGrep),
+            }
+        }
+        if arg.starts_with('-') && arg != "-" {
+            match translate_grep_short_options(
+                args,
+                &mut i,
+                arg,
+                &mut out,
+                &mut patterns,
+                &mut mode,
+                &mut filename_override,
+            )? {
+                GrepOptionOutcome::Translated => {
+                    i += 1;
+                    continue;
+                }
+                GrepOptionOutcome::Fallback => return Ok(GrepTranslation::FallbackToGrep),
+            }
+        }
+        consume_grep_positional(arg, &mut patterns, &mut paths);
+        i += 1;
+    }
+
+    if patterns.is_empty() {
+        return Err("a grep pattern is required".to_string());
+    }
+    if paths.is_empty() && !io::stdin().is_terminal() {
+        return Ok(GrepTranslation::FallbackToGrep);
+    }
+    if !filename_override && paths.len() == 1 && PathBuf::from(&paths[0]).is_file() {
+        out.push("-I".to_string());
+    }
+    let Some(pattern) = build_grep_search_pattern(&patterns, mode) else {
+        return Ok(GrepTranslation::FallbackToGrep);
+    };
+    if mode == GrepRegexMode::Fixed && patterns.len() == 1 && !patterns[0].is_empty() {
+        out.push("-F".to_string());
+    }
+    out.push("--".to_string());
+    out.push(pattern);
+    out.extend(paths);
+    Ok(GrepTranslation::Search(out))
+}
+
+enum GrepOptionOutcome {
+    Translated,
+    Fallback,
+}
+
+fn consume_grep_positional(arg: &str, patterns: &mut Vec<String>, paths: &mut Vec<String>) {
+    if patterns.is_empty() {
+        patterns.push(arg.to_string());
+    } else {
+        paths.push(arg.to_string());
+    }
+}
+
+fn translate_grep_long_option(
+    args: &[String],
+    i: &mut usize,
+    long: &str,
+    out: &mut Vec<String>,
+    patterns: &mut Vec<String>,
+    mode: &mut GrepRegexMode,
+    filename_override: &mut bool,
+) -> Result<GrepOptionOutcome, String> {
+    let (name, inline_value) = long
+        .split_once('=')
+        .map(|(name, value)| (name, Some(value.to_string())))
+        .unwrap_or((long, None));
+    match name {
+        "help" => {
+            print_isgrep_help();
+            std::process::exit(0);
+        }
+        "version" => {
+            println!("{} {}", frontend_command_name(), env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        "basic-regexp" => *mode = GrepRegexMode::Basic,
+        "extended-regexp" => *mode = GrepRegexMode::Extended,
+        "fixed-strings" => *mode = GrepRegexMode::Fixed,
+        "perl-regexp" => return Ok(GrepOptionOutcome::Fallback),
+        "regexp" => patterns.push(grep_option_value(args, i, "--regexp", inline_value)?),
+        "file" => {
+            let file = grep_option_value(args, i, "--file", inline_value)?;
+            let Ok(text) = fs::read_to_string(file) else {
+                return Ok(GrepOptionOutcome::Fallback);
+            };
+            patterns.extend(text.lines().map(str::to_string));
+        }
+        "ignore-case" => out.push("-i".to_string()),
+        "invert-match" => out.push("-v".to_string()),
+        "word-regexp" => out.push("-w".to_string()),
+        "line-regexp" => out.push("-x".to_string()),
+        "line-number" => out.push("-n".to_string()),
+        "with-filename" => {
+            *filename_override = true;
+            out.push("-H".to_string());
+        }
+        "no-filename" => {
+            *filename_override = true;
+            out.push("-I".to_string());
+        }
+        "files-with-matches" => out.push("-l".to_string()),
+        "files-without-match" => out.push("--files-without-match".to_string()),
+        "count" => out.push("-c".to_string()),
+        "only-matching" => out.push("-o".to_string()),
+        "quiet" | "silent" => out.push("-q".to_string()),
+        "no-messages" => out.push("--no-messages".to_string()),
+        "after-context" => push_grep_value(out, "-A", grep_option_value(args, i, "--after-context", inline_value)?),
+        "before-context" => push_grep_value(out, "-B", grep_option_value(args, i, "--before-context", inline_value)?),
+        "context" => push_grep_value(out, "-C", grep_option_value(args, i, "--context", inline_value)?),
+        "max-count" => push_grep_value(out, "-m", grep_option_value(args, i, "--max-count", inline_value)?),
+        "include" => push_grep_value(out, "-g", grep_option_value(args, i, "--include", inline_value)?),
+        "exclude" => {
+            let value = grep_option_value(args, i, "--exclude", inline_value)?;
+            push_grep_value(out, "-g", format!("!{value}"));
+        }
+        "exclude-dir" => {
+            let value = grep_option_value(args, i, "--exclude-dir", inline_value)?;
+            push_grep_value(out, "-g", format!("!{value}/**"));
+            push_grep_value(out, "-g", format!("!**/{value}/**"));
+        }
+        "recursive" => {}
+        "dereference-recursive" => out.push("--follow".to_string()),
+        "color" | "colour" => {
+            let value = inline_value.unwrap_or_else(|| "auto".to_string());
+            out.push(format!("--color={value}"));
+        }
+        "binary-files" => {
+            let _ = inline_value.unwrap_or_else(|| "binary".to_string());
+        }
+        "text" | "binary" | "devices" | "mmap" | "line-buffered" | "initial-tab" => {}
+        "directories" => {
+            let value = grep_option_value(args, i, "--directories", inline_value)?;
+            if value != "recurse" {
+                return Ok(GrepOptionOutcome::Fallback);
+            }
+        }
+        "null" | "null-data" | "byte-offset" | "label" => return Ok(GrepOptionOutcome::Fallback),
+        _ => return Ok(GrepOptionOutcome::Fallback),
+    }
+    Ok(GrepOptionOutcome::Translated)
+}
+
+fn translate_grep_short_options(
+    args: &[String],
+    i: &mut usize,
+    arg: &str,
+    out: &mut Vec<String>,
+    patterns: &mut Vec<String>,
+    mode: &mut GrepRegexMode,
+    filename_override: &mut bool,
+) -> Result<GrepOptionOutcome, String> {
+    let bytes = arg.as_bytes();
+    let mut pos = 1usize;
+    while pos < bytes.len() {
+        let flag = bytes[pos] as char;
+        match flag {
+            'G' => *mode = GrepRegexMode::Basic,
+            'E' => *mode = GrepRegexMode::Extended,
+            'F' => *mode = GrepRegexMode::Fixed,
+            'P' | 'Z' | 'z' | 'b' => return Ok(GrepOptionOutcome::Fallback),
+            'e' => {
+                patterns.push(grep_short_value(args, i, arg, pos, "-e")?);
+                return Ok(GrepOptionOutcome::Translated);
+            }
+            'f' => {
+                let file = grep_short_value(args, i, arg, pos, "-f")?;
+                let Ok(text) = fs::read_to_string(file) else {
+                    return Ok(GrepOptionOutcome::Fallback);
+                };
+                patterns.extend(text.lines().map(str::to_string));
+                return Ok(GrepOptionOutcome::Translated);
+            }
+            'A' => {
+                push_grep_value(out, "-A", grep_short_value(args, i, arg, pos, "-A")?);
+                return Ok(GrepOptionOutcome::Translated);
+            }
+            'B' => {
+                push_grep_value(out, "-B", grep_short_value(args, i, arg, pos, "-B")?);
+                return Ok(GrepOptionOutcome::Translated);
+            }
+            'C' => {
+                push_grep_value(out, "-C", grep_short_value(args, i, arg, pos, "-C")?);
+                return Ok(GrepOptionOutcome::Translated);
+            }
+            'm' => {
+                push_grep_value(out, "-m", grep_short_value(args, i, arg, pos, "-m")?);
+                return Ok(GrepOptionOutcome::Translated);
+            }
+            'd' => {
+                let value = grep_short_value(args, i, arg, pos, "-d")?;
+                if value != "recurse" {
+                    return Ok(GrepOptionOutcome::Fallback);
+                }
+                return Ok(GrepOptionOutcome::Translated);
+            }
+            'D' => return Ok(GrepOptionOutcome::Fallback),
+            'i' | 'y' => out.push("-i".to_string()),
+            'v' => out.push("-v".to_string()),
+            'w' => out.push("-w".to_string()),
+            'x' => out.push("-x".to_string()),
+            'n' => out.push("-n".to_string()),
+            'H' => {
+                *filename_override = true;
+                out.push("-H".to_string());
+            }
+            'h' => {
+                *filename_override = true;
+                out.push("-I".to_string());
+            }
+            'l' => out.push("-l".to_string()),
+            'L' => out.push("--files-without-match".to_string()),
+            'c' => out.push("-c".to_string()),
+            'o' => out.push("-o".to_string()),
+            'q' => out.push("-q".to_string()),
+            's' => out.push("--no-messages".to_string()),
+            'r' => {}
+            'R' => out.push("--follow".to_string()),
+            'a' | 'I' | 'T' | 'U' | 'u' => {}
+            'V' => {
+                println!("{} {}", frontend_command_name(), env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            _ => return Ok(GrepOptionOutcome::Fallback),
+        }
+        pos += 1;
+    }
+    Ok(GrepOptionOutcome::Translated)
+}
+
+fn grep_option_value(
+    args: &[String],
+    i: &mut usize,
+    name: &str,
+    inline_value: Option<String>,
+) -> Result<String, String> {
+    if let Some(value) = inline_value {
+        return Ok(value);
+    }
+    *i += 1;
+    args.get(*i)
+        .cloned()
+        .ok_or_else(|| format!("option {name} requires an argument"))
+}
+
+fn grep_short_value(args: &[String], i: &mut usize, arg: &str, pos: usize, name: &str) -> Result<String, String> {
+    if pos + 1 < arg.len() {
+        Ok(arg[pos + 1..].to_string())
+    } else {
+        *i += 1;
+        args.get(*i)
+            .cloned()
+            .ok_or_else(|| format!("option {name} requires an argument"))
+    }
+}
+
+fn push_grep_value(out: &mut Vec<String>, flag: &str, value: String) {
+    out.push(flag.to_string());
+    out.push(value);
+}
+
+fn build_grep_search_pattern(patterns: &[String], mode: GrepRegexMode) -> Option<String> {
+    let mut converted = Vec::with_capacity(patterns.len());
+    for pattern in patterns {
+        if grep_pattern_has_backreference(pattern) {
+            return None;
+        }
+        converted.push(match mode {
+            GrepRegexMode::Basic => translate_basic_grep_regex(pattern),
+            GrepRegexMode::Extended => pattern.clone(),
+            GrepRegexMode::Fixed => regex::escape(pattern),
+        });
+    }
+    if mode == GrepRegexMode::Fixed && patterns.len() == 1 && !patterns[0].is_empty() {
+        return patterns.first().cloned();
+    }
+    Some(join_regex_alternates(&converted))
+}
+
+fn join_regex_alternates(patterns: &[String]) -> String {
+    if patterns.len() == 1 {
+        if patterns[0].is_empty() {
+            "(?:)".to_string()
+        } else {
+            patterns[0].clone()
+        }
+    } else {
+        patterns
+            .iter()
+            .map(|pattern| {
+                if pattern.is_empty() {
+                    "(?:)".to_string()
+                } else {
+                    format!("(?:{pattern})")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+}
+
+fn translate_basic_grep_regex(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut chars = pattern.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(next) = chars.next() {
+                if matches!(next, '|' | '(' | ')' | '+' | '?' | '{' | '}') {
+                    out.push(next);
+                } else {
+                    out.push('\\');
+                    out.push(next);
+                }
+            } else {
+                out.push('\\');
+            }
+        } else if matches!(ch, '|' | '(' | ')' | '+' | '?' | '{' | '}') {
+            out.push('\\');
+            out.push(ch);
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn grep_pattern_has_backreference(pattern: &str) -> bool {
+    let mut escaped = false;
+    for ch in pattern.chars() {
+        if escaped {
+            if matches!(ch, '1'..='9') {
+                return true;
+            }
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        }
+    }
+    false
+}
+
+fn run_system_grep(args: &[String]) -> Result<i32, String> {
+    let mut command = system_grep_command();
+    command.args(args);
+    let status = command.status().map_err(|err| {
+        format!(
+            "cannot translate this grep invocation and failed to run system grep: {err}"
+        )
+    })?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn system_grep_command() -> Command {
+    let current = env::current_exe().ok();
+    for candidate in ["/usr/bin/grep", "/bin/grep"] {
+        let path = PathBuf::from(candidate);
+        if path.is_file()
+            && current
+                .as_ref()
+                .is_none_or(|exe| !same_fileish(&path, exe))
+        {
+            return Command::new(path);
+        }
+    }
+    Command::new("grep")
 }
 
 fn run(args: &[String]) -> Result<i32, String> {
@@ -883,12 +1353,22 @@ fn run_backend_search_help() -> Result<i32, String> {
 }
 
 fn frontend_command_name() -> String {
-    env::current_exe()
-        .ok()
-        .and_then(|path| {
-            path.file_stem()
+    env::args()
+        .next()
+        .and_then(|arg| {
+            Path::new(&arg)
+                .file_stem()
                 .and_then(|stem| stem.to_str())
                 .map(str::to_string)
+        })
+        .or_else(|| {
+            env::current_exe()
+                .ok()
+                .and_then(|path| {
+                    path.file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .map(str::to_string)
+                })
         })
         .unwrap_or_else(|| "is".to_string())
 }
