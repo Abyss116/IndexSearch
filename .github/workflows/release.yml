@@ -100,7 +100,7 @@ jobs:
           cp README.md "dist/${{ matrix.artifact }}/"
           cp LICENSE-MIT LICENSE-APACHE "dist/${{ matrix.artifact }}/"
           cp install.sh install.ps1 "dist/${{ matrix.artifact }}/"
-          cp is-project-config.txt "dist/${{ matrix.artifact }}/"
+          cp templates/unreal-engine/is-project-config.txt "dist/${{ matrix.artifact }}/is-project-config.txt"
           cp -R templates "dist/${{ matrix.artifact }}/"
           cp -R skills "dist/${{ matrix.artifact }}/"
           cp -R agent-rules "dist/${{ matrix.artifact }}/"
