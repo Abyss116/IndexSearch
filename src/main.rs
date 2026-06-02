@@ -2953,7 +2953,7 @@ fn discover_daemon_pids() -> Vec<u32> {
             "Where-Object { $_.Name -like 'is-daemon*' -or $_.CommandLine -match 'search-daemon' } | ",
             "ForEach-Object { $_.ProcessId }"
         );
-        if let Ok(output) = Command::new("powershell")
+        if let Ok(output) = hidden_background_command("powershell")
             .args(["-NoProfile", "-Command", script])
             .output()
         {
@@ -5257,7 +5257,7 @@ fn append_profile_events<W: Write>(out: &mut W, profile: &SearchProfile) -> Resu
 
 fn start_search_daemon(root: &Path) -> Result<()> {
     let exe = search_daemon_executable()?;
-    let mut command = Command::new(exe);
+    let mut command = hidden_background_command(exe);
     command
         .arg("search-daemon")
         .arg("--detach")
@@ -5271,6 +5271,18 @@ fn start_search_daemon(root: &Path) -> Result<()> {
         bail!("failed to start project service for {}", display_path(root));
     }
     Ok(())
+}
+
+fn hidden_background_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
 }
 
 fn start_search_daemon_from_current_index(root: &Path) -> Result<()> {
@@ -7291,7 +7303,7 @@ fn git_exclude_target(root: &Path) -> Result<Option<GitExcludeTarget>> {
 }
 
 fn git_rev_parse(root: &Path, args: &[&str]) -> Result<Option<String>> {
-    let output = Command::new("git")
+    let output = hidden_background_command("git")
         .arg("-C")
         .arg(root)
         .arg("rev-parse")
@@ -8337,7 +8349,7 @@ fn collect_git_changes(root: &Path, include_untracked: bool) -> Result<Option<Ve
     let mut changes = BTreeMap::new();
     match state.git_head {
         Some(previous_head) if previous_head != current_head => {
-            let output = Command::new("git")
+            let output = hidden_background_command("git")
                 .arg("-C")
                 .arg(root)
                 .args(["diff", "--name-status", "-z", &previous_head, &current_head])
@@ -8356,7 +8368,7 @@ fn collect_git_changes(root: &Path, include_untracked: bool) -> Result<Option<Ve
     } else {
         "--untracked-files=no"
     };
-    let output = Command::new("git")
+    let output = hidden_background_command("git")
         .arg("-C")
         .arg(root)
         .args(["status", "--porcelain=v1", "-z", untracked])
@@ -8378,7 +8390,7 @@ fn is_git_root(root: &Path) -> Result<bool> {
     if !git_metadata_present(root) {
         return Ok(false);
     }
-    let top = Command::new("git")
+    let top = hidden_background_command("git")
         .arg("-C")
         .arg(root)
         .args(["rev-parse", "--show-toplevel"])
@@ -8465,7 +8477,7 @@ fn current_git_head(root: &Path) -> Result<Option<String>> {
     if !git_metadata_present(root) {
         return Ok(None);
     }
-    let output = Command::new("git")
+    let output = hidden_background_command("git")
         .arg("-C")
         .arg(root)
         .args(["rev-parse", "--verify", "HEAD"])
@@ -14124,7 +14136,7 @@ fn stop_process(pid: u32) {
     }
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
+        let _ = hidden_background_command("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())

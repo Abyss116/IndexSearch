@@ -1144,7 +1144,7 @@ fn stderr_supports_progress() -> bool {
 fn start_project_service(root: &Path) -> Result<(), String> {
     let backend = backend_path()?;
     let show_progress = stderr_supports_progress();
-    let mut command = Command::new(backend);
+    let mut command = hidden_background_command(backend);
     command.arg("search-daemon").arg("--detach");
     command.arg(root).stdin(Stdio::null()).stdout(Stdio::null());
     if show_progress {
@@ -1162,6 +1162,18 @@ fn start_project_service(root: &Path) -> Result<(), String> {
             display_path(root)
         ))
     }
+}
+
+fn hidden_background_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
 }
 
 fn read_valid_record(root: &Path) -> Option<DaemonRecord> {
@@ -1570,7 +1582,7 @@ fn stop_process(pid: u32) {
     }
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
+        let _ = hidden_background_command("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
