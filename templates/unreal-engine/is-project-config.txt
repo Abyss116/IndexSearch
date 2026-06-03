@@ -17,6 +17,7 @@
 .vscode/
 .xcode/
 DerivedDataCache/
+ZenData/
 Intermediate/
 Binaries/
 Plugins/**/Binaries/

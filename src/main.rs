@@ -631,7 +631,11 @@ impl SearchProfile {
 }
 
 fn elapsed_ns(start: Instant) -> u64 {
-    start.elapsed().as_nanos().min(u64::MAX as u128) as u64
+    duration_ns(start.elapsed())
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
 }
 
 fn ns_to_secs(ns: u64) -> f64 {
@@ -2156,6 +2160,9 @@ fn command_index(args: &[String]) -> Result<i32> {
     timings.write += write_timer.elapsed().as_secs_f64();
     let index_size = index_storage_size(&cfg.root, &path);
     let elapsed = timer.elapsed().as_secs_f64();
+    progress.set_indeterminate("Starting service");
+    drop(_lock);
+    refresh_or_start_search_daemon_after_index(&cfg.root)?;
     progress.finish("Indexed code");
     flow.summary(format!(
         "Indexed {} files",
@@ -2186,8 +2193,6 @@ fn command_index(args: &[String]) -> Result<i32> {
     if !flow.compact_stdout() {
         println!("index_size: {}", format_bytes(index_size));
     }
-    drop(_lock);
-    refresh_or_start_search_daemon_after_index(&cfg.root)?;
     std::mem::forget(index);
     Ok(0)
 }
@@ -2356,6 +2361,9 @@ fn command_update(args: &[String]) -> Result<i32> {
     timings.write += write_timer.elapsed().as_secs_f64();
     let index_size = index_storage_size(&cfg.root, &path);
     let elapsed = timer.elapsed().as_secs_f64();
+    progress.set_indeterminate("Starting service");
+    drop(_lock);
+    refresh_or_start_search_daemon_after_index(&cfg.root)?;
     progress.finish("Indexed code");
     flow.summary(format!(
         "Indexed {} files",
@@ -2386,8 +2394,6 @@ fn command_update(args: &[String]) -> Result<i32> {
     if !flow.compact_stdout() {
         println!("index_size: {}", format_bytes(index_size));
     }
-    drop(_lock);
-    refresh_or_start_search_daemon_after_index(&cfg.root)?;
     std::mem::forget(index);
     Ok(0)
 }
@@ -7560,6 +7566,7 @@ fn build_index_file_entries(
 
     let count_profile_keys = options.profile;
     let profile_tokenize_steps = options.profile && index_profile_detail_enabled();
+    let slow_read_threshold = index_slow_read_threshold();
     let channel_capacity = index_pipeline_channel_capacity(cpu_threads, io_threads);
     let worker_file_capacity = entries.len().div_ceil(cpu_threads);
     let (tx, rx) = mpsc::sync_channel::<ReadIndexFile>(channel_capacity);
@@ -7617,9 +7624,20 @@ fn build_index_file_entries(
                         }
                         continue;
                     };
+                    let read_elapsed = read_timer.elapsed();
+                    if let Some(threshold) = slow_read_threshold
+                        && read_elapsed >= threshold
+                    {
+                        eprintln!(
+                            "profile: index_slow_read={} bytes={} path={}",
+                            format_elapsed_duration(read_elapsed),
+                            bytes.len(),
+                            display_path(&entry.path)
+                        );
+                    }
                     stats
                         .read_ns
-                        .fetch_add(elapsed_ns(read_timer), AtomicOrdering::Relaxed);
+                        .fetch_add(duration_ns(read_elapsed), AtomicOrdering::Relaxed);
                     let read_file = ReadIndexFile {
                         ordinal: entry.ordinal,
                         rel: entry.rel.clone(),
@@ -7651,6 +7669,12 @@ fn build_index_file_entries(
         }
         built
     })
+}
+
+fn index_slow_read_threshold() -> Option<Duration> {
+    let value = env::var("INDEXSEARCH_INDEX_SLOW_READ_MS").ok()?;
+    let millis = value.trim().parse::<u64>().ok()?;
+    (millis > 0).then(|| Duration::from_millis(millis))
 }
 
 fn processing_progress_total(entries: &[CurrentFile]) -> u64 {

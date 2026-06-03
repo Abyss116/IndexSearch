@@ -1144,7 +1144,11 @@ fn stderr_supports_progress() -> bool {
 fn start_project_service(root: &Path) -> Result<(), String> {
     let backend = backend_path()?;
     let show_progress = stderr_supports_progress();
-    let mut command = hidden_background_command(backend);
+    let mut command = if hide_project_service_startup_parent(show_progress) {
+        hidden_background_command(backend)
+    } else {
+        Command::new(backend)
+    };
     command.arg("search-daemon").arg("--detach");
     command.arg(root).stdin(Stdio::null()).stdout(Stdio::null());
     if show_progress {
@@ -1162,6 +1166,10 @@ fn start_project_service(root: &Path) -> Result<(), String> {
             display_path(root)
         ))
     }
+}
+
+fn hide_project_service_startup_parent(show_progress: bool) -> bool {
+    !show_progress
 }
 
 fn hidden_background_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
@@ -1672,5 +1680,16 @@ fn stdout_supports_ansi() -> bool {
             return true;
         }
         SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_service_startup_process_is_visible_when_showing_progress() {
+        assert!(!hide_project_service_startup_parent(true));
+        assert!(hide_project_service_startup_parent(false));
     }
 }
