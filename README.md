@@ -127,17 +127,17 @@ shader-debug/
 
 `IndexSearch.paths.live` is for high-churn or generated text directories that
 should not be persisted into the project index. Explicit searches inside those
-paths fall back to `rg`, for example `is Error Saved/Logs`, while ordinary
-project searches stay fast and stable. The bundled Unreal Engine template uses
-this for logs and shader debug output, while excluding `Saved/` from persistent
-indexing.
+paths are routed internally through `rg`, for example `is Error Saved/Logs`,
+while ordinary project searches stay fast and stable. The bundled Unreal Engine
+template uses this for logs and shader debug output, while excluding `Saved/`
+from persistent indexing.
 
 When a command names multiple explicit paths, IndexSearch splits the work: paths
 covered by `IndexSearch.paths.ignore`, `IndexSearch.paths.live`, or file
-include/exclude rules fall back to the external stream searcher, while indexed
-paths continue through the daemon. `is` uses `rg`; `isgrep` translates compatible
-grep syntax to `rg` as well, and only falls back to system `grep` for grep-only
-features that cannot be translated safely.
+include/exclude rules are routed internally through the external stream searcher,
+while indexed paths continue through the daemon. `is` uses `rg`; `isgrep`
+translates compatible grep syntax to `rg` as well, and invokes system `grep`
+internally for grep-only features that cannot be translated safely.
 
 For Unreal Engine source trees, copy the bundled template into the project
 root's `.indexsearch/` directory:
@@ -235,8 +235,10 @@ git diff | isgrep -n "SomeSymbol"
 Claude Code installs get an additional guardrail: `istool install-skills
 --target claude` copies a `PreToolUse` hook that blocks bare Bash `rg`/`ripgrep`
 and `grep`/`egrep`/`fgrep` commands. Retry ordinary local source searches with
-`is` or `isgrep`. Set `INDEXSEARCH_ALLOW_RG=1` or `INDEXSEARCH_ALLOW_GREP=1`
-only when exact ripgrep or grep semantics are intentionally required.
+`is` or `isgrep`; they route stdin, live/generated paths, ignored explicit
+paths, and compatible translated grep syntax through the necessary external
+search internally. Exit code 1 with no output means no matches, not a reason to
+rerun the same local search with bare `rg` or `grep`.
 
 ## Profiling
 

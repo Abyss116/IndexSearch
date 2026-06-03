@@ -8,13 +8,15 @@ commands.
 - Prefer `isgrep` over `grep`; it handles common grep flags and BRE
   alternation.
 - `is` may auto-create/find the index and start the project service.
-- For stdin, `is` uses `rg`; `isgrep` translates to `rg` when safe.
-- Use `rg` only for exact unsupported ripgrep behavior: PCRE2, multiline,
-  preprocessors, archives, or other non-indexed semantics.
-- Use `grep` only for exact grep-only behavior: binary mode, backreferences,
-  PCRE, null-data, or other unsafe translations.
+- For stdin, live/generated paths, ignored explicit paths, and compatible
+  translated grep syntax, keep using `is`/`isgrep`; they route the necessary
+  external search internally.
+- If `is` or `isgrep` exits with code 1 and no output, treat that as "no
+  matches", not as a reason to retry with `rg` or `grep`.
+- Do not manually rerun a local source search with bare `rg`/`grep` after
+  `is`/`isgrep` has no matches. Adjust the pattern or path while staying on
+  `is`/`isgrep`.
 - Claude hook blocks bare Bash `rg`/`ripgrep` and `grep`/`egrep`/`fgrep`.
-  Intentional escapes: `INDEXSEARCH_ALLOW_RG=1` or `INDEXSEARCH_ALLOW_GREP=1`.
 
 Examples:
 

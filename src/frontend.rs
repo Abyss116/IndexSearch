@@ -170,7 +170,7 @@ fn print_isgrep_help() {
     println!("Description");
     println!("  grep-compatible frontend for indexed IndexSearch searches");
     println!("  Defaults to grep Basic Regex syntax, so `A\\|B` works as alternation.");
-    println!("  Unsupported grep-only semantics fall back to the system grep when available.");
+    println!("  Unsupported grep-only semantics are handled through system grep internally.");
     println!();
     println!("Common Options");
     println!("  -G, --basic-regexp              use grep Basic Regex syntax (default)");

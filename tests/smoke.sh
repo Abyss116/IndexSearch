@@ -614,6 +614,15 @@ HOME="$skills_home" "$tool_bin" install-skills --target all --scope user >/dev/n
 [[ -f "$skills_home/.claude/skills/indexsearch/SKILL.md" ]]
 [[ -f "$skills_home/.claude/skills/indexsearch/scripts/prefer-isgrep-hook.py" ]]
 grep -q 'prefer-isgrep-hook.py' "$skills_home/.claude/settings.json"
+hook_payload='{"tool_name":"Bash","tool_input":{"command":"INDEXSEARCH_ALLOW_GREP=1 grep Foo ."}}'
+hook_status=0
+hook_err="$skills_home/hook.err"
+printf '%s\n' "$hook_payload" \
+  | python3 "$skills_home/.claude/skills/indexsearch/scripts/prefer-isgrep-hook.py" \
+    >/dev/null 2>"$hook_err" || hook_status=$?
+[[ "$hook_status" -eq 2 ]]
+grep -q 'Use `isgrep`' "$hook_err"
+grep -q 'Exit code 1' "$hook_err"
 grep -q 'IndexSearch Agent Instructions' "$skills_home/.config/opencode/AGENTS.md"
 "$tool_bin" install-skills --target all --scope project --project "$skills_project" --ue-template >/dev/null
 [[ -f "$skills_project/AGENTS.md" ]]
