@@ -220,12 +220,12 @@ isgrep -r -n --include="*.rs" "SomeSymbol" .
 Rust regex alternation used by IndexSearch. It also maps grep-specific flags
 whose meanings conflict with `is`, such as `grep -h` and `grep -L`. For grep
 semantics that the indexed backend cannot provide, such as PCRE mode,
-backreferences, null-data mode, or piped stdin searches, `isgrep` falls back to
-the system `grep` when available.
+backreferences, or null-data mode, `isgrep` falls back to the system `grep`
+when available.
 
 For pipeline input, the persistent project index is not used. `is` forwards
-rg-style stdin searches to `rg`, while `isgrep` falls back to `grep` for
-grep-style stdin searches:
+rg-style stdin searches to `rg`; `isgrep` translates compatible grep-style
+stdin searches to `rg` too, and uses system `grep` only for grep-only semantics:
 
 ```bash
 git diff | is -n "SomeSymbol"
@@ -233,10 +233,10 @@ git diff | isgrep -n "SomeSymbol"
 ```
 
 Claude Code installs get an additional guardrail: `istool install-skills
---target claude` copies a `PreToolUse` hook that blocks bare Bash `grep`,
-`egrep`, and `fgrep` commands and tells Claude to retry with `isgrep`. Set
-`INDEXSEARCH_ALLOW_GREP=1` on the Bash command only when exact grep semantics
-are intentionally required.
+--target claude` copies a `PreToolUse` hook that blocks bare Bash `rg`/`ripgrep`
+and `grep`/`egrep`/`fgrep` commands. Retry ordinary local source searches with
+`is` or `isgrep`. Set `INDEXSEARCH_ALLOW_RG=1` or `INDEXSEARCH_ALLOW_GREP=1`
+only when exact ripgrep or grep semantics are intentionally required.
 
 ## Profiling
 
@@ -294,6 +294,11 @@ installed with:
 istool install-skills
 istool install-skills --target all --scope project --project /path/to/project --ue-template
 ```
+
+Claude Code is the strictest target because it supports a `PreToolUse` hook for
+Bash commands. Codex and OpenCode receive skill/`AGENTS.md` instructions, and
+Cursor receives an always-on rule file; those surfaces guide the agent but do
+not provide the same hard interception as Claude's hook.
 
 ## License
 

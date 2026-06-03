@@ -1,6 +1,6 @@
 ---
 description: Prefer IndexSearch for fast searches in large source trees, especially Unreal Engine.
-alwaysApply: false
+alwaysApply: true
 ---
 
 # IndexSearch
@@ -19,6 +19,9 @@ For grep-style commands, prefer `isgrep` over `grep`; it accepts grep-style
 flags and translates default Basic Regex patterns like `A\|B`. Fall back to
 `grep` only when exact grep stdin, binary, PCRE, backreference, null-data, or
 other non-indexed semantics are required.
+For compatible grep-style stdin or excluded-path searches, `isgrep` translates
+the command to `rg`; system `grep` is only for semantics that cannot be safely
+translated.
 Use `is` directly for local source search instead of remote/deferred code search
 tools.
 In PowerShell, quote patterns containing `|` or `>` and prefer `is -- ">>>>"`

@@ -20,9 +20,10 @@ index, and start the project service automatically.
 - Use `grep` only when exact grep stdin, binary, PCRE, backreference, null-data,
   or other non-indexed semantics are required.
 - `istool install-skills --target claude` installs a Claude Code `PreToolUse`
-  hook that blocks bare Bash `grep`/`egrep`/`fgrep` and asks you to retry with
-  `isgrep`. Use `INDEXSEARCH_ALLOW_GREP=1` only for intentional exact grep
-  semantics.
+  hook that blocks bare Bash `rg`/`ripgrep` and `grep`/`egrep`/`fgrep`. Retry
+  ordinary local source searches with `is` or `isgrep`. Use
+  `INDEXSEARCH_ALLOW_RG=1` or `INDEXSEARCH_ALLOW_GREP=1` only for intentional
+  exact ripgrep/grep semantics.
 - Run `istool update --git .` after Git changes if no project service was running.
 - Use `istool projects`, `istool log .`, and `istool stop .` to inspect or stop
   project services.

@@ -22,7 +22,8 @@ service for non-interactive agent searches when needed.
 Use `isgrep` as the default replacement for `grep` when the command is already
 written in grep syntax or when grep Basic Regex compatibility matters.
 Claude Code installs also include a `PreToolUse` hook that blocks bare Bash
-`grep`/`egrep`/`fgrep` and asks the agent to retry with `isgrep`.
+`rg`/`ripgrep` and `grep`/`egrep`/`fgrep`, asking the agent to retry with `is`
+or `isgrep`.
 
 ## Default Behavior
 
@@ -44,6 +45,9 @@ Claude Code installs also include a `PreToolUse` hook that blocks bare Bash
   search excluded paths with `rg`; `isgrep` also uses translated `rg` arguments
   for compatible grep syntax, and uses system `grep` only for grep-only
   semantics that cannot be translated safely.
+- Claude Code hook escape hatches are explicit: use `INDEXSEARCH_ALLOW_RG=1`
+  only for intentional exact ripgrep semantics, and `INDEXSEARCH_ALLOW_GREP=1`
+  only for intentional exact grep semantics.
 - If the current directory is inside an indexed repository, use `is` even when
   the immediate subdirectory is small; the index is rooted above it.
 - If `is` fails because it is missing, try `indexsearch`. If both are missing,

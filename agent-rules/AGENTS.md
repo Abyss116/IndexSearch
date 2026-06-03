@@ -14,6 +14,9 @@ Use IndexSearch for fast source-code search in large codebases.
 - For piped stdin, `is PATTERN` forwards rg-style searches to `rg` instead of
   using the persistent project index. Use `isgrep` for grep-style pipeline
   commands.
+- For compatible grep-style stdin or excluded-path searches, `isgrep` translates
+  to `rg`; use system `grep` only for semantics that cannot be safely
+  translated.
 - Use `indexsearch` if `is` is unavailable.
 - If `isgrep` is unavailable, convert the command to `is` when practical.
 - Fall back to `rg` only when IndexSearch is missing or exact ripgrep semantics
@@ -35,6 +38,9 @@ Use IndexSearch for fast source-code search in large codebases.
   syntax error, call `is.exe`/`isgrep.exe` or remove the stale `is.cmd` found by
   `Get-Command is -All`.
 - Refresh these instructions from a packaged binary with `istool install-skills`.
+  Claude Code installs also include a hook that blocks bare Bash `rg` and
+  `grep` unless the command sets `INDEXSEARCH_ALLOW_RG=1` or
+  `INDEXSEARCH_ALLOW_GREP=1`.
 
 Useful commands:
 

@@ -1401,7 +1401,7 @@ fn print_install_skills_help() {
     help_option(
         &style,
         "--target claude",
-        "also install a Claude Code hook that blocks bare grep in Bash",
+        "also install a Claude Code hook that blocks bare rg and grep in Bash",
     );
     help_option(&style, "--force", "replace an existing UE template");
     help_option(&style, "--dry-run", "show what would be installed");
