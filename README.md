@@ -262,7 +262,7 @@ cargo test --locked
 ```
 
 Local builds append build metadata to the displayed version, for example
-`0.4.6+build.1770000000.g8d2644d.dirty`. The package/release version remains
+`0.4.7+build.1770000000.g8d2644d.dirty`. The package/release version remains
 plain SemVer for package managers.
 
 Tagged pushes create GitHub Releases with Linux, macOS, and Windows archives.
