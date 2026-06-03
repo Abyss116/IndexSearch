@@ -15,6 +15,7 @@ const INDEX_FILE: &str = "index.bin";
 const PROJECT_CONFIG_FILE: &str = "is-project-config.txt";
 const LEGACY_PROJECT_FILE: &str = "index-search-project.txt";
 const SEARCH_DAEMON_FILE: &str = "search-daemon.txt";
+const MAINTENANCE_FILE: &str = "maintenance.txt";
 const PROJECTS_DIR: &str = "projects";
 const REQUEST_MAGIC: &[u8; 8] = b"ISDREQ1\n";
 const RESPONSE_MAGIC: &[u8; 8] = b"ISDRES1\n";
@@ -26,6 +27,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(20);
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(not(windows))]
 const START_TIMEOUT: Duration = Duration::from_secs(2);
+const MAINTENANCE_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+const MAINTENANCE_WAIT_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(windows)]
 const FRAME_COPY_BUFFER_SIZE: usize = 256 * 1024;
 #[cfg(not(windows))]
@@ -1069,6 +1072,10 @@ fn ensure_project_service(
     root: &Path,
     profile: &mut FrontendProfile,
 ) -> Result<(PathBuf, DaemonRecord), String> {
+    let maintenance_timer = Instant::now();
+    wait_for_project_maintenance(root)?;
+    profile.record("frontend_wait_project_maintenance", maintenance_timer);
+
     let ready_timer = Instant::now();
     if let Some(record) = ready_project_record(root) {
         profile.record("frontend_ready_project_record", ready_timer);
@@ -1096,6 +1103,42 @@ fn ready_project_record(root: &Path) -> Option<DaemonRecord> {
         return None;
     }
     read_valid_record(root)
+}
+
+fn wait_for_project_maintenance(root: &Path) -> Result<(), String> {
+    let start = Instant::now();
+    while project_maintenance_active(root) {
+        if start.elapsed() >= MAINTENANCE_WAIT_TIMEOUT {
+            return Err(format!(
+                "project maintenance is still running for {}",
+                display_path(root)
+            ));
+        }
+        std::thread::sleep(MAINTENANCE_WAIT_INTERVAL);
+    }
+    Ok(())
+}
+
+fn project_maintenance_active(root: &Path) -> bool {
+    let path = maintenance_path(root);
+    let Ok(text) = fs::read_to_string(&path) else {
+        return false;
+    };
+    let Some(pid) = maintenance_pid_from_text(&text) else {
+        let _ = fs::remove_file(path);
+        return false;
+    };
+    if process_alive(pid) {
+        return true;
+    }
+    let _ = fs::remove_file(path);
+    false
+}
+
+fn maintenance_pid_from_text(text: &str) -> Option<u32> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .and_then(|value| value.parse().ok())
 }
 
 fn wait_for_ready_project_record(root: &Path, timeout: Duration) -> Option<DaemonRecord> {
@@ -1289,11 +1332,23 @@ fn read_daemon_response(mut stream: &mut impl Read) -> io::Result<i32> {
         let mut tag = [0u8; 1];
         stream.read_exact(&mut tag)?;
         match tag[0] {
-            STDOUT_FRAME => copy_frame(&mut stream, &mut out)?,
+            STDOUT_FRAME => {
+                if let Err(err) = copy_frame(&mut stream, &mut out) {
+                    if is_broken_pipe(&err) {
+                        return Ok(0);
+                    }
+                    return Err(err);
+                }
+            }
             STDERR_FRAME => copy_frame(&mut stream, &mut err)?,
             DONE_FRAME => {
                 let code = read_u32(&mut stream)? as i32;
-                out.flush()?;
+                if let Err(err) = out.flush() {
+                    if is_broken_pipe(&err) {
+                        return Ok(0);
+                    }
+                    return Err(err);
+                }
                 err.flush()?;
                 return Ok(code);
             }
@@ -1305,6 +1360,10 @@ fn read_daemon_response(mut stream: &mut impl Read) -> io::Result<i32> {
             }
         }
     }
+}
+
+fn is_broken_pipe(err: &io::Error) -> bool {
+    matches!(err.kind(), io::ErrorKind::BrokenPipe)
 }
 
 #[cfg(unix)]
@@ -1475,6 +1534,10 @@ fn clean_path_string(path: &str) -> String {
 
 fn index_path(root: &Path) -> PathBuf {
     root.join(INDEX_DIR).join(INDEX_FILE)
+}
+
+fn maintenance_path(root: &Path) -> PathBuf {
+    root.join(INDEX_DIR).join(MAINTENANCE_FILE)
 }
 
 fn project_config_path(root: &Path) -> PathBuf {
@@ -1683,6 +1746,28 @@ fn stdout_supports_ansi() -> bool {
     }
 }
 
+fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+    #[cfg(windows)]
+    {
+        hidden_background_command("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!("if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"),
+            ])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1691,5 +1776,11 @@ mod tests {
     fn project_service_startup_process_is_visible_when_showing_progress() {
         assert!(!hide_project_service_startup_parent(true));
         assert!(hide_project_service_startup_parent(false));
+    }
+
+    #[test]
+    fn broken_pipe_is_quiet_output_termination() {
+        let err = io::Error::new(io::ErrorKind::BrokenPipe, "closed");
+        assert!(is_broken_pipe(&err));
     }
 }

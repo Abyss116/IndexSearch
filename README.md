@@ -205,6 +205,9 @@ semantics that the indexed backend cannot provide, such as PCRE mode,
 backreferences, null-data mode, or piped stdin searches, `isgrep` falls back to
 the system `grep` when available.
 
+For pipeline input, prefer `isgrep`/`grep` instead of `is`: the input is already
+small and transient, so a persistent project index does not help.
+
 Claude Code installs get an additional guardrail: `istool install-skills
 --target claude` copies a `PreToolUse` hook that blocks bare Bash `grep`,
 `egrep`, and `fgrep` commands and tells Claude to retry with `isgrep`. Set

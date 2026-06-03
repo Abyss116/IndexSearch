@@ -38,7 +38,6 @@ Saved/GPUDumps/
 Saved/MaterialStats/
 Saved/Profiling/
 Saved/Screenshots/
-Saved/ShaderDebugInfo/
 Saved/Shaders/
 Saved/SourceControl/
 Saved/StagedBuilds/

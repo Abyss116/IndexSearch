@@ -57,6 +57,7 @@ const INDEX_FILE: &str = "index.bin";
 const DELTA_DIR: &str = "deltas";
 const PROJECTS_DIR: &str = "projects";
 const LOCK_FILE: &str = "index.lock";
+const MAINTENANCE_FILE: &str = "maintenance.txt";
 const STATE_FILE: &str = "state.txt";
 const PROJECT_LOG_FILE: &str = "project.log";
 const SEARCH_DAEMON_FILE: &str = "search-daemon.txt";
@@ -74,12 +75,18 @@ const SEARCH_DAEMON_STDERR_FRAME: u8 = 2;
 const SEARCH_DAEMON_DONE_FRAME: u8 = 3;
 const SEARCH_DAEMON_CONTROL_ARG: &str = "--__indexsearch-daemon-control";
 const SEARCH_DAEMON_CONTROL_UPDATE: &str = "update";
+const SEARCH_DAEMON_CONTROL_SHUTDOWN: &str = "shutdown";
 const SEARCH_DAEMON_SKIP_STARTUP_SYNC_ARG: &str = "--__indexsearch-daemon-skip-startup-sync";
 const SEARCH_DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_millis(20);
 #[cfg(windows)]
 const SEARCH_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(not(windows))]
 const SEARCH_DAEMON_START_TIMEOUT: Duration = Duration::from_millis(250);
+const REBUILD_LOCK_GRACE_TIMEOUT: Duration = Duration::from_millis(300);
+const REBUILD_LOCK_FORCE_TIMEOUT: Duration = Duration::from_secs(5);
+const REBUILD_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+const MAINTENANCE_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+const MAINTENANCE_WAIT_INTERVAL: Duration = Duration::from_millis(100);
 #[cfg(windows)]
 const SEARCH_DAEMON_STREAM_BUFFER_SIZE: usize = 256 * 1024;
 #[cfg(not(windows))]
@@ -357,6 +364,23 @@ impl Drop for IndexLock {
             IndexLock::Shared(file) | IndexLock::Exclusive(file) => {
                 let _ = file.unlock();
             }
+        }
+    }
+}
+
+struct MaintenanceGuard {
+    root: PathBuf,
+    pid: u32,
+}
+
+impl Drop for MaintenanceGuard {
+    fn drop(&mut self) {
+        let path = maintenance_path(&self.root);
+        let Ok(text) = fs::read_to_string(&path) else {
+            return;
+        };
+        if maintenance_pid_from_text(&text) == Some(self.pid) {
+            let _ = fs::remove_file(path);
         }
     }
 }
@@ -949,6 +973,7 @@ struct WatchState {
     pending: Mutex<HashSet<String>>,
     index_io: Mutex<()>,
     restart_required: AtomicBool,
+    shutdown_requested: AtomicBool,
 }
 
 struct WatchFlushOutcome {
@@ -2133,7 +2158,8 @@ fn stderr_supports_color() -> bool {
 fn command_index(args: &[String]) -> Result<i32> {
     let (options, start) = parse_index_args(args)?;
     let cfg = load_or_create_config(&start)?;
-    let _lock = acquire_exclusive_lock(&cfg.root)?;
+    let _maintenance = begin_project_maintenance(&cfg.root, "index")?;
+    let _lock = acquire_rebuild_lock(&cfg.root)?;
     let timer = Instant::now();
     let flow = ConsoleFlow::start();
     flow.step_done(format!("Resolved project {}", display_path(&cfg.root)));
@@ -2205,7 +2231,8 @@ fn command_update(args: &[String]) -> Result<i32> {
             return Ok(code);
         }
     }
-    let _lock = acquire_exclusive_lock(&cfg.root)?;
+    let _maintenance = begin_project_maintenance(&cfg.root, "update")?;
+    let _lock = acquire_rebuild_lock(&cfg.root)?;
     let path = index_path(&cfg.root);
     let timer = Instant::now();
     let flow = ConsoleFlow::start();
@@ -2923,12 +2950,72 @@ fn stop_search_daemon_for_root(root: &Path, stopped: &mut HashSet<u32>) -> bool 
     true
 }
 
-fn stop_stale_daemon_processes(stopped: &mut HashSet<u32>) -> usize {
-    if env::var_os("INDEXSEARCH_SKIP_STALE_DAEMON_KILL").is_some() {
-        return 0;
+fn request_project_services_shutdown_for_rebuild(root: &Path) {
+    let requested_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if let Ok(record) = read_search_daemon_record(&search_daemon_record_path(&requested_root)) {
+        let _ = request_search_daemon_shutdown(&record);
     }
+    let Ok(entries) = fs::read_dir(project_registry_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.extension().is_some_and(|ext| ext == "project") {
+            continue;
+        }
+        let Ok(record) = read_project_record(&path) else {
+            let _ = fs::remove_file(path);
+            continue;
+        };
+        if project_record_is_covered_by_root(&record.root, &requested_root)
+            && let Ok(daemon) = read_search_daemon_record(&search_daemon_record_path(&record.root))
+        {
+            let _ = request_search_daemon_shutdown(&daemon);
+        }
+    }
+}
+
+fn stop_project_services_for_rebuild(root: &Path) -> usize {
+    let requested_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut stopped = HashSet::default();
     let mut count = 0usize;
-    for pid in discover_daemon_pids() {
+
+    if let Ok(record) = read_search_daemon_record(&search_daemon_record_path(&requested_root)) {
+        if record.pid != std::process::id() && stopped.insert(record.pid) {
+            stop_process(record.pid);
+            count += 1;
+        }
+        let _ = fs::remove_file(search_daemon_record_path(&requested_root));
+    }
+
+    if fs::create_dir_all(project_registry_dir()).is_ok()
+        && let Ok(entries) = fs::read_dir(project_registry_dir())
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.extension().is_some_and(|ext| ext == "project") {
+                continue;
+            }
+            let Ok(record) = read_project_record(&path) else {
+                let _ = fs::remove_file(path);
+                continue;
+            };
+            if project_record_is_covered_by_root(&record.root, &requested_root) {
+                if record.pid != std::process::id() && stopped.insert(record.pid) {
+                    stop_process(record.pid);
+                    count += 1;
+                }
+                let _ = fs::remove_file(path);
+                let _ = fs::remove_file(search_daemon_record_path(&record.root));
+                let _ = append_project_log(
+                    &record.root,
+                    &format!("project-service-stop pid={} reason=rebuild", record.pid),
+                );
+            }
+        }
+    }
+
+    for pid in discover_daemon_pids_for_root(&requested_root) {
         if pid == std::process::id() || !stopped.insert(pid) {
             continue;
         }
@@ -2938,15 +3025,48 @@ fn stop_stale_daemon_processes(stopped: &mut HashSet<u32>) -> usize {
     count
 }
 
-fn discover_daemon_pids() -> Vec<u32> {
+fn project_record_is_covered_by_root(record_root: &Path, requested_root: &Path) -> bool {
+    let record_root = fs::canonicalize(record_root).unwrap_or_else(|_| record_root.to_path_buf());
+    record_root == requested_root || path_is_ancestor(requested_root, &record_root)
+}
+
+fn stop_stale_daemon_processes(stopped: &mut HashSet<u32>) -> usize {
+    if env::var_os("INDEXSEARCH_SKIP_STALE_DAEMON_KILL").is_some() {
+        return 0;
+    }
+    let mut count = 0usize;
+    for (pid, _) in discover_daemon_processes() {
+        if pid == std::process::id() || !stopped.insert(pid) {
+            continue;
+        }
+        stop_process(pid);
+        count += 1;
+    }
+    count
+}
+
+fn discover_daemon_pids_for_root(root: &Path) -> Vec<u32> {
+    discover_daemon_processes()
+        .into_iter()
+        .filter_map(|(pid, command)| daemon_command_matches_root(&command, root).then_some(pid))
+        .collect()
+}
+
+fn discover_daemon_processes() -> Vec<(u32, String)> {
     let mut pids = HashSet::default();
+    let mut processes = Vec::new();
     #[cfg(unix)]
     {
         for pattern in ["is-daemon", "search-daemon"] {
-            if let Ok(output) = Command::new("pgrep").args(["-f", pattern]).output() {
+            if let Ok(output) = Command::new("pgrep").args(["-af", pattern]).output() {
                 for line in String::from_utf8_lossy(&output.stdout).lines() {
-                    if let Ok(pid) = line.trim().parse::<u32>() {
-                        pids.insert(pid);
+                    let Some((pid, command)) = line.trim().split_once(char::is_whitespace) else {
+                        continue;
+                    };
+                    if let Ok(pid) = pid.parse::<u32>()
+                        && pids.insert(pid)
+                    {
+                        processes.push((pid, command.to_string()));
                     }
                 }
             }
@@ -2956,21 +3076,91 @@ fn discover_daemon_pids() -> Vec<u32> {
     {
         let script = concat!(
             "Get-CimInstance Win32_Process | ",
-            "Where-Object { $_.Name -like 'is-daemon*' -or $_.CommandLine -match 'search-daemon' } | ",
-            "ForEach-Object { $_.ProcessId }"
+            "Where-Object { $_.Name -like 'is-daemon*' } | ",
+            "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }"
         );
         if let Ok(output) = hidden_background_command("powershell")
             .args(["-NoProfile", "-Command", script])
             .output()
         {
             for line in String::from_utf8_lossy(&output.stdout).lines() {
-                if let Ok(pid) = line.trim().parse::<u32>() {
-                    pids.insert(pid);
+                let Some((pid, command)) = line.split_once('\t') else {
+                    continue;
+                };
+                if let Ok(pid) = pid.trim().parse::<u32>()
+                    && pids.insert(pid)
+                {
+                    processes.push((pid, command.trim().to_string()));
                 }
             }
         }
     }
-    pids.into_iter().collect()
+    processes
+}
+
+fn daemon_command_matches_root(command: &str, root: &Path) -> bool {
+    let command = normalize_daemon_command_text(command);
+    daemon_root_match_strings(root)
+        .into_iter()
+        .any(|candidate| command_contains_path_token(&command, &candidate))
+}
+
+fn daemon_root_match_strings(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for path in [
+        root.to_path_buf(),
+        fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()),
+    ] {
+        let display = display_path(&path);
+        for candidate in [display.clone(), slash_path(path)] {
+            let normalized = normalize_daemon_command_text(&candidate);
+            if !normalized.is_empty() && !out.contains(&normalized) {
+                out.push(normalized);
+            }
+        }
+    }
+    out
+}
+
+fn normalize_daemon_command_text(text: &str) -> String {
+    let text = text
+        .replace(r"\\?\UNC\", r"\\")
+        .replace(r"\\?\", "")
+        .replace('\\', "/");
+    #[cfg(windows)]
+    {
+        text.to_ascii_lowercase().trim_end_matches('/').to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        text.trim_end_matches('/').to_string()
+    }
+}
+
+fn command_contains_path_token(command: &str, path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let mut start = 0usize;
+    while let Some(offset) = command[start..].find(path) {
+        let match_start = start + offset;
+        let match_end = match_start + path.len();
+        let before = command[..match_start].chars().next_back();
+        let after = command[match_end..].chars().next();
+        if path_token_boundary_before(before) && path_token_boundary_after(after) {
+            return true;
+        }
+        start = match_end;
+    }
+    false
+}
+
+fn path_token_boundary_before(ch: Option<char>) -> bool {
+    ch.is_none_or(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '='))
+}
+
+fn path_token_boundary_after(ch: Option<char>) -> bool {
+    ch.is_none_or(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '/' | '\\'))
 }
 
 fn command_project_log(args: &[String]) -> Result<i32> {
@@ -4113,7 +4303,8 @@ fn compact_root(
 fn command_compact(args: &[String]) -> Result<i32> {
     let (options, start) = parse_index_args(args)?;
     let cfg = load_config(&start)?;
-    let _lock = acquire_exclusive_lock(&cfg.root)?;
+    let _maintenance = begin_project_maintenance(&cfg.root, "compact")?;
+    let _lock = acquire_rebuild_lock(&cfg.root)?;
     let timer = Instant::now();
     let flow = ConsoleFlow::start();
     flow.step_done(format!("Resolved project {}", display_path(&cfg.root)));
@@ -5162,6 +5353,11 @@ fn try_search_daemon(
     mut profile: Option<&mut SearchProfile>,
     total_timer: Instant,
 ) -> Result<i32> {
+    let maintenance_timer = Instant::now();
+    wait_for_project_maintenance(root)?;
+    if let Some(profile) = profile.as_deref_mut() {
+        profile.record("client_wait_project_maintenance", maintenance_timer.elapsed());
+    }
     let mut last_error: Option<String> = None;
     if let Some(record) = read_valid_search_daemon_record(root, profile.as_deref_mut())? {
         if record.supports_search() {
@@ -5791,6 +5987,7 @@ fn run_search_daemon(root: &Path, watch_options: WatchOptions) -> Result<i32> {
     );
     listener.set_nonblocking(true)?;
     while !shutdown.load(AtomicOrdering::Relaxed)
+        && !watch_state.shutdown_requested.load(AtomicOrdering::Relaxed)
         && !watch_state.restart_required.load(AtomicOrdering::Relaxed)
     {
         match listener.accept() {
@@ -5815,13 +6012,15 @@ fn run_search_daemon(root: &Path, watch_options: WatchOptions) -> Result<i32> {
         }
     }
     let restart = watch_state.restart_required.load(AtomicOrdering::Relaxed);
+    let requested_shutdown = watch_state.shutdown_requested.load(AtomicOrdering::Relaxed);
     append_project_log(
         root,
         &format!(
-            "project-service-main-exit pid={} restart={} shutdown={}",
+            "project-service-main-exit pid={} restart={} shutdown={} requested_shutdown={}",
             record.pid,
             restart,
-            shutdown.load(AtomicOrdering::Relaxed)
+            shutdown.load(AtomicOrdering::Relaxed),
+            requested_shutdown
         ),
     )?;
     shutdown.store(true, AtomicOrdering::Relaxed);
@@ -5875,6 +6074,18 @@ fn handle_search_daemon_client(
         close_stdout_fd(stdout_fd.take());
         let _io = watch_state.index_io.lock().unwrap();
         let result = handle_search_daemon_update_client(stream, record, &index_state, watch_state);
+        if let Some(dir) = current_dir {
+            let _ = env::set_current_dir(dir);
+        }
+        return result;
+    }
+    if is_daemon_shutdown_request(&cwd.args) {
+        close_stdout_fd(stdout_fd.take());
+        watch_state
+            .shutdown_requested
+            .store(true, AtomicOrdering::Relaxed);
+        let result = write_search_daemon_response_begin(stream)
+            .and_then(|_| write_search_daemon_done(stream, 0));
         if let Some(dir) = current_dir {
             let _ = env::set_current_dir(dir);
         }
@@ -5963,6 +6174,12 @@ fn is_daemon_update_request(args: &[String]) -> bool {
     args.len() == 2
         && args[0] == SEARCH_DAEMON_CONTROL_ARG
         && args[1] == SEARCH_DAEMON_CONTROL_UPDATE
+}
+
+fn is_daemon_shutdown_request(args: &[String]) -> bool {
+    args.len() == 2
+        && args[0] == SEARCH_DAEMON_CONTROL_ARG
+        && args[1] == SEARCH_DAEMON_CONTROL_SHUTDOWN
 }
 
 fn sync_daemon_index_before_search(
@@ -6328,6 +6545,17 @@ fn request_search_daemon_quiet(record: &SearchDaemonRecord, args: &[String]) -> 
     write_search_daemon_request(&mut stream, record, args)?;
     stream.send_stdout_fd(record)?;
     read_search_daemon_response_to_sink(&mut stream)
+}
+
+fn request_search_daemon_shutdown(record: &SearchDaemonRecord) -> Result<()> {
+    let args = vec![
+        SEARCH_DAEMON_CONTROL_ARG.to_string(),
+        SEARCH_DAEMON_CONTROL_SHUTDOWN.to_string(),
+    ];
+    let mut stream = SearchDaemonStream::connect(record)?;
+    write_search_daemon_request(&mut stream, record, &args)?;
+    stream.send_stdout_fd(record)?;
+    Ok(())
 }
 
 fn write_search_daemon_request(
@@ -13683,6 +13911,10 @@ fn lock_path(root: &Path) -> PathBuf {
     root.join(INDEX_DIR).join(LOCK_FILE)
 }
 
+fn maintenance_path(root: &Path) -> PathBuf {
+    root.join(INDEX_DIR).join(MAINTENANCE_FILE)
+}
+
 fn state_path(root: &Path) -> PathBuf {
     root.join(INDEX_DIR).join(STATE_FILE)
 }
@@ -14067,6 +14299,13 @@ fn log_timestamp() -> String {
     secs.to_string()
 }
 
+fn unix_now_ns() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
 fn acquire_shared_lock(root: &Path) -> Result<IndexLock> {
     fs::create_dir_all(root.join(INDEX_DIR))?;
     let file = OpenOptions::new()
@@ -14089,6 +14328,118 @@ fn acquire_exclusive_lock(root: &Path) -> Result<IndexLock> {
         .open(lock_path(root))?;
     file.lock_exclusive()?;
     Ok(IndexLock::Exclusive(file))
+}
+
+fn acquire_rebuild_lock(root: &Path) -> Result<IndexLock> {
+    if let Some(lock) = try_acquire_exclusive_lock(root)? {
+        return Ok(lock);
+    }
+
+    let _ = append_project_log(root, "maintenance-lock-busy action=shutdown-services");
+    request_project_services_shutdown_for_rebuild(root);
+    if let Some(lock) = wait_for_rebuild_lock(root, REBUILD_LOCK_GRACE_TIMEOUT)? {
+        return Ok(lock);
+    }
+
+    let stopped = stop_project_services_for_rebuild(root);
+    let _ = append_project_log(
+        root,
+        &format!("maintenance-lock-force-stop services={stopped}"),
+    );
+    if let Some(lock) = wait_for_rebuild_lock(root, REBUILD_LOCK_FORCE_TIMEOUT)? {
+        return Ok(lock);
+    }
+
+    bail!(
+        "index lock is still held after stopping project services for {}",
+        display_path(root)
+    )
+}
+
+fn begin_project_maintenance(root: &Path, reason: &str) -> Result<MaintenanceGuard> {
+    fs::create_dir_all(root.join(INDEX_DIR))?;
+    let pid = std::process::id();
+    let text = format!(
+        "pid={pid}\nreason={reason}\nstarted_ns={}\nroot={}\n",
+        unix_now_ns(),
+        display_path(root)
+    );
+    fs::write(maintenance_path(root), text)?;
+    Ok(MaintenanceGuard {
+        root: root.to_path_buf(),
+        pid,
+    })
+}
+
+fn maintenance_pid_from_text(text: &str) -> Option<u32> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("pid="))
+        .and_then(|value| value.parse().ok())
+}
+
+fn wait_for_project_maintenance(root: &Path) -> Result<()> {
+    let start = Instant::now();
+    while project_maintenance_active(root) {
+        if start.elapsed() >= MAINTENANCE_WAIT_TIMEOUT {
+            bail!(
+                "project maintenance is still running for {}",
+                display_path(root)
+            );
+        }
+        std::thread::sleep(MAINTENANCE_WAIT_INTERVAL);
+    }
+    Ok(())
+}
+
+fn project_maintenance_active(root: &Path) -> bool {
+    let path = maintenance_path(root);
+    let Ok(text) = fs::read_to_string(&path) else {
+        return false;
+    };
+    let Some(pid) = maintenance_pid_from_text(&text) else {
+        let _ = fs::remove_file(path);
+        return false;
+    };
+    if process_alive(pid) {
+        return true;
+    }
+    let _ = fs::remove_file(path);
+    false
+}
+
+fn wait_for_rebuild_lock(root: &Path, timeout: Duration) -> Result<Option<IndexLock>> {
+    let start = Instant::now();
+    loop {
+        if let Some(lock) = try_acquire_exclusive_lock(root)? {
+            return Ok(Some(lock));
+        }
+        if start.elapsed() >= timeout {
+            return Ok(None);
+        }
+        std::thread::sleep(REBUILD_LOCK_RETRY_INTERVAL);
+    }
+}
+
+fn try_acquire_exclusive_lock(root: &Path) -> Result<Option<IndexLock>> {
+    fs::create_dir_all(root.join(INDEX_DIR))?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path(root))?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(IndexLock::Exclusive(file))),
+        Err(err) if lock_is_contended(&err) => Ok(None),
+        Err(err) => Err(err).context("failed to acquire index lock"),
+    }
+}
+
+fn lock_is_contended(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::PermissionDenied
+    )
 }
 
 fn write_project_record(record: &ProjectRecord) -> Result<()> {
@@ -14506,6 +14857,22 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn daemon_command_matches_verbatim_project_root() {
+        let root = Path::new(r"D:\Gujian4");
+        let command = r#""C:\Users\me\.local\bin\is-daemon.exe" search-daemon \\?\D:\Gujian4 --__indexsearch-daemon-skip-startup-sync"#;
+
+        assert!(daemon_command_matches_root(command, root));
+    }
+
+    #[test]
+    fn daemon_command_does_not_match_sibling_project_root() {
+        let root = Path::new(r"D:\Gujian4");
+        let command = r#""C:\Users\me\.local\bin\is-daemon.exe" search-daemon D:\Gujian4Other --__indexsearch-daemon-skip-startup-sync"#;
+
+        assert!(!daemon_command_matches_root(command, root));
     }
 
     #[test]
