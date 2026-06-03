@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+
 const INDEX_DIR: &str = ".indexsearch";
 const INDEX_FILE: &str = "index.bin";
 const PROJECT_CONFIG_FILE: &str = "is-project-config.txt";
@@ -136,6 +138,11 @@ enum GrepTranslation {
     FallbackToGrep,
 }
 
+enum ExternalFallback<'a> {
+    Ripgrep,
+    Grep { original_args: &'a [String] },
+}
+
 fn run_grep_frontend(args: &[String]) -> Result<i32, String> {
     let first = first_search_flag(args);
     if args.is_empty() {
@@ -151,7 +158,12 @@ fn run_grep_frontend(args: &[String]) -> Result<i32, String> {
         return Ok(0);
     }
     match translate_grep_args(args)? {
-        GrepTranslation::Search(search_args) => run(&search_args),
+        GrepTranslation::Search(search_args) => run_with_fallback(
+            &search_args,
+            ExternalFallback::Grep {
+                original_args: args,
+            },
+        ),
         GrepTranslation::FallbackToGrep => run_system_grep(args),
     }
 }
@@ -573,6 +585,21 @@ fn run_system_grep(args: &[String]) -> Result<i32, String> {
     Ok(status.code().unwrap_or(1))
 }
 
+fn run_system_grep_or_translated_ripgrep(
+    grep_args: &[String],
+    ripgrep_args: &[String],
+) -> Result<i32, String> {
+    let mut command = system_grep_command();
+    command.args(grep_args);
+    match command.status() {
+        Ok(status) => Ok(status.code().unwrap_or(1)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => run_system_ripgrep(ripgrep_args),
+        Err(err) => Err(format!(
+            "translated grep fallback failed to run system grep: {err}"
+        )),
+    }
+}
+
 fn system_grep_command() -> Command {
     let current = env::current_exe().ok();
     for candidate in ["/usr/bin/grep", "/bin/grep"] {
@@ -589,6 +616,10 @@ fn system_grep_command() -> Command {
 }
 
 fn run(args: &[String]) -> Result<i32, String> {
+    run_with_fallback(args, ExternalFallback::Ripgrep)
+}
+
+fn run_with_fallback(args: &[String], fallback: ExternalFallback<'_>) -> Result<i32, String> {
     let first = first_search_flag(args);
     if args.is_empty() || first.is_some_and(|arg| matches!(arg, "-h" | "--help")) {
         return run_backend_search_help();
@@ -616,12 +647,6 @@ fn run(args: &[String]) -> Result<i32, String> {
         return run_backend_search(&search_args);
     };
     profile.record("frontend_resolve_search_paths", path_timer);
-    if should_fallback_to_ripgrep_live_paths(&search_paths) {
-        return run_system_ripgrep(&ripgrep_stdin_args(&search_args));
-    }
-    if search_args.iter().any(|arg| arg == "--no-auto-index") {
-        return run_backend_search(&search_args);
-    }
     if agent_auto_project_mode()
         && search_paths
             .iter()
@@ -633,23 +658,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         profile.record("frontend_agent_auto_project", create_timer);
     }
     let root_timer = Instant::now();
-    if search_paths.len() == 1 {
-        let Some(root) = find_project_root(&search_paths[0].abs) else {
-            if search_paths[0].arg_index.is_none() {
-                return handle_missing_project(args);
-            }
-            return Err(format!(
-                "no IndexSearch project found above {}; run `istool index` in that project first",
-                display_path(&search_paths[0].abs)
-            ));
-        };
-        profile.record("frontend_find_project_roots", root_timer);
-        let code = run_search_group(&search_args, root, &mut profile)?;
-        profile.record("frontend_total", total_timer);
-        profile.print();
-        return Ok(code);
-    }
-    let groups = match search_groups(&search_args, &search_paths) {
+    let runs = match search_runs(&search_paths) {
         Ok(groups) => groups,
         Err(MissingProject::Single) => return handle_missing_project(args),
         Err(MissingProject::Path(path)) => {
@@ -660,12 +669,32 @@ fn run(args: &[String]) -> Result<i32, String> {
         }
     };
     profile.record("frontend_find_project_roots", root_timer);
-    if groups.len() > 1 {
-        profile.record_value("frontend_search_root_count", groups.len() as f64);
+    if runs.len() > 1 {
+        profile.record_value("frontend_search_run_count", runs.len() as f64);
     }
     let mut final_code = 1;
-    for group in groups {
-        let code = run_search_group(&group.args, group.root, &mut profile)?;
+    for run in runs {
+        let code = match run.kind {
+            SearchRunKind::Indexed(root) => {
+                let group_args = search_args_for_group(&search_args, &run.path_indexes);
+                run_indexed_search_group(&group_args, root, &mut profile)?
+            }
+            SearchRunKind::External => match &fallback {
+                ExternalFallback::Ripgrep => {
+                    let group_args = search_args_for_group(&search_args, &run.path_indexes);
+                    run_system_ripgrep(&ripgrep_stdin_args(&group_args))?
+                }
+                ExternalFallback::Grep { original_args } => {
+                    let group_args = grep_args_for_path_ordinals(original_args, &run.path_ordinals);
+                    let ripgrep_group_args =
+                        search_args_for_group(&search_args, &run.path_indexes);
+                    run_system_grep_or_translated_ripgrep(
+                        &group_args,
+                        &ripgrep_stdin_args(&ripgrep_group_args),
+                    )?
+                }
+            },
+        };
         final_code = combine_exit_codes(final_code, code);
     }
     profile.record("frontend_total", total_timer);
@@ -847,22 +876,7 @@ fn stdin_file_type_is_searchable() -> bool {
     !io::stdin().is_terminal()
 }
 
-fn should_fallback_to_ripgrep_live_paths(search_paths: &[SearchPathArg]) -> bool {
-    for path in search_paths {
-        let Some(root) = find_project_root(&path.abs) else {
-            continue;
-        };
-        let Ok(patterns) = live_path_patterns(&root) else {
-            continue;
-        };
-        if path_matches_live_patterns(&root, &path.abs, &patterns) {
-            return true;
-        }
-    }
-    false
-}
-
-fn live_path_patterns(root: &Path) -> Result<Vec<String>, String> {
+fn load_frontend_project_config(root: &Path) -> Result<FrontendProjectConfig, String> {
     let config = project_config_path(root);
     let legacy = legacy_project_config_path(root);
     let text = if config.is_file() {
@@ -870,53 +884,131 @@ fn live_path_patterns(root: &Path) -> Result<Vec<String>, String> {
     } else if legacy.is_file() {
         fs::read_to_string(legacy).map_err(|err| err.to_string())?
     } else {
-        return Ok(Vec::new());
+        return Ok(FrontendProjectConfig::default());
     };
-    Ok(clean_config_section(
-        parse_config_sections(&text).get("IndexSearch.paths.live"),
-    ))
+    let sections = parse_config_sections(&text);
+    let paths_ignore =
+        FrontendMatcher::new(&clean_config_section(sections.get("IndexSearch.paths.ignore")))?;
+    let paths_live =
+        FrontendMatcher::new(&clean_config_section(sections.get("IndexSearch.paths.live")))?;
+    let files_ignore =
+        FrontendMatcher::new(&clean_config_section(sections.get("IndexSearch.files.ignore")))?;
+    let mut files_include = clean_config_section(sections.get("IndexSearch.files.include"));
+    if files_include.is_empty() {
+        files_include.push("*".to_string());
+    }
+    let files_include = FrontendMatcher::new(&files_include)?;
+    Ok(FrontendProjectConfig {
+        paths_ignore,
+        paths_live,
+        files_ignore,
+        files_include,
+    })
 }
 
-fn path_matches_live_patterns(root: &Path, path: &Path, patterns: &[String]) -> bool {
-    if patterns.is_empty() {
-        return false;
+#[derive(Default)]
+struct FrontendProjectConfig {
+    paths_ignore: FrontendMatcher,
+    paths_live: FrontendMatcher,
+    files_ignore: FrontendMatcher,
+    files_include: FrontendMatcher,
+}
+
+#[derive(Default)]
+struct FrontendMatcher {
+    set: Option<GlobSet>,
+}
+
+impl FrontendMatcher {
+    fn new(patterns: &[String]) -> Result<Self, String> {
+        if patterns.is_empty() {
+            return Ok(Self::default());
+        }
+        let mut builder = GlobSetBuilder::new();
+        for pattern in patterns {
+            add_frontend_glob_pattern(&mut builder, pattern)?;
+        }
+        Ok(Self {
+            set: Some(builder.build().map_err(|err| err.to_string())?),
+        })
     }
+
+    fn is_match(&self, rel: &str) -> bool {
+        self.set.as_ref().is_some_and(|set| set.is_match(rel))
+    }
+}
+
+fn explicit_path_requires_external_fallback(root: &Path, path: &Path) -> bool {
+    let Ok(cfg) = load_frontend_project_config(root) else {
+        return false;
+    };
     let root = normalized_existing_path(root);
     let path = normalized_existing_path(path);
     let Ok(rel_path) = path.strip_prefix(&root) else {
         return false;
     };
-    let rel = rel_path.to_string_lossy().replace('\\', "/");
+    let rel = normalize_rel_path_for_match(rel_path);
     if rel.is_empty() {
         return false;
     }
-    let rel_dir = format!("{}/", rel.trim_end_matches('/'));
-    patterns.iter().any(|pattern| {
-        let pattern = normalized_live_pattern(pattern);
-        if pattern.is_empty() {
-            return false;
+    rel_requires_external_fallback(&cfg, &rel, path.is_file())
+}
+
+fn rel_requires_external_fallback(cfg: &FrontendProjectConfig, rel: &str, is_file: bool) -> bool {
+    cfg.paths_ignore.is_match(rel)
+        || cfg.paths_live.is_match(rel)
+        || (is_file && (cfg.files_ignore.is_match(rel) || !cfg.files_include.is_match(rel)))
+}
+
+fn normalize_rel_path_for_match(path: &Path) -> String {
+    let mut rel = path.to_string_lossy().replace('\\', "/");
+    while let Some(stripped) = rel.strip_prefix("./") {
+        rel = stripped.to_string();
+    }
+    rel.trim_end_matches('/').to_string()
+}
+
+fn add_frontend_glob_pattern(builder: &mut GlobSetBuilder, raw: &str) -> Result<(), String> {
+    let mut pat = raw.replace('\\', "/");
+    let directory_only = pat.ends_with('/');
+    while pat.starts_with('/') {
+        pat.remove(0);
+    }
+    while pat.ends_with('/') {
+        pat.pop();
+    }
+    if pat.is_empty() {
+        return Ok(());
+    }
+    let has_slash = pat.contains('/');
+    let mut variants = Vec::new();
+    if has_slash {
+        variants.push(pat.clone());
+        if !pat.starts_with("**/") {
+            variants.push(format!("**/{pat}"));
         }
-        live_pattern_overlaps_rel(&pattern, &rel_dir)
-    })
-}
-
-fn normalized_live_pattern(pattern: &str) -> String {
-    let mut pattern = pattern.trim().replace('\\', "/");
-    while let Some(stripped) = pattern.strip_prefix("./") {
-        pattern = stripped.to_string();
+        if directory_only {
+            variants.push(format!("{pat}/**"));
+            if !pat.starts_with("**/") {
+                variants.push(format!("**/{pat}/**"));
+            }
+        }
+    } else {
+        variants.push(pat.clone());
+        variants.push(format!("**/{pat}"));
+        if directory_only {
+            variants.push(format!("{pat}/**"));
+            variants.push(format!("**/{pat}/**"));
+        }
     }
-    if !pattern.ends_with('/') {
-        pattern.push('/');
+    for variant in variants {
+        builder.add(
+            GlobBuilder::new(&variant)
+                .build()
+                .map_err(|err| err.to_string())?,
+        );
     }
-    pattern
-}
-
-fn live_pattern_overlaps_rel(pattern: &str, rel_dir: &str) -> bool {
-    rel_dir == pattern
-        || rel_dir.starts_with(pattern)
-        || pattern.starts_with(rel_dir)
-        || rel_dir.ends_with(pattern)
-        || rel_dir.contains(&format!("/{pattern}"))
+    Ok(())
 }
 
 fn parse_config_sections(text: &str) -> std::collections::BTreeMap<String, Vec<String>> {
@@ -1062,9 +1154,15 @@ struct SearchPathArg {
     abs: PathBuf,
 }
 
-struct SearchGroup {
-    root: PathBuf,
-    args: Vec<String>,
+struct SearchRun {
+    kind: SearchRunKind,
+    path_indexes: Vec<Option<usize>>,
+    path_ordinals: Vec<usize>,
+}
+
+enum SearchRunKind {
+    Indexed(PathBuf),
+    External,
 }
 
 enum MissingProject {
@@ -1149,33 +1247,70 @@ fn search_path_args(args: &[String]) -> Option<Vec<SearchPathArg>> {
     )
 }
 
-fn search_groups(
-    args: &[String],
-    paths: &[SearchPathArg],
-) -> Result<Vec<SearchGroup>, MissingProject> {
-    let mut groups: Vec<(PathBuf, Vec<Option<usize>>)> = Vec::new();
+fn search_runs(paths: &[SearchPathArg]) -> Result<Vec<SearchRun>, MissingProject> {
+    let mut runs = Vec::new();
+    let mut explicit_ordinal = 0usize;
     for path in paths {
+        let path_ordinal = if path.arg_index.is_some() {
+            let ordinal = explicit_ordinal;
+            explicit_ordinal += 1;
+            Some(ordinal)
+        } else {
+            None
+        };
         let Some(root) = find_project_root(&path.abs) else {
             if paths.len() == 1 && path.arg_index.is_none() {
                 return Err(MissingProject::Single);
             }
             return Err(MissingProject::Path(path.abs.clone()));
         };
-        if let Some((_, indexes)) = groups.iter_mut().find(|(group_root, _)| {
-            normalized_existing_path(group_root) == normalized_existing_path(&root)
-        }) {
-            indexes.push(path.arg_index);
-        } else {
-            groups.push((root, vec![path.arg_index]));
-        }
+        let use_external = path
+            .arg_index
+            .is_some_and(|_| explicit_path_requires_external_fallback(&root, &path.abs));
+        push_search_run(
+            &mut runs,
+            if use_external {
+                SearchRunKind::External
+            } else {
+                SearchRunKind::Indexed(root)
+            },
+            path.arg_index,
+            path_ordinal,
+        );
     }
-    Ok(groups
-        .into_iter()
-        .map(|(root, indexes)| SearchGroup {
-            root,
-            args: search_args_for_group(args, &indexes),
-        })
-        .collect())
+    Ok(runs)
+}
+
+fn push_search_run(
+    runs: &mut Vec<SearchRun>,
+    kind: SearchRunKind,
+    path_index: Option<usize>,
+    path_ordinal: Option<usize>,
+) {
+    if let Some(last) = runs.last_mut()
+        && search_run_kind_matches(&last.kind, &kind)
+    {
+        last.path_indexes.push(path_index);
+        if let Some(path_ordinal) = path_ordinal {
+            last.path_ordinals.push(path_ordinal);
+        }
+        return;
+    }
+    runs.push(SearchRun {
+        kind,
+        path_indexes: vec![path_index],
+        path_ordinals: path_ordinal.into_iter().collect(),
+    });
+}
+
+fn search_run_kind_matches(left: &SearchRunKind, right: &SearchRunKind) -> bool {
+    match (left, right) {
+        (SearchRunKind::External, SearchRunKind::External) => true,
+        (SearchRunKind::Indexed(left), SearchRunKind::Indexed(right)) => {
+            normalized_existing_path(left) == normalized_existing_path(right)
+        }
+        _ => false,
+    }
 }
 
 fn search_args_for_group(args: &[String], keep_path_indexes: &[Option<usize>]) -> Vec<String> {
@@ -1198,6 +1333,142 @@ fn search_args_for_group(args: &[String], keep_path_indexes: &[Option<usize>]) -
             }
         })
         .collect()
+}
+
+fn grep_args_for_path_ordinals(args: &[String], keep_path_ordinals: &[usize]) -> Vec<String> {
+    let path_indexes = grep_path_arg_indexes(args);
+    if path_indexes.is_empty() {
+        return args.to_vec();
+    }
+    let keep_indexes = path_indexes
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, index)| keep_path_ordinals.contains(&ordinal).then_some(*index))
+        .collect::<Vec<_>>();
+    args.iter()
+        .enumerate()
+        .filter_map(|(idx, arg)| {
+            if path_indexes.contains(&idx) && !keep_indexes.contains(&idx) {
+                None
+            } else {
+                Some(arg.clone())
+            }
+        })
+        .collect()
+}
+
+fn grep_path_arg_indexes(args: &[String]) -> Vec<usize> {
+    let mut path_indexes = Vec::new();
+    let mut saw_pattern = false;
+    let mut positional_only = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = &args[i];
+        if positional_only {
+            if saw_pattern {
+                path_indexes.push(i);
+            } else {
+                saw_pattern = true;
+            }
+            i += 1;
+            continue;
+        }
+        if arg == "--" {
+            positional_only = true;
+            i += 1;
+            continue;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            if long.is_empty() {
+                positional_only = true;
+                i += 1;
+                continue;
+            }
+            let (name, has_inline_value) = long
+                .split_once('=')
+                .map(|(name, _)| (name, true))
+                .unwrap_or((long, false));
+            if matches!(name, "regexp" | "file") {
+                saw_pattern = true;
+            }
+            if grep_long_option_takes_value(name) && !has_inline_value {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if arg.starts_with('-') && arg != "-" {
+            let (takes_value, adds_pattern) = grep_short_option_scan(arg);
+            if adds_pattern {
+                saw_pattern = true;
+            }
+            i += if takes_value && grep_short_value_is_separate(arg) {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        if saw_pattern {
+            path_indexes.push(i);
+        } else {
+            saw_pattern = true;
+        }
+        i += 1;
+    }
+    path_indexes
+}
+
+fn grep_long_option_takes_value(name: &str) -> bool {
+    matches!(
+        name,
+        "regexp"
+            | "file"
+            | "after-context"
+            | "before-context"
+            | "context"
+            | "max-count"
+            | "include"
+            | "exclude"
+            | "exclude-dir"
+            | "directories"
+            | "binary-files"
+    )
+}
+
+fn grep_short_option_scan(arg: &str) -> (bool, bool) {
+    for ch in arg.chars().skip(1) {
+        match ch {
+            'e' | 'f' => return (true, true),
+            'A' | 'B' | 'C' | 'm' | 'd' | 'D' => return (true, false),
+            _ => {}
+        }
+    }
+    (false, false)
+}
+
+fn grep_short_value_is_separate(arg: &str) -> bool {
+    let mut chars = arg.chars();
+    let _dash = chars.next();
+    let Some(flag) = chars.next() else {
+        return false;
+    };
+    matches!(flag, 'e' | 'f' | 'A' | 'B' | 'C' | 'm' | 'd' | 'D') && chars.next().is_none()
+}
+
+fn run_indexed_search_group(
+    group_args: &[String],
+    root: PathBuf,
+    profile: &mut FrontendProfile,
+) -> Result<i32, String> {
+    if group_args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--auto-update" | "--no-auto-index"))
+    {
+        return run_backend_search(group_args);
+    }
+    run_search_group(group_args, root, profile)
 }
 
 fn combine_exit_codes(current: i32, next: i32) -> i32 {
@@ -2114,44 +2385,110 @@ mod tests {
 
     #[test]
     fn live_path_target_falls_back_to_ripgrep() {
-        let root = Path::new(r"D:\Project");
-        let path = Path::new(r"D:\Project\Game\Saved\Logs");
-        assert!(path_matches_live_patterns(
-            root,
-            path,
-            &["Game/Saved/Logs/".to_string()]
+        let cfg = FrontendProjectConfig {
+            paths_live: FrontendMatcher::new(&["Game/Saved/Logs/".to_string()]).unwrap(),
+            ..Default::default()
+        };
+        assert!(rel_requires_external_fallback(
+            &cfg,
+            "Game/Saved/Logs",
+            false
         ));
     }
 
     #[test]
     fn project_root_does_not_fallback_just_because_it_contains_live_paths() {
-        let root = Path::new(r"D:\Project");
-        assert!(!path_matches_live_patterns(
-            root,
-            root,
-            &["Game/Saved/Logs/".to_string()]
-        ));
+        let cfg = FrontendProjectConfig {
+            paths_live: FrontendMatcher::new(&["Game/Saved/Logs/".to_string()]).unwrap(),
+            ..Default::default()
+        };
+        assert!(!rel_requires_external_fallback(&cfg, "", false));
     }
 
     #[test]
-    fn live_parent_target_falls_back_to_ripgrep() {
-        let root = Path::new(r"D:\Project");
-        let path = Path::new(r"D:\Project\Game\Saved");
-        assert!(path_matches_live_patterns(
-            root,
-            path,
-            &["Game/Saved/Logs/".to_string()]
+    fn ignored_directory_target_falls_back_to_external_tool() {
+        let cfg = FrontendProjectConfig {
+            paths_ignore: FrontendMatcher::new(&["Saved/".to_string()]).unwrap(),
+            ..Default::default()
+        };
+        assert!(rel_requires_external_fallback(&cfg, "Game/Saved", false));
+        assert!(rel_requires_external_fallback(
+            &cfg,
+            "Game/Saved/Logs",
+            false
         ));
+        assert!(!rel_requires_external_fallback(&cfg, "Game", false));
     }
 
     #[test]
     fn live_suffix_pattern_matches_nested_target() {
-        let root = Path::new(r"D:\Project");
-        let path = Path::new(r"D:\Project\Game\Saved\Logs");
-        assert!(path_matches_live_patterns(
-            root,
-            path,
-            &["Saved/Logs/".to_string()]
+        let cfg = FrontendProjectConfig {
+            paths_live: FrontendMatcher::new(&["Saved/Logs/".to_string()]).unwrap(),
+            ..Default::default()
+        };
+        assert!(rel_requires_external_fallback(
+            &cfg,
+            "Game/Saved/Logs",
+            false
         ));
+    }
+
+    #[test]
+    fn explicit_file_not_in_indexed_file_set_falls_back() {
+        let cfg = FrontendProjectConfig {
+            files_ignore: FrontendMatcher::new(&["*.png".to_string()]).unwrap(),
+            files_include: FrontendMatcher::new(&["*.rs".to_string()]).unwrap(),
+            ..Default::default()
+        };
+        assert!(rel_requires_external_fallback(&cfg, "src/logo.png", true));
+        assert!(rel_requires_external_fallback(&cfg, "src/readme.md", true));
+        assert!(!rel_requires_external_fallback(&cfg, "src/main.rs", true));
+        assert!(!rel_requires_external_fallback(&cfg, "src", false));
+    }
+
+    #[test]
+    fn grep_args_for_path_ordinals_keeps_only_selected_paths() {
+        let args = vec![
+            "-r".to_string(),
+            "-n".to_string(),
+            "--include=*.cpp".to_string(),
+            "Needle".to_string(),
+            "Source".to_string(),
+            "Saved/Logs".to_string(),
+            "Plugins".to_string(),
+        ];
+        assert_eq!(
+            grep_path_arg_indexes(&args),
+            vec![4usize, 5usize, 6usize]
+        );
+        assert_eq!(
+            grep_args_for_path_ordinals(&args, &[1]),
+            vec![
+                "-r".to_string(),
+                "-n".to_string(),
+                "--include=*.cpp".to_string(),
+                "Needle".to_string(),
+                "Saved/Logs".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn search_args_for_group_keeps_selected_search_paths() {
+        let args = vec![
+            "-n".to_string(),
+            "Needle".to_string(),
+            "Source".to_string(),
+            "Saved/Logs".to_string(),
+            "Plugins".to_string(),
+        ];
+        assert_eq!(
+            search_args_for_group(&args, &[Some(3)]),
+            vec![
+                "-n".to_string(),
+                "Needle".to_string(),
+                "Saved/Logs".to_string(),
+            ]
+        );
     }
 }

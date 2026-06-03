@@ -39,6 +39,10 @@ Claude Code installs also include a `PreToolUse` hook that blocks bare Bash
 - For piped stdin, `is PATTERN` forwards rg-style searches to `rg` instead of
   using the persistent project index. Use `isgrep` for grep-style pipeline
   commands.
+- For explicit path arguments that are excluded by the project config, `is`
+  falls back for those paths only. Mixed commands keep indexed paths on `is` and
+  search excluded paths with `rg`; `isgrep` uses `grep` for excluded paths when
+  available and translated `rg` arguments otherwise.
 - If the current directory is inside an indexed repository, use `is` even when
   the immediate subdirectory is small; the index is rooted above it.
 - If `is` fails because it is missing, try `indexsearch`. If both are missing,

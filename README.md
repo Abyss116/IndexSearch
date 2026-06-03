@@ -132,6 +132,12 @@ project searches stay fast and stable. The bundled Unreal Engine template uses
 this for logs and shader debug output, while excluding `Saved/` from persistent
 indexing.
 
+When a command names multiple explicit paths, IndexSearch splits the work: paths
+covered by `IndexSearch.paths.ignore`, `IndexSearch.paths.live`, or file
+include/exclude rules fall back to the external stream searcher, while indexed
+paths continue through the daemon. `is` uses `rg`; `isgrep` prefers system
+`grep` and uses translated `rg` arguments if grep is unavailable.
+
 For Unreal Engine source trees, copy the bundled template into the project
 root's `.indexsearch/` directory:
 
