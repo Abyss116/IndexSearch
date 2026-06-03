@@ -138,9 +138,9 @@ enum GrepTranslation {
     FallbackToGrep,
 }
 
-enum ExternalFallback<'a> {
+enum ExternalFallback {
     Ripgrep,
-    Grep { original_args: &'a [String] },
+    Grep,
 }
 
 fn run_grep_frontend(args: &[String]) -> Result<i32, String> {
@@ -158,12 +158,7 @@ fn run_grep_frontend(args: &[String]) -> Result<i32, String> {
         return Ok(0);
     }
     match translate_grep_args(args)? {
-        GrepTranslation::Search(search_args) => run_with_fallback(
-            &search_args,
-            ExternalFallback::Grep {
-                original_args: args,
-            },
-        ),
+        GrepTranslation::Search(search_args) => run_with_fallback(&search_args, ExternalFallback::Grep),
         GrepTranslation::FallbackToGrep => run_system_grep(args),
     }
 }
@@ -255,9 +250,6 @@ fn translate_grep_args(args: &[String]) -> Result<GrepTranslation, String> {
 
     if patterns.is_empty() {
         return Err("a grep pattern is required".to_string());
-    }
-    if paths.is_empty() && !io::stdin().is_terminal() {
-        return Ok(GrepTranslation::FallbackToGrep);
     }
     if !filename_override && paths.len() == 1 && PathBuf::from(&paths[0]).is_file() {
         out.push("-I".to_string());
@@ -585,21 +577,6 @@ fn run_system_grep(args: &[String]) -> Result<i32, String> {
     Ok(status.code().unwrap_or(1))
 }
 
-fn run_system_grep_or_translated_ripgrep(
-    grep_args: &[String],
-    ripgrep_args: &[String],
-) -> Result<i32, String> {
-    let mut command = system_grep_command();
-    command.args(grep_args);
-    match command.status() {
-        Ok(status) => Ok(status.code().unwrap_or(1)),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => run_system_ripgrep(ripgrep_args),
-        Err(err) => Err(format!(
-            "translated grep fallback failed to run system grep: {err}"
-        )),
-    }
-}
-
 fn system_grep_command() -> Command {
     let current = env::current_exe().ok();
     for candidate in ["/usr/bin/grep", "/bin/grep"] {
@@ -619,7 +596,7 @@ fn run(args: &[String]) -> Result<i32, String> {
     run_with_fallback(args, ExternalFallback::Ripgrep)
 }
 
-fn run_with_fallback(args: &[String], fallback: ExternalFallback<'_>) -> Result<i32, String> {
+fn run_with_fallback(args: &[String], fallback: ExternalFallback) -> Result<i32, String> {
     let first = first_search_flag(args);
     if args.is_empty() || first.is_some_and(|arg| matches!(arg, "-h" | "--help")) {
         return run_backend_search_help();
@@ -684,14 +661,10 @@ fn run_with_fallback(args: &[String], fallback: ExternalFallback<'_>) -> Result<
                     let group_args = search_args_for_group(&search_args, &run.path_indexes);
                     run_system_ripgrep(&ripgrep_stdin_args(&group_args))?
                 }
-                ExternalFallback::Grep { original_args } => {
-                    let group_args = grep_args_for_path_ordinals(original_args, &run.path_ordinals);
+                ExternalFallback::Grep => {
                     let ripgrep_group_args =
                         search_args_for_group(&search_args, &run.path_indexes);
-                    run_system_grep_or_translated_ripgrep(
-                        &group_args,
-                        &ripgrep_stdin_args(&ripgrep_group_args),
-                    )?
+                    run_system_ripgrep(&ripgrep_stdin_args(&ripgrep_group_args))?
                 }
             },
         };
@@ -1157,7 +1130,6 @@ struct SearchPathArg {
 struct SearchRun {
     kind: SearchRunKind,
     path_indexes: Vec<Option<usize>>,
-    path_ordinals: Vec<usize>,
 }
 
 enum SearchRunKind {
@@ -1249,15 +1221,7 @@ fn search_path_args(args: &[String]) -> Option<Vec<SearchPathArg>> {
 
 fn search_runs(paths: &[SearchPathArg]) -> Result<Vec<SearchRun>, MissingProject> {
     let mut runs = Vec::new();
-    let mut explicit_ordinal = 0usize;
     for path in paths {
-        let path_ordinal = if path.arg_index.is_some() {
-            let ordinal = explicit_ordinal;
-            explicit_ordinal += 1;
-            Some(ordinal)
-        } else {
-            None
-        };
         let Some(root) = find_project_root(&path.abs) else {
             if paths.len() == 1 && path.arg_index.is_none() {
                 return Err(MissingProject::Single);
@@ -1275,7 +1239,6 @@ fn search_runs(paths: &[SearchPathArg]) -> Result<Vec<SearchRun>, MissingProject
                 SearchRunKind::Indexed(root)
             },
             path.arg_index,
-            path_ordinal,
         );
     }
     Ok(runs)
@@ -1285,21 +1248,16 @@ fn push_search_run(
     runs: &mut Vec<SearchRun>,
     kind: SearchRunKind,
     path_index: Option<usize>,
-    path_ordinal: Option<usize>,
 ) {
     if let Some(last) = runs.last_mut()
         && search_run_kind_matches(&last.kind, &kind)
     {
         last.path_indexes.push(path_index);
-        if let Some(path_ordinal) = path_ordinal {
-            last.path_ordinals.push(path_ordinal);
-        }
         return;
     }
     runs.push(SearchRun {
         kind,
         path_indexes: vec![path_index],
-        path_ordinals: path_ordinal.into_iter().collect(),
     });
 }
 
@@ -1333,128 +1291,6 @@ fn search_args_for_group(args: &[String], keep_path_indexes: &[Option<usize>]) -
             }
         })
         .collect()
-}
-
-fn grep_args_for_path_ordinals(args: &[String], keep_path_ordinals: &[usize]) -> Vec<String> {
-    let path_indexes = grep_path_arg_indexes(args);
-    if path_indexes.is_empty() {
-        return args.to_vec();
-    }
-    let keep_indexes = path_indexes
-        .iter()
-        .enumerate()
-        .filter_map(|(ordinal, index)| keep_path_ordinals.contains(&ordinal).then_some(*index))
-        .collect::<Vec<_>>();
-    args.iter()
-        .enumerate()
-        .filter_map(|(idx, arg)| {
-            if path_indexes.contains(&idx) && !keep_indexes.contains(&idx) {
-                None
-            } else {
-                Some(arg.clone())
-            }
-        })
-        .collect()
-}
-
-fn grep_path_arg_indexes(args: &[String]) -> Vec<usize> {
-    let mut path_indexes = Vec::new();
-    let mut saw_pattern = false;
-    let mut positional_only = false;
-    let mut i = 0usize;
-    while i < args.len() {
-        let arg = &args[i];
-        if positional_only {
-            if saw_pattern {
-                path_indexes.push(i);
-            } else {
-                saw_pattern = true;
-            }
-            i += 1;
-            continue;
-        }
-        if arg == "--" {
-            positional_only = true;
-            i += 1;
-            continue;
-        }
-        if let Some(long) = arg.strip_prefix("--") {
-            if long.is_empty() {
-                positional_only = true;
-                i += 1;
-                continue;
-            }
-            let (name, has_inline_value) = long
-                .split_once('=')
-                .map(|(name, _)| (name, true))
-                .unwrap_or((long, false));
-            if matches!(name, "regexp" | "file") {
-                saw_pattern = true;
-            }
-            if grep_long_option_takes_value(name) && !has_inline_value {
-                i += 2;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-        if arg.starts_with('-') && arg != "-" {
-            let (takes_value, adds_pattern) = grep_short_option_scan(arg);
-            if adds_pattern {
-                saw_pattern = true;
-            }
-            i += if takes_value && grep_short_value_is_separate(arg) {
-                2
-            } else {
-                1
-            };
-            continue;
-        }
-        if saw_pattern {
-            path_indexes.push(i);
-        } else {
-            saw_pattern = true;
-        }
-        i += 1;
-    }
-    path_indexes
-}
-
-fn grep_long_option_takes_value(name: &str) -> bool {
-    matches!(
-        name,
-        "regexp"
-            | "file"
-            | "after-context"
-            | "before-context"
-            | "context"
-            | "max-count"
-            | "include"
-            | "exclude"
-            | "exclude-dir"
-            | "directories"
-            | "binary-files"
-    )
-}
-
-fn grep_short_option_scan(arg: &str) -> (bool, bool) {
-    for ch in arg.chars().skip(1) {
-        match ch {
-            'e' | 'f' => return (true, true),
-            'A' | 'B' | 'C' | 'm' | 'd' | 'D' => return (true, false),
-            _ => {}
-        }
-    }
-    (false, false)
-}
-
-fn grep_short_value_is_separate(arg: &str) -> bool {
-    let mut chars = arg.chars();
-    let _dash = chars.next();
-    let Some(flag) = chars.next() else {
-        return false;
-    };
-    matches!(flag, 'e' | 'f' | 'A' | 'B' | 'C' | 'm' | 'd' | 'D') && chars.next().is_none()
 }
 
 fn run_indexed_search_group(
@@ -2447,33 +2283,6 @@ mod tests {
     }
 
     #[test]
-    fn grep_args_for_path_ordinals_keeps_only_selected_paths() {
-        let args = vec![
-            "-r".to_string(),
-            "-n".to_string(),
-            "--include=*.cpp".to_string(),
-            "Needle".to_string(),
-            "Source".to_string(),
-            "Saved/Logs".to_string(),
-            "Plugins".to_string(),
-        ];
-        assert_eq!(
-            grep_path_arg_indexes(&args),
-            vec![4usize, 5usize, 6usize]
-        );
-        assert_eq!(
-            grep_args_for_path_ordinals(&args, &[1]),
-            vec![
-                "-r".to_string(),
-                "-n".to_string(),
-                "--include=*.cpp".to_string(),
-                "Needle".to_string(),
-                "Saved/Logs".to_string(),
-            ]
-        );
-    }
-
-    #[test]
     fn search_args_for_group_keeps_selected_search_paths() {
         let args = vec![
             "-n".to_string(),
@@ -2490,5 +2299,27 @@ mod tests {
                 "Saved/Logs".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn grep_translation_without_paths_can_use_ripgrep_stdin_fallback() {
+        let args = vec!["-n".to_string(), r"Needle\|Other".to_string()];
+        let GrepTranslation::Search(search_args) = translate_grep_args(&args).unwrap() else {
+            panic!("basic grep syntax should translate to rg-compatible search args");
+        };
+        assert_eq!(
+            search_args,
+            vec!["-n".to_string(), "--".to_string(), "Needle|Other".to_string()]
+        );
+        assert!(should_fallback_to_ripgrep_stdin(&search_args, true));
+    }
+
+    #[test]
+    fn grep_backreference_still_requires_system_grep() {
+        let args = vec![r"\(a\)\1".to_string()];
+        assert!(matches!(
+            translate_grep_args(&args).unwrap(),
+            GrepTranslation::FallbackToGrep
+        ));
     }
 }

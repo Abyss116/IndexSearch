@@ -135,8 +135,9 @@ indexing.
 When a command names multiple explicit paths, IndexSearch splits the work: paths
 covered by `IndexSearch.paths.ignore`, `IndexSearch.paths.live`, or file
 include/exclude rules fall back to the external stream searcher, while indexed
-paths continue through the daemon. `is` uses `rg`; `isgrep` prefers system
-`grep` and uses translated `rg` arguments if grep is unavailable.
+paths continue through the daemon. `is` uses `rg`; `isgrep` translates compatible
+grep syntax to `rg` as well, and only falls back to system `grep` for grep-only
+features that cannot be translated safely.
 
 For Unreal Engine source trees, copy the bundled template into the project
 root's `.indexsearch/` directory:
