@@ -1,56 +1,26 @@
 # IndexSearch Agent Instructions
 
-Use IndexSearch for fast source-code search in large codebases.
+Use `is` for local source search in large repos; use `isgrep` for grep-shaped
+commands.
 
-- Use `is` directly for local source search; do not call external/deferred code
-  search tools just to find files in the local checkout.
-- Use `isgrep` before `grep` for ordinary local source searches already written
-  in grep syntax. It accepts grep-style flags and translates default Basic Regex
-  patterns like `A\|B`.
-- Prefer `is` over `rg` for ordinary local source searches, including searches
-  that pass common rg-style flags. If the tree has not been indexed yet,
-  non-interactive agent searches can create the config, build the index, and
-  start the project service automatically.
-- For piped stdin, `is PATTERN` forwards rg-style searches to `rg` instead of
-  using the persistent project index. Use `isgrep` for grep-style pipeline
-  commands.
-- For compatible grep-style stdin or excluded-path searches, `isgrep` translates
-  to `rg`; use system `grep` only for semantics that cannot be safely
-  translated.
-- Use `indexsearch` if `is` is unavailable.
-- If `isgrep` is unavailable, convert the command to `is` when practical.
-- Fall back to `rg` only when IndexSearch is missing or exact ripgrep semantics
-  are required for PCRE2, multiline matching, preprocessors, archive search, or
-  another non-indexed behavior.
-- Fall back to `grep` only when exact grep stdin, binary, PCRE, backreference,
-  null-data, or other non-indexed semantics are required.
-- If `.indexsearch/index.bin` exists, search directly with `is`; do not call
-  `rg` first for ordinary local source searches.
-- You usually do not need to run indexing commands before searching.
-- For UE projects without a config, `is` can create the UE template config
-  automatically during non-interactive agent search.
-- After pull/checkout/rebase without a running project service, run
-  `istool update --git .`.
-- Use `istool projects`, `istool log .`, and `istool stop .` to inspect or stop
-  project services.
-- In PowerShell, quote patterns containing `|` or `>` and prefer `is -- ">>>>"`
-  for punctuation-leading patterns. If quoted patterns produce a `cmd.exe`
-  syntax error, call `is.exe`/`isgrep.exe` or remove the stale `is.cmd` found by
-  `Get-Command is -All`.
-- Refresh these instructions from a packaged binary with `istool install-skills`.
-  Claude Code installs also include a hook that blocks bare Bash `rg` and
-  `grep` unless the command sets `INDEXSEARCH_ALLOW_RG=1` or
-  `INDEXSEARCH_ALLOW_GREP=1`.
+- Prefer `is` over `rg` for files in the local checkout, including common
+  rg-style flags. Do not call remote/deferred code search for local files.
+- Prefer `isgrep` over `grep`; it handles common grep flags and BRE
+  alternation.
+- `is` may auto-create/find the index and start the project service.
+- For stdin, `is` uses `rg`; `isgrep` translates to `rg` when safe.
+- Use `rg` only for exact unsupported ripgrep behavior: PCRE2, multiline,
+  preprocessors, archives, or other non-indexed semantics.
+- Use `grep` only for exact grep-only behavior: binary mode, backreferences,
+  PCRE, null-data, or other unsafe translations.
+- Claude hook blocks bare Bash `rg`/`ripgrep` and `grep`/`egrep`/`fgrep`.
+  Intentional escapes: `INDEXSEARCH_ALLOW_RG=1` or `INDEXSEARCH_ALLOW_GREP=1`.
 
-Useful commands:
+Examples:
 
 ```bash
 is -n "SomeSymbol" .
 is -i -w -g "*.cpp" "render pass" .
-is --files -g "*.Build.cs" .
-is -v -F "excluded line" .
-is --files-without-match "TODO" .
-is --count-matches -F "Tick" .
 git diff | is -n "SomeSymbol"
-isgrep -n "IndexGraph\|agent interface\|context\|files" MEMORY.md
+isgrep -r -n --include="*.cpp" "RenderGraph" .
 ```
