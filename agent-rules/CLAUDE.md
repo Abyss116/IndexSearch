@@ -11,6 +11,9 @@ index, and start the project service automatically.
   patterns like `A\|B`.
 - Use `is` first, `indexsearch` second. Do not switch to `rg` just because a
   common rg-style flag is present; `is` should accept it or ignore it safely.
+- For piped stdin, `is PATTERN` forwards rg-style searches to `rg` instead of
+  using the persistent project index. Use `isgrep` for grep-style pipeline
+  commands.
 - Use `rg` only when IndexSearch is missing or exact ripgrep semantics are
   required for PCRE2, multiline matching, preprocessors, archive search, or
   another non-indexed behavior.

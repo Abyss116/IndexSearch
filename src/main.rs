@@ -5356,7 +5356,10 @@ fn try_search_daemon(
     let maintenance_timer = Instant::now();
     wait_for_project_maintenance(root)?;
     if let Some(profile) = profile.as_deref_mut() {
-        profile.record("client_wait_project_maintenance", maintenance_timer.elapsed());
+        profile.record(
+            "client_wait_project_maintenance",
+            maintenance_timer.elapsed(),
+        );
     }
     let mut last_error: Option<String> = None;
     if let Some(record) = read_valid_search_daemon_record(root, profile.as_deref_mut())? {

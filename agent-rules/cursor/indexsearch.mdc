@@ -12,6 +12,9 @@ index, and start the project service automatically. Use `indexsearch` if the
 short alias is missing. Fall back to `rg` only when IndexSearch is missing or
 exact ripgrep semantics are required for PCRE2, multiline matching,
 preprocessors, archive search, or another non-indexed behavior.
+For piped stdin, `is PATTERN` forwards rg-style searches to `rg` instead of
+using the persistent project index. Use `isgrep` for grep-style pipeline
+commands.
 For grep-style commands, prefer `isgrep` over `grep`; it accepts grep-style
 flags and translates default Basic Regex patterns like `A\|B`. Fall back to
 `grep` only when exact grep stdin, binary, PCRE, backreference, null-data, or

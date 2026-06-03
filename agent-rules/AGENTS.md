@@ -11,6 +11,9 @@ Use IndexSearch for fast source-code search in large codebases.
   that pass common rg-style flags. If the tree has not been indexed yet,
   non-interactive agent searches can create the config, build the index, and
   start the project service automatically.
+- For piped stdin, `is PATTERN` forwards rg-style searches to `rg` instead of
+  using the persistent project index. Use `isgrep` for grep-style pipeline
+  commands.
 - Use `indexsearch` if `is` is unavailable.
 - If `isgrep` is unavailable, convert the command to `is` when practical.
 - Fall back to `rg` only when IndexSearch is missing or exact ripgrep semantics
@@ -42,5 +45,6 @@ is --files -g "*.Build.cs" .
 is -v -F "excluded line" .
 is --files-without-match "TODO" .
 is --count-matches -F "Tick" .
+git diff | is -n "SomeSymbol"
 isgrep -n "IndexGraph\|agent interface\|context\|files" MEMORY.md
 ```

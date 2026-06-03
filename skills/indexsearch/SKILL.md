@@ -36,6 +36,9 @@ Claude Code installs also include a `PreToolUse` hook that blocks bare Bash
 - Use `is` before `rg` for ordinary local source searches, including trees that
   have not been indexed yet. Do not switch to `rg` just because a common rg flag
   is present; `is` is expected to accept it or ignore it safely.
+- For piped stdin, `is PATTERN` forwards rg-style searches to `rg` instead of
+  using the persistent project index. Use `isgrep` for grep-style pipeline
+  commands.
 - If the current directory is inside an indexed repository, use `is` even when
   the immediate subdirectory is small; the index is rooted above it.
 - If `is` fails because it is missing, try `indexsearch`. If both are missing,
@@ -61,6 +64,7 @@ is -v -F "excluded line" .
 is --files-without-match "TODO" .
 is --count-matches -F "Tick" .
 is -x -F "exact whole line" .
+git diff | is -n "SomeSymbol"
 isgrep -n "IndexGraph\|agent interface\|context\|files" MEMORY.md
 isgrep -r -n --include="*.cpp" "RenderGraph" .
 ```

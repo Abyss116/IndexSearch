@@ -602,6 +602,9 @@ fn run(args: &[String]) -> Result<i32, String> {
     let prepare_timer = Instant::now();
     let search_args = args.to_vec();
     profile.record("frontend_prepare_args", prepare_timer);
+    if should_fallback_to_ripgrep_stdin(&search_args, stdin_has_searchable_stream()) {
+        return run_system_ripgrep(&ripgrep_stdin_args(&search_args));
+    }
     if search_args.iter().any(|arg| arg == "--auto-update") {
         return run_backend_search(&search_args);
     }
@@ -681,6 +684,160 @@ fn first_search_flag(args: &[String]) -> Option<&str> {
         i += 1;
     }
     args.get(i).map(String::as_str)
+}
+
+fn should_fallback_to_ripgrep_stdin(args: &[String], stdin_is_searchable_stream: bool) -> bool {
+    if !stdin_is_searchable_stream || args.is_empty() {
+        return false;
+    }
+    if first_search_flag(args).is_some_and(|arg| matches!(arg, "-h" | "--help" | "-V" | "--version")) {
+        return false;
+    }
+    if args.iter().any(|arg| matches!(arg.as_str(), "--files" | "--type-list")) {
+        return false;
+    }
+    let Some(positionals) = search_positionals(args) else {
+        return false;
+    };
+    if !positionals.saw_pattern {
+        return false;
+    }
+    positionals.paths.is_empty() || positionals.paths.iter().any(|path| path == "-")
+}
+
+#[derive(Default)]
+struct SearchPositionals {
+    saw_pattern: bool,
+    paths: Vec<String>,
+}
+
+fn search_positionals(args: &[String]) -> Option<SearchPositionals> {
+    let mut out = SearchPositionals::default();
+    let mut after_double_dash = false;
+    let mut files_mode = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = &args[i];
+        if after_double_dash {
+            consume_search_positional(arg, &mut out, files_mode);
+            i += 1;
+            continue;
+        }
+        if arg == "--" {
+            after_double_dash = true;
+            i += 1;
+            continue;
+        }
+        if arg == "--files" {
+            files_mode = true;
+            i += 1;
+            continue;
+        }
+        if arg.starts_with("--regexp=") || (arg.starts_with("-e") && arg.len() > 2) {
+            out.saw_pattern = true;
+            i += 1;
+            continue;
+        }
+        if arg == "-e" || arg == "--regexp" {
+            out.saw_pattern = true;
+            i += 2;
+            continue;
+        }
+        if option_takes_value(arg) {
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("--") {
+            i += 1;
+            continue;
+        }
+        if short_option_with_attached_value(arg) || (arg.starts_with('-') && arg != "-" && arg.len() > 1) {
+            i += 1;
+            continue;
+        }
+        consume_search_positional(arg, &mut out, files_mode);
+        i += 1;
+    }
+    Some(out)
+}
+
+fn consume_search_positional(arg: &str, out: &mut SearchPositionals, files_mode: bool) {
+    if files_mode || out.saw_pattern {
+        out.paths.push(arg.to_string());
+    } else {
+        out.saw_pattern = true;
+    }
+}
+
+fn ripgrep_stdin_args(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|arg| {
+            !matches!(
+                arg.as_str(),
+                "--profile"
+                    | "--instrument"
+                    | "--profile-search"
+                    | "--auto-update"
+                    | "--no-auto-index"
+                    | "--no-daemon"
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn run_system_ripgrep(args: &[String]) -> Result<i32, String> {
+    let mut command = system_ripgrep_command();
+    command.args(args);
+    let status = command.status().map_err(|err| {
+        format!("stdin search requires ripgrep, but failed to run rg: {err}")
+    })?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn system_ripgrep_command() -> Command {
+    Command::new("rg")
+}
+
+fn stdin_has_searchable_stream() -> bool {
+    if io::stdin().is_terminal() {
+        return false;
+    }
+    stdin_file_type_is_searchable()
+}
+
+#[cfg(unix)]
+fn stdin_file_type_is_searchable() -> bool {
+    let stdin = io::stdin();
+    let fd = stdin.as_raw_fd();
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+    if rc != 0 {
+        return false;
+    }
+    let stat = unsafe { stat.assume_init() };
+    let kind = stat.st_mode & libc::S_IFMT;
+    kind == libc::S_IFIFO || kind == libc::S_IFREG || kind == libc::S_IFSOCK
+}
+
+#[cfg(windows)]
+fn stdin_file_type_is_searchable() -> bool {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
+
+    unsafe {
+        let handle = GetStdHandle(STD_INPUT_HANDLE);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        matches!(GetFileType(handle), FILE_TYPE_PIPE | FILE_TYPE_DISK)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn stdin_file_type_is_searchable() -> bool {
+    !io::stdin().is_terminal()
 }
 
 fn run_search_group(
@@ -1782,5 +1939,59 @@ mod tests {
     fn broken_pipe_is_quiet_output_termination() {
         let err = io::Error::new(io::ErrorKind::BrokenPipe, "closed");
         assert!(is_broken_pipe(&err));
+    }
+
+    #[test]
+    fn piped_stdin_without_paths_uses_ripgrep_fallback() {
+        let args = vec!["-n".to_string(), "Needle".to_string()];
+        assert!(should_fallback_to_ripgrep_stdin(&args, true));
+    }
+
+    #[test]
+    fn piped_stdin_with_explicit_path_stays_indexed() {
+        let args = vec!["-n".to_string(), "Needle".to_string(), ".".to_string()];
+        assert!(!should_fallback_to_ripgrep_stdin(&args, true));
+    }
+
+    #[test]
+    fn non_pipe_without_paths_stays_indexed() {
+        let args = vec!["-n".to_string(), "Needle".to_string()];
+        assert!(!should_fallback_to_ripgrep_stdin(&args, false));
+    }
+
+    #[test]
+    fn piped_stdin_explicit_dash_path_uses_ripgrep_fallback() {
+        let args = vec!["-n".to_string(), "Needle".to_string(), "-".to_string()];
+        assert!(should_fallback_to_ripgrep_stdin(&args, true));
+    }
+
+    #[test]
+    fn piped_files_mode_stays_indexed() {
+        let args = vec!["--files".to_string(), "-g".to_string(), "*.rs".to_string()];
+        assert!(!should_fallback_to_ripgrep_stdin(&args, true));
+    }
+
+    #[test]
+    fn ripgrep_stdin_args_strip_indexsearch_management_flags() {
+        let args = vec![
+            "--profile".to_string(),
+            "--auto-update".to_string(),
+            "--no-daemon".to_string(),
+            "-n".to_string(),
+            "Needle".to_string(),
+        ];
+        assert_eq!(
+            ripgrep_stdin_args(&args),
+            vec!["-n".to_string(), "Needle".to_string()]
+        );
+    }
+
+    #[test]
+    fn piped_stdin_with_inline_regexp_uses_ripgrep_fallback() {
+        let args = vec!["--regexp=Needle".to_string()];
+        assert!(should_fallback_to_ripgrep_stdin(&args, true));
+
+        let args = vec!["-eNeedle".to_string()];
+        assert!(should_fallback_to_ripgrep_stdin(&args, true));
     }
 }
