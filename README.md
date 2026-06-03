@@ -113,6 +113,10 @@ Project rules live in `.indexsearch/is-project-config.txt`.
 .git/
 out/
 
+[IndexSearch.paths.live]
+run-logs/
+shader-debug/
+
 [IndexSearch.files.ignore]
 *.png
 *.pdb
@@ -120,6 +124,13 @@ out/
 [IndexSearch.files.include]
 *
 ```
+
+`IndexSearch.paths.live` is for high-churn or generated text directories that
+should not be persisted into the project index. Explicit searches inside those
+paths fall back to `rg`, for example `is Error Saved/Logs`, while ordinary
+project searches stay fast and stable. The bundled Unreal Engine template uses
+this for logs and shader debug output, while excluding `Saved/` from persistent
+indexing.
 
 For Unreal Engine source trees, copy the bundled template into the project
 root's `.indexsearch/` directory:

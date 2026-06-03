@@ -616,6 +616,9 @@ fn run(args: &[String]) -> Result<i32, String> {
         return run_backend_search(&search_args);
     };
     profile.record("frontend_resolve_search_paths", path_timer);
+    if should_fallback_to_ripgrep_live_paths(&search_paths) {
+        return run_system_ripgrep(&ripgrep_stdin_args(&search_args));
+    }
     if search_args.iter().any(|arg| arg == "--no-auto-index") {
         return run_backend_search(&search_args);
     }
@@ -842,6 +845,110 @@ fn stdin_file_type_is_searchable() -> bool {
 #[cfg(not(any(unix, windows)))]
 fn stdin_file_type_is_searchable() -> bool {
     !io::stdin().is_terminal()
+}
+
+fn should_fallback_to_ripgrep_live_paths(search_paths: &[SearchPathArg]) -> bool {
+    for path in search_paths {
+        let Some(root) = find_project_root(&path.abs) else {
+            continue;
+        };
+        let Ok(patterns) = live_path_patterns(&root) else {
+            continue;
+        };
+        if path_matches_live_patterns(&root, &path.abs, &patterns) {
+            return true;
+        }
+    }
+    false
+}
+
+fn live_path_patterns(root: &Path) -> Result<Vec<String>, String> {
+    let config = project_config_path(root);
+    let legacy = legacy_project_config_path(root);
+    let text = if config.is_file() {
+        fs::read_to_string(config).map_err(|err| err.to_string())?
+    } else if legacy.is_file() {
+        fs::read_to_string(legacy).map_err(|err| err.to_string())?
+    } else {
+        return Ok(Vec::new());
+    };
+    Ok(clean_config_section(
+        parse_config_sections(&text).get("IndexSearch.paths.live"),
+    ))
+}
+
+fn path_matches_live_patterns(root: &Path, path: &Path, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    let root = normalized_existing_path(root);
+    let path = normalized_existing_path(path);
+    let Ok(rel_path) = path.strip_prefix(&root) else {
+        return false;
+    };
+    let rel = rel_path.to_string_lossy().replace('\\', "/");
+    if rel.is_empty() {
+        return false;
+    }
+    let rel_dir = format!("{}/", rel.trim_end_matches('/'));
+    patterns.iter().any(|pattern| {
+        let pattern = normalized_live_pattern(pattern);
+        if pattern.is_empty() {
+            return false;
+        }
+        live_pattern_overlaps_rel(&pattern, &rel_dir)
+    })
+}
+
+fn normalized_live_pattern(pattern: &str) -> String {
+    let mut pattern = pattern.trim().replace('\\', "/");
+    while let Some(stripped) = pattern.strip_prefix("./") {
+        pattern = stripped.to_string();
+    }
+    if !pattern.ends_with('/') {
+        pattern.push('/');
+    }
+    pattern
+}
+
+fn live_pattern_overlaps_rel(pattern: &str, rel_dir: &str) -> bool {
+    rel_dir == pattern
+        || rel_dir.starts_with(pattern)
+        || pattern.starts_with(rel_dir)
+        || rel_dir.ends_with(pattern)
+        || rel_dir.contains(&format!("/{pattern}"))
+}
+
+fn parse_config_sections(text: &str) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut sections = std::collections::BTreeMap::<String, Vec<String>>::new();
+    let mut current = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            current = trimmed[1..trimmed.len() - 1].trim().to_string();
+            sections.entry(current.clone()).or_default();
+        } else if !current.is_empty() {
+            sections
+                .entry(current.clone())
+                .or_default()
+                .push(trimmed.to_string());
+        }
+    }
+    sections
+}
+
+fn clean_config_section(section: Option<&Vec<String>>) -> Vec<String> {
+    section
+        .into_iter()
+        .flat_map(|lines| lines.iter())
+        .filter_map(|line| {
+            let line = line.split('#').next().unwrap_or("").trim();
+            (!line.is_empty()).then(|| line.to_string())
+        })
+        .collect()
 }
 
 fn run_search_group(
@@ -2003,5 +2110,48 @@ mod tests {
 
         let args = vec!["-eNeedle".to_string()];
         assert!(should_fallback_to_ripgrep_stdin(&args, true));
+    }
+
+    #[test]
+    fn live_path_target_falls_back_to_ripgrep() {
+        let root = Path::new(r"D:\Project");
+        let path = Path::new(r"D:\Project\Game\Saved\Logs");
+        assert!(path_matches_live_patterns(
+            root,
+            path,
+            &["Game/Saved/Logs/".to_string()]
+        ));
+    }
+
+    #[test]
+    fn project_root_does_not_fallback_just_because_it_contains_live_paths() {
+        let root = Path::new(r"D:\Project");
+        assert!(!path_matches_live_patterns(
+            root,
+            root,
+            &["Game/Saved/Logs/".to_string()]
+        ));
+    }
+
+    #[test]
+    fn live_parent_target_falls_back_to_ripgrep() {
+        let root = Path::new(r"D:\Project");
+        let path = Path::new(r"D:\Project\Game\Saved");
+        assert!(path_matches_live_patterns(
+            root,
+            path,
+            &["Game/Saved/Logs/".to_string()]
+        ));
+    }
+
+    #[test]
+    fn live_suffix_pattern_matches_nested_target() {
+        let root = Path::new(r"D:\Project");
+        let path = Path::new(r"D:\Project\Game\Saved\Logs");
+        assert!(path_matches_live_patterns(
+            root,
+            path,
+            &["Saved/Logs/".to_string()]
+        ));
     }
 }

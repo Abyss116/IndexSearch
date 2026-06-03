@@ -95,6 +95,7 @@ const STREAMING_PIPELINE_MIN_CANDIDATES: usize = 50_000;
 const POSTING_BUILD_CHUNK_FILES: usize = 4096;
 const POSTING_MERGE_MAX_SHARDS: usize = 64;
 const INDEX_PROCESS_PROGRESS_GRANULARITY: u64 = 8 * 1024 * 1024;
+const INDEX_PROFILE_TOP_DIRS: usize = 12;
 const DEFAULT_PROJECT_CONFIG: &str = "[IndexSearch.paths.ignore]\n.git/\n.hg/\n.svn/\n.indexsearch/\n\n\
 [IndexSearch.files.ignore]\n*.png\n*.jpg\n*.jpeg\n*.gif\n*.pdf\n*.zip\n*.gz\n*.dll\n*.exe\n*.pdb\n*.o\n*.obj\n\n\
 [IndexSearch.files.include]\n*\n";
@@ -137,6 +138,7 @@ struct ProjectConfig {
     root: PathBuf,
     path: Option<PathBuf>,
     paths_ignore: MatcherSet,
+    paths_live: MatcherSet,
     files_ignore: MatcherSet,
     files_include: MatcherSet,
     hash: u64,
@@ -2217,6 +2219,7 @@ fn command_index(args: &[String]) -> Result<i32> {
     }
     if options.profile {
         print_index_profile(&timings);
+        print_index_top_dirs_profile(&index);
     }
     println!("root: {}", display_path(&cfg.root));
     println!("index: {}", display_path(&path));
@@ -7409,6 +7412,7 @@ fn load_config_inner(start: &Path, create_default: bool) -> Result<ProjectConfig
     let path = config_path.unwrap_or(path);
     let sections = parse_sections(&text);
     let paths_ignore = MatcherSet::new(&clean_section(sections.get("IndexSearch.paths.ignore")))?;
+    let paths_live = MatcherSet::new(&clean_section(sections.get("IndexSearch.paths.live")))?;
     let files_ignore = MatcherSet::new(&clean_section(sections.get("IndexSearch.files.ignore")))?;
     let mut include_lines = clean_section(sections.get("IndexSearch.files.include"));
     if include_lines.is_empty() {
@@ -7419,6 +7423,7 @@ fn load_config_inner(start: &Path, create_default: bool) -> Result<ProjectConfig
         root,
         path: has_config.then_some(path),
         paths_ignore,
+        paths_live,
         files_ignore,
         files_include,
         hash: fnv1a(text.as_bytes()),
@@ -8972,7 +8977,7 @@ fn should_descend_rel(cfg: &ProjectConfig, options: &Options, rel: &str) -> bool
     if !options.hidden && is_hidden(rel) {
         return false;
     }
-    if cfg.paths_ignore.is_match(rel) {
+    if cfg.paths_ignore.is_match(rel) || cfg.paths_live.is_match(rel) {
         return false;
     }
     true
@@ -9081,6 +9086,7 @@ fn scan_indexable_dir_windows(
 
 fn is_searchable(cfg: &ProjectConfig, rel: &str) -> bool {
     !cfg.paths_ignore.is_match(rel)
+        && !cfg.paths_live.is_match(rel)
         && !cfg.files_ignore.is_match(rel)
         && cfg.files_include.is_match(rel)
 }
@@ -14614,6 +14620,13 @@ fn print_index_profile(timings: &Timings) {
     let _ = err.flush();
 }
 
+fn print_index_top_dirs_profile(index: &BuiltIndex) {
+    let stderr = std::io::stderr();
+    let mut err = BufWriter::new(stderr.lock());
+    let _ = append_index_top_dirs_profile(&mut err, index, INDEX_PROFILE_TOP_DIRS);
+    let _ = err.flush();
+}
+
 fn append_index_profile<W: Write>(out: &mut W, timings: &Timings) -> Result<()> {
     let events = [
         ("index_git", timings.git),
@@ -14675,6 +14688,53 @@ fn append_index_profile<W: Write>(out: &mut W, timings: &Timings) -> Result<()> 
         }
     }
     Ok(())
+}
+
+fn append_index_top_dirs_profile<W: Write>(
+    out: &mut W,
+    index: &BuiltIndex,
+    limit: usize,
+) -> Result<()> {
+    let mut dirs = BTreeMap::<String, (u64, u64)>::new();
+    for file in &index.files {
+        let entry = dirs
+            .entry(index_profile_dir_key(&file.path))
+            .or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(file.size);
+        entry.1 += 1;
+    }
+    let mut items: Vec<_> = dirs.into_iter().collect();
+    items.sort_by(|left, right| {
+        right
+            .1
+            .0
+            .cmp(&left.1.0)
+            .then_with(|| right.1.1.cmp(&left.1.1))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    for (path, (bytes, files)) in items.into_iter().take(limit) {
+        writeln!(
+            out,
+            "profile: index_top_dir bytes={bytes} files={files} path={path}"
+        )?;
+    }
+    Ok(())
+}
+
+fn index_profile_dir_key(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let mut parts = Vec::with_capacity(3);
+    for part in normalized.split('/').filter(|part| !part.is_empty()) {
+        parts.push(part);
+        if parts.len() == 3 {
+            break;
+        }
+    }
+    if parts.is_empty() {
+        normalized
+    } else {
+        parts.join("/")
+    }
 }
 
 fn timing_summary(timings: &Timings) -> String {
@@ -15022,5 +15082,32 @@ mod tests {
     fn displayed_version_includes_build_metadata() {
         let version = display_version();
         assert!(version.starts_with(concat!(env!("CARGO_PKG_VERSION"), "+build.")));
+    }
+
+    #[test]
+    fn live_paths_are_not_persistently_indexed() {
+        let cfg = ProjectConfig {
+            root: PathBuf::from(r"D:\Project"),
+            path: None,
+            paths_ignore: MatcherSet::new(&["Saved/".to_string()]).unwrap(),
+            paths_live: MatcherSet::new(&["Saved/Logs/".to_string()]).unwrap(),
+            files_ignore: MatcherSet::default(),
+            files_include: MatcherSet::new(&["*".to_string()]).unwrap(),
+            hash: 0,
+        };
+
+        assert!(!is_searchable(&cfg, "Saved/Logs/Game.log"));
+        assert!(is_searchable(&cfg, "Source/Game.cpp"));
+        assert!(!should_descend_rel(&cfg, &Options::default(), "Saved"));
+        assert!(!should_descend_rel(&cfg, &Options::default(), "Saved/Logs"));
+    }
+
+    #[test]
+    fn index_profile_dir_key_uses_first_three_components() {
+        assert_eq!(
+            index_profile_dir_key(r"Engine\Source\ThirdParty\Huge.h"),
+            "Engine/Source/ThirdParty"
+        );
+        assert_eq!(index_profile_dir_key("README.md"), "README.md");
     }
 }
