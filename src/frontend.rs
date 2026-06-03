@@ -147,7 +147,7 @@ fn run_grep_frontend(args: &[String]) -> Result<i32, String> {
         return Ok(0);
     }
     if first.is_some_and(|arg| matches!(arg, "-V" | "--version")) {
-        println!("{} {}", frontend_command_name(), env!("CARGO_PKG_VERSION"));
+        println!("{} {}", frontend_command_name(), display_version());
         return Ok(0);
     }
     match translate_grep_args(args)? {
@@ -294,7 +294,7 @@ fn translate_grep_long_option(
             std::process::exit(0);
         }
         "version" => {
-            println!("{} {}", frontend_command_name(), env!("CARGO_PKG_VERSION"));
+            println!("{} {}", frontend_command_name(), display_version());
             std::process::exit(0);
         }
         "basic-regexp" => *mode = GrepRegexMode::Basic,
@@ -441,7 +441,7 @@ fn translate_grep_short_options(
             'R' => out.push("--follow".to_string()),
             'a' | 'I' | 'T' | 'U' | 'u' => {}
             'V' => {
-                println!("{} {}", frontend_command_name(), env!("CARGO_PKG_VERSION"));
+                println!("{} {}", frontend_command_name(), display_version());
                 std::process::exit(0);
             }
             _ => return Ok(GrepOptionOutcome::Fallback),
@@ -594,7 +594,7 @@ fn run(args: &[String]) -> Result<i32, String> {
         return run_backend_search_help();
     }
     if first.is_some_and(|arg| matches!(arg, "-V" | "--version")) {
-        println!("{} {}", frontend_command_name(), env!("CARGO_PKG_VERSION"));
+        println!("{} {}", frontend_command_name(), display_version());
         return Ok(0);
     }
     let total_timer = Instant::now();
@@ -684,6 +684,10 @@ fn first_search_flag(args: &[String]) -> Option<&str> {
         i += 1;
     }
     args.get(i).map(String::as_str)
+}
+
+fn display_version() -> &'static str {
+    concat!(env!("CARGO_PKG_VERSION"), "+", env!("INDEXSEARCH_BUILD_ID"))
 }
 
 fn should_fallback_to_ripgrep_stdin(args: &[String], stdin_is_searchable_stream: bool) -> bool {
@@ -1657,7 +1661,7 @@ fn backend_candidate_paths() -> Vec<PathBuf> {
     let Some(dir) = exe.parent() else {
         return Vec::new();
     };
-    let versioned_daemon = format!("is-daemon-{}", env!("CARGO_PKG_VERSION"));
+    let versioned_daemon = format!("is-daemon-{}", display_version());
     [versioned_daemon.as_str(), "is-daemon", "istool"]
         .into_iter()
         .map(|name| dir.join(executable_name(name)))
@@ -1939,6 +1943,12 @@ mod tests {
     fn broken_pipe_is_quiet_output_termination() {
         let err = io::Error::new(io::ErrorKind::BrokenPipe, "closed");
         assert!(is_broken_pipe(&err));
+    }
+
+    #[test]
+    fn displayed_version_includes_build_metadata() {
+        let version = display_version();
+        assert!(version.starts_with(concat!(env!("CARGO_PKG_VERSION"), "+build.")));
     }
 
     #[test]

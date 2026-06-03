@@ -838,7 +838,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         "-V" | "--version" => {
-            println!("{} {}", cli_binary_name(), env!("CARGO_PKG_VERSION"));
+            println!("{} {}", cli_binary_name(), display_version());
             Ok(())
         }
         "version" => {
@@ -846,7 +846,7 @@ fn run() -> Result<()> {
             if maybe_print_command_help("version", &args) {
                 std::process::exit(0);
             }
-            println!("{} {}", cli_binary_name(), env!("CARGO_PKG_VERSION"));
+            println!("{} {}", cli_binary_name(), display_version());
             Ok(())
         }
         value => bail_unknown_command(value),
@@ -867,6 +867,10 @@ fn cli_binary_name() -> &'static str {
     } else {
         "istool"
     }
+}
+
+fn display_version() -> &'static str {
+    concat!(env!("CARGO_PKG_VERSION"), "+", env!("INDEXSEARCH_BUILD_ID"))
 }
 
 struct CommandSpec {
@@ -3392,10 +3396,8 @@ fn command_install(args: &[String]) -> Result<i32> {
     }
     #[cfg(windows)]
     let installed_backend_path = {
-        let versioned_daemon_path = dir.join(executable_name(&format!(
-            "is-daemon-{}",
-            env!("CARGO_PKG_VERSION")
-        )));
+        let versioned_daemon_path =
+            dir.join(executable_name(&format!("is-daemon-{}", display_version())));
         install_executable(&daemon_src, &versioned_daemon_path)?;
         if let Err(err) = install_executable(&daemon_src, &daemon_path) {
             eprintln!(
@@ -5643,10 +5645,7 @@ fn search_daemon_executable() -> Result<PathBuf> {
         return Ok(exe);
     }
     if let Some(dir) = exe.parent() {
-        let versioned = dir.join(executable_name(&format!(
-            "is-daemon-{}",
-            env!("CARGO_PKG_VERSION")
-        )));
+        let versioned = dir.join(executable_name(&format!("is-daemon-{}", display_version())));
         if versioned.is_file() {
             return Ok(versioned);
         }
@@ -14153,10 +14152,7 @@ fn search_daemon_client_exe_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join(executable_name(&format!(
-                "is-daemon-{}",
-                env!("CARGO_PKG_VERSION")
-            ))));
+            candidates.push(dir.join(executable_name(&format!("is-daemon-{}", display_version()))));
             candidates.push(dir.join(executable_name("is-daemon")));
             candidates.push(dir.join(executable_name("istool")));
         }
@@ -15020,5 +15016,11 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn displayed_version_includes_build_metadata() {
+        let version = display_version();
+        assert!(version.starts_with(concat!(env!("CARGO_PKG_VERSION"), "+build.")));
     }
 }
