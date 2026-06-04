@@ -52,7 +52,6 @@ type StdoutFd = i32;
 const INDEX_DIR: &str = ".indexsearch";
 const PROJECT_CONFIG_FILE: &str = "is-project-config.txt";
 const PROJECT_CONFIG_REL: &str = ".indexsearch/is-project-config.txt";
-const LEGACY_PROJECT_FILE: &str = "index-search-project.txt";
 const INDEX_FILE: &str = "index.bin";
 const DELTA_DIR: &str = "deltas";
 const PROJECTS_DIR: &str = "projects";
@@ -81,7 +80,9 @@ const SEARCH_DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_millis(20);
 #[cfg(windows)]
 const SEARCH_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(not(windows))]
-const SEARCH_DAEMON_START_TIMEOUT: Duration = Duration::from_millis(250);
+const SEARCH_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const SEARCH_DAEMON_UNIX_SOCKET_PATH_LIMIT: usize = 100;
 const REBUILD_LOCK_GRACE_TIMEOUT: Duration = Duration::from_millis(300);
 const REBUILD_LOCK_FORCE_TIMEOUT: Duration = Duration::from_secs(5);
 const REBUILD_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(25);
@@ -3902,12 +3903,10 @@ fn install_agents_rule(options: &InstallSkillsOptions, project: Option<&Path>) -
 
 fn install_ue_template(project: &Path, force: bool, dry_run: bool) -> Result<()> {
     let dst = project_config_path(project);
-    let legacy = legacy_project_config_path(project);
-    if (dst.exists() || legacy.exists()) && !force {
-        let existing = if dst.exists() { &dst } else { &legacy };
+    if dst.exists() && !force {
         println!(
             "kept existing {}; pass --force to replace it",
-            display_path(existing)
+            display_path(&dst)
         );
         return Ok(());
     }
@@ -4525,12 +4524,8 @@ fn project_config_path(root: &Path) -> PathBuf {
     root.join(INDEX_DIR).join(PROJECT_CONFIG_FILE)
 }
 
-fn legacy_project_config_path(root: &Path) -> PathBuf {
-    root.join(LEGACY_PROJECT_FILE)
-}
-
 fn project_config_exists(root: &Path) -> bool {
-    project_config_path(root).is_file() || legacy_project_config_path(root).is_file()
+    project_config_path(root).is_file()
 }
 
 fn project_marker_exists(root: &Path) -> bool {
@@ -4538,7 +4533,7 @@ fn project_marker_exists(root: &Path) -> bool {
 }
 
 fn is_project_config_rel(rel: &str) -> bool {
-    rel == PROJECT_CONFIG_REL || rel == LEGACY_PROJECT_FILE
+    rel == PROJECT_CONFIG_REL
 }
 
 fn confirm_clean(roots: &[PathBuf]) -> Result<bool> {
@@ -5483,16 +5478,19 @@ fn start_search_daemon(root: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
 fn hidden_background_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut command = Command::new(program);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
+    command.creation_flags(CREATE_NO_WINDOW);
     command
+}
+
+#[cfg(not(windows))]
+fn hidden_background_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    Command::new(program)
 }
 
 fn start_search_daemon_from_current_index(root: &Path) -> Result<()> {
@@ -5745,6 +5743,14 @@ impl SearchDaemonListener {
                 Ok(SearchDaemonStream::Unix(stream))
             }
         }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SearchDaemonListener {
+    fn drop(&mut self) {
+        let Self::Unix { path, .. } = self;
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -7381,13 +7387,9 @@ fn load_config_inner(start: &Path, create_default: bool) -> Result<ProjectConfig
         ensure_local_git_excludes_for_project(&root)?;
     }
     let path = project_config_path(&root);
-    let legacy_path = legacy_project_config_path(&root);
     let (config_path, text) = if path.exists() {
         let text = fs::read_to_string(&path)?;
         (Some(path.clone()), text)
-    } else if legacy_path.exists() {
-        let text = fs::read_to_string(&legacy_path)?;
-        (Some(legacy_path.clone()), text)
     } else {
         let default_config = if is_unreal_root(&root) {
             EMBEDDED_UE_SKILL_CONFIG
@@ -8040,14 +8042,14 @@ fn index_cpu_thread_count() -> usize {
 
 fn index_io_thread_count(cpu_threads: usize) -> usize {
     thread_count_env("INDEXSEARCH_INDEX_IO_THREADS").unwrap_or_else(|| {
-        let available = available_threads();
         #[cfg(windows)]
         {
+            let available = available_threads();
             (available / 16).clamp(2, 4).min(cpu_threads.max(1))
         }
         #[cfg(not(windows))]
         {
-            (cpu_threads / 4).clamp(2, 8).min(cpu_threads.max(1))
+            cpu_threads.div_ceil(2).clamp(2, 8).min(cpu_threads.max(1))
         }
     })
 }
@@ -13933,7 +13935,27 @@ fn search_daemon_record_path(root: &Path) -> PathBuf {
 
 #[cfg(unix)]
 fn search_daemon_socket_path(root: &Path) -> PathBuf {
-    root.join(INDEX_DIR).join("search-daemon.sock")
+    let path = root.join(INDEX_DIR).join("search-daemon.sock");
+    if unix_socket_path_fits(&path) {
+        return path;
+    }
+    short_search_daemon_socket_path(root)
+}
+
+#[cfg(unix)]
+fn short_search_daemon_socket_path(root: &Path) -> PathBuf {
+    let name = format!("is-{}-{}.sock", project_id(root), std::process::id());
+    let path = env::temp_dir().join(&name);
+    if unix_socket_path_fits(&path) {
+        return path;
+    }
+    PathBuf::from("/tmp").join(name)
+}
+
+#[cfg(unix)]
+fn unix_socket_path_fits(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().len() < SEARCH_DAEMON_UNIX_SOCKET_PATH_LIMIT
 }
 
 fn project_registry_dir() -> PathBuf {
@@ -15103,11 +15125,59 @@ mod tests {
     }
 
     #[test]
+    fn recursive_directory_patterns_skip_nested_unreal_outputs() {
+        let cfg = ProjectConfig {
+            root: PathBuf::from(r"D:\Project"),
+            path: None,
+            paths_ignore: MatcherSet::new(&[
+                "**/Binaries/".to_string(),
+                "**/DerivedDataCache/".to_string(),
+                "**/Intermediate/".to_string(),
+            ])
+            .unwrap(),
+            paths_live: MatcherSet::default(),
+            files_ignore: MatcherSet::default(),
+            files_include: MatcherSet::new(&["*".to_string()]).unwrap(),
+            hash: 0,
+        };
+
+        for rel in [
+            "Binaries",
+            "Project/Binaries",
+            "Plugins/Foo/Binaries",
+            "DerivedDataCache",
+            "Project/DerivedDataCache",
+            "Plugins/Foo/Intermediate",
+            "Engine/Source/Programs/UnrealBuildTool/Intermediate",
+        ] {
+            assert!(!should_descend_rel(&cfg, &Options::default(), rel), "{rel}");
+        }
+        assert!(should_descend_rel(&cfg, &Options::default(), "Source"));
+        assert!(!is_searchable(&cfg, "Plugins/Foo/Binaries/Generated.txt"));
+        assert!(is_searchable(&cfg, "Plugins/Foo/Source/Module.cpp"));
+    }
+
+    #[test]
     fn index_profile_dir_key_uses_first_three_components() {
         assert_eq!(
             index_profile_dir_key(r"Engine\Source\ThirdParty\Huge.h"),
             "Engine/Source/ThirdParty"
         );
         assert_eq!(index_profile_dir_key("README.md"), "README.md");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn long_search_daemon_socket_path_uses_short_temp_path() {
+        let short_root = PathBuf::from("/tmp/indexsearch-short-root");
+        assert_eq!(
+            search_daemon_socket_path(&short_root),
+            short_root.join(INDEX_DIR).join("search-daemon.sock")
+        );
+
+        let long_root = PathBuf::from(format!("/tmp/{}", "deep".repeat(40)));
+        let socket_path = search_daemon_socket_path(&long_root);
+        assert!(unix_socket_path_fits(&socket_path));
+        assert!(!socket_path.starts_with(long_root.join(INDEX_DIR)));
     }
 }

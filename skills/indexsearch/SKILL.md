@@ -1,6 +1,6 @@
 ---
 name: indexsearch
-description: Use when searching local source in large repos, indexed projects, or Unreal Engine trees.
+description: Use is/isgrep as the searching CLI.
 hooks:
   PreToolUse:
     - matcher: "Bash"
@@ -14,14 +14,17 @@ hooks:
 
 # IndexSearch
 
-Use `is` for local source search. Use `isgrep` when the command is already
-grep-shaped.
+Use `is`/`isgrep` as the searching CLI. Use `isgrep` when the command is
+already grep-shaped.
 
 Rules:
 - Prefer `is` over `rg`; do not call remote/deferred search tools for files in
   the local checkout.
 - Prefer `isgrep` over `grep`; it handles common grep flags and BRE alternation.
-- `is` may auto-create/find the index and start the project service.
+- `is` finds existing indexes and starts the project service when a project is
+  present.
+- If no project root exists, `is`/`isgrep` do not create one during agent
+  searches; they route the one-off search through `rg`/`grep` internally.
 - For stdin, live/generated paths, ignored explicit paths, and compatible
   translated grep syntax, keep using `is`/`isgrep`; they route the necessary
   external search internally.

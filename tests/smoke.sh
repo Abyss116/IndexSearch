@@ -23,7 +23,7 @@ export HOME="$test_home"
 
 cleanup() {
   "$tool_bin" stop --all >/dev/null 2>&1 || "$daemon_bin" stop --all >/dev/null 2>&1 || true
-  rm -rf "${tmp:-}" "${no_cfg_tmp:-}" "${search_no_cfg_tmp:-}" "${backend_auto_tmp:-}" \
+  rm -rf "${tmp:-}" "${no_cfg_tmp:-}" "${search_no_cfg_tmp:-}" "${grep_no_cfg_tmp:-}" "${backend_auto_tmp:-}" \
     "${home_registry_tmp:-}" "${outside_log_tmp:-}" "${multi_root_tmp:-}" "${git_tmp:-}" "${ue_git_tmp:-}" "${sub_git_tmp:-}" "${watch_tmp:-}" \
     "${compact_watch_tmp:-}" "${config_watch_tmp:-}" "${offline_watch_tmp:-}" \
     "${implicit_watch_tmp:-}" "${clean_tmp:-}" "${all_home:-}" "${all_watch_a:-}" \
@@ -42,6 +42,12 @@ assert_daemon_capabilities() {
   fi
 }
 
+write_project_config() {
+  local root="$1"
+  mkdir -p "$root/.indexsearch"
+  cat > "$root/.indexsearch/is-project-config.txt"
+}
+
 tmp="$(mktemp -d)"
 trap cleanup EXIT
 
@@ -49,7 +55,16 @@ no_cfg_tmp="$(mktemp -d)"
 search_no_cfg_tmp="$(mktemp -d)"
 printf 'no_search_config_symbol\n' > "$search_no_cfg_tmp/a.txt"
 "$bin" -q -F no_search_config_symbol "$search_no_cfg_tmp"
-[[ -f "$search_no_cfg_tmp/.indexsearch/is-project-config.txt" ]]
+[[ ! -e "$search_no_cfg_tmp/.indexsearch/is-project-config.txt" ]]
+(
+  cd "$search_no_cfg_tmp"
+  "$bin" -q -F no_search_config_symbol
+)
+[[ ! -e "$search_no_cfg_tmp/.indexsearch/is-project-config.txt" ]]
+grep_no_cfg_tmp="$(mktemp -d)"
+printf 'grep_no_config_symbol\n' > "$grep_no_cfg_tmp/a.txt"
+"$grep_bin" -r -q -F grep_no_config_symbol "$grep_no_cfg_tmp"
+[[ ! -e "$grep_no_cfg_tmp/.indexsearch/is-project-config.txt" ]]
 if [[ -x "$tool_bin" ]]; then
   backend_auto_tmp="$(mktemp -d)"
   printf 'backend_auto_symbol\n' > "$backend_auto_tmp/a.txt"
@@ -78,7 +93,6 @@ git -C "$ue_git_tmp" init -q
 "$tool_bin" index "$ue_git_tmp" >/dev/null
 grep -q '# Local ignore IndexSearch and IndexGraph' "$ue_git_tmp/.git/info/exclude"
 grep -qx '/.indexsearch/' "$ue_git_tmp/.git/info/exclude"
-! grep -qx 'index-search-project.txt' "$ue_git_tmp/.git/info/exclude"
 [[ -f "$ue_git_tmp/.indexsearch/is-project-config.txt" ]]
 "$tool_bin" index "$ue_git_tmp" >/dev/null
 [[ "$(grep -cx '/.indexsearch/' "$ue_git_tmp/.git/info/exclude")" -eq 1 ]]
@@ -142,7 +156,7 @@ grep -q $'\033\\[' <<<"$color_help"
 plain_help="$(NO_COLOR=1 CLICOLOR_FORCE=1 "$bin" --help)"
 ! grep -q $'\033\\[' <<<"$plain_help"
 
-cat > "$tmp/index-search-project.txt" <<'CFG'
+write_project_config "$tmp" <<'CFG'
 [IndexSearch.paths.ignore]
 out/
 
@@ -254,15 +268,15 @@ grep -q 'b.txt:1:Needle there' <<<"$grep_extended_alt"
 grep_no_filename="$("$grep_bin" -h -n 'hello_world' "$tmp/src/a.cc")"
 [[ "$grep_no_filename" == '1:hello_world = 1' ]]
 grep_without_match="$("$grep_bin" -L -F needle "$tmp/src/a.cc" "$tmp/src/b.txt")"
-grep -q "$tmp/src/b.txt" <<<"$grep_without_match"
-! grep -q "$tmp/src/a.cc" <<<"$grep_without_match"
+grep -qx 'src/b.txt' <<<"$grep_without_match"
+! grep -qx 'src/a.cc' <<<"$grep_without_match"
 
 files="$("$bin" --files "$tmp")"
 grep -q 'src/a.cc' <<<"$files"
 grep -q 'src/b.txt' <<<"$files"
 
 multi_root_tmp="$(mktemp -d)"
-cat > "$multi_root_tmp/index-search-project.txt" <<'CFG'
+write_project_config "$multi_root_tmp" <<'CFG'
 [IndexSearch.files.include]
 *.txt
 CFG
@@ -299,7 +313,7 @@ grep -q 'index_size:' <<<"$status"
 
 git_tmp="$(mktemp -d)"
 
-cat > "$git_tmp/index-search-project.txt" <<'CFG'
+write_project_config "$git_tmp" <<'CFG'
 [IndexSearch.paths.ignore]
 .git/
 
@@ -358,7 +372,7 @@ grep -q 'compacted' <<<"$compact_out"
 "$bin" -q -F 'daemon_delta_symbol' "$git_tmp"
 
 watch_tmp="$(mktemp -d)"
-cat > "$watch_tmp/index-search-project.txt" <<'CFG'
+write_project_config "$watch_tmp" <<'CFG'
 [IndexSearch.paths.ignore]
 .git/
 
@@ -431,12 +445,13 @@ fi
 if [[ -x "$daemon_bin" ]]; then
   compact_watch_tmp="$(mktemp -d)"
   config_watch_tmp="$(mktemp -d)"
-  cat > "$compact_watch_tmp/index-search-project.txt" <<'CFG'
+  write_project_config "$compact_watch_tmp" <<'CFG'
 [IndexSearch.files.include]
 *.txt
 CFG
   printf 'compact_first\n' > "$compact_watch_tmp/a.txt"
   "$tool_bin" index "$compact_watch_tmp" >/dev/null
+  "$tool_bin" stop "$compact_watch_tmp" >/dev/null 2>&1 || true
   "$daemon_bin" search-daemon --detach --idle-seconds 1 --compact-delta-count 1 "$compact_watch_tmp" >/dev/null
   for _ in 1 2 3 4 5; do
     [[ -f "$compact_watch_tmp/.indexsearch/search-daemon.txt" ]] && break
@@ -485,12 +500,13 @@ CFG
 fi
 
 offline_watch_tmp="$(mktemp -d)"
-cat > "$offline_watch_tmp/index-search-project.txt" <<'CFG'
+write_project_config "$offline_watch_tmp" <<'CFG'
 [IndexSearch.files.include]
 *.txt
 CFG
 printf 'offline_old\n' > "$offline_watch_tmp/a.txt"
 "$tool_bin" index "$offline_watch_tmp" >/dev/null
+"$tool_bin" stop "$offline_watch_tmp" >/dev/null 2>&1 || true
 printf 'offline_new\n' > "$offline_watch_tmp/a.txt"
 printf 'offline_added\n' > "$offline_watch_tmp/added.txt"
 "$bin" -q -F offline_new "$offline_watch_tmp"
@@ -501,7 +517,7 @@ grep -q 'startup-update' <<<"$offline_watch_log"
 "$tool_bin" stop "$offline_watch_tmp" >/dev/null
 
 implicit_watch_tmp="$(mktemp -d)"
-cat > "$implicit_watch_tmp/index-search-project.txt" <<'CFG'
+write_project_config "$implicit_watch_tmp" <<'CFG'
 [IndexSearch.files.include]
 *.txt
 CFG
@@ -555,7 +571,7 @@ grep -q 'cleaned 0 index directories' <<<"$registry_clean"
 [[ -f "$registry_home/.indexsearch/projects/fake.project" ]]
 
 for all_watch_tmp in "$all_watch_a" "$all_watch_b"; do
-  cat > "$all_watch_tmp/index-search-project.txt" <<'CFG'
+  write_project_config "$all_watch_tmp" <<'CFG'
 [IndexSearch.files.include]
 *.txt
 CFG
@@ -596,7 +612,7 @@ fi
 [[ -x "$install_grep" || -L "$install_grep" ]]
 [[ -x "$install_daemon" || -L "$install_daemon" ]]
 [[ -x "$install_tool" || -L "$install_tool" ]]
-cat > "$install_project/index-search-project.txt" <<'CFG'
+write_project_config "$install_project" <<'CFG'
 [IndexSearch.files.include]
 *.txt
 CFG

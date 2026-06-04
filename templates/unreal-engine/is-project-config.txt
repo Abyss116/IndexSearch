@@ -16,13 +16,10 @@
 .idea/
 .vscode/
 .xcode/
-DerivedDataCache/
+**/DerivedDataCache/
 ZenData/
-Intermediate/
-Binaries/
-Plugins/**/Binaries/
-Plugins/**/Intermediate/
-Plugins/**/DerivedDataCache/
+**/Intermediate/
+**/Binaries/
 Build/Receipts/
 Build/Windows/FileOpenOrder/
 Build/BatchFiles/Mac/BuildRules/

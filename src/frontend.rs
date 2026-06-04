@@ -15,7 +15,6 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 const INDEX_DIR: &str = ".indexsearch";
 const INDEX_FILE: &str = "index.bin";
 const PROJECT_CONFIG_FILE: &str = "is-project-config.txt";
-const LEGACY_PROJECT_FILE: &str = "index-search-project.txt";
 const SEARCH_DAEMON_FILE: &str = "search-daemon.txt";
 const MAINTENANCE_FILE: &str = "maintenance.txt";
 const PROJECTS_DIR: &str = "projects";
@@ -138,9 +137,10 @@ enum GrepTranslation {
     FallbackToGrep,
 }
 
+#[derive(Clone)]
 enum ExternalFallback {
     Ripgrep,
-    Grep,
+    Grep { original_args: Vec<String> },
 }
 
 fn run_grep_frontend(args: &[String]) -> Result<i32, String> {
@@ -158,7 +158,12 @@ fn run_grep_frontend(args: &[String]) -> Result<i32, String> {
         return Ok(0);
     }
     match translate_grep_args(args)? {
-        GrepTranslation::Search(search_args) => run_with_fallback(&search_args, ExternalFallback::Grep),
+        GrepTranslation::Search(search_args) => run_with_fallback(
+            &search_args,
+            ExternalFallback::Grep {
+                original_args: args.to_vec(),
+            },
+        ),
         GrepTranslation::FallbackToGrep => run_system_grep(args),
     }
 }
@@ -624,20 +629,19 @@ fn run_with_fallback(args: &[String], fallback: ExternalFallback) -> Result<i32,
         return run_backend_search(&search_args);
     };
     profile.record("frontend_resolve_search_paths", path_timer);
-    if agent_auto_project_mode()
-        && search_paths
-            .iter()
-            .any(|path| find_project_root(&path.abs).is_none())
-    {
-        let create_timer = Instant::now();
-        let root = agent_auto_project_root(&search_paths)?;
-        let _ = ensure_project_service(&root, &mut profile)?;
-        profile.record("frontend_agent_auto_project", create_timer);
+    let missing_project = search_paths
+        .iter()
+        .any(|path| find_project_root(&path.abs).is_none());
+    if missing_project {
+        if search_paths.len() == 1 && search_paths[0].arg_index.is_none() {
+            return handle_missing_project(&search_args, &fallback);
+        }
+        return run_missing_project_fallback(&search_args, &fallback);
     }
     let root_timer = Instant::now();
     let runs = match search_runs(&search_paths) {
         Ok(groups) => groups,
-        Err(MissingProject::Single) => return handle_missing_project(args),
+        Err(MissingProject::Single) => return handle_missing_project(&search_args, &fallback),
         Err(MissingProject::Path(path)) => {
             return Err(format!(
                 "no IndexSearch project found above {}; run `istool index` in that project first",
@@ -661,7 +665,7 @@ fn run_with_fallback(args: &[String], fallback: ExternalFallback) -> Result<i32,
                     let group_args = search_args_for_group(&search_args, &run.path_indexes);
                     run_system_ripgrep(&ripgrep_stdin_args(&group_args))?
                 }
-                ExternalFallback::Grep => {
+                ExternalFallback::Grep { .. } => {
                     let ripgrep_group_args =
                         search_args_for_group(&search_args, &run.path_indexes);
                     run_system_ripgrep(&ripgrep_stdin_args(&ripgrep_group_args))?
@@ -851,11 +855,8 @@ fn stdin_file_type_is_searchable() -> bool {
 
 fn load_frontend_project_config(root: &Path) -> Result<FrontendProjectConfig, String> {
     let config = project_config_path(root);
-    let legacy = legacy_project_config_path(root);
     let text = if config.is_file() {
         fs::read_to_string(config).map_err(|err| err.to_string())?
-    } else if legacy.is_file() {
-        fs::read_to_string(legacy).map_err(|err| err.to_string())?
     } else {
         return Ok(FrontendProjectConfig::default());
     };
@@ -1380,18 +1381,17 @@ fn find_project_root(start: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn handle_missing_project(args: &[String]) -> Result<i32, String> {
+fn handle_missing_project(args: &[String], fallback: &ExternalFallback) -> Result<i32, String> {
     let cwd = env::current_dir().map_err(|err| err.to_string())?;
-    if agent_auto_project_mode() {
-        eprintln!(
-            "is: no IndexSearch project found above {}; auto-create failed",
-            display_path(&cwd)
-        );
-        return Ok(2);
+    if missing_project_should_skip_prompt()
+        || !(io::stdin().is_terminal() && io::stderr().is_terminal())
+    {
+        return run_missing_project_fallback(args, fallback);
     }
     if io::stdin().is_terminal() && io::stderr().is_terminal() {
         eprint!(
-            "is: no IndexSearch project found above {}. Create one here? [Y/n] ",
+            "{}: no IndexSearch project found above {}. Create one here? [Y/n] ",
+            frontend_command_name(),
             display_path(&cwd)
         );
         let _ = io::stderr().flush();
@@ -1402,45 +1402,33 @@ fn handle_missing_project(args: &[String]) -> Result<i32, String> {
                     let mut profile = FrontendProfile::default();
                     let (root, _) = ensure_project_service(&cwd, &mut profile)?;
                     if index_path(&root).is_file() {
-                        return run(args);
+                        return run_with_fallback(args, fallback.clone());
                     }
                     return Ok(2);
                 }
-                "n" | "N" | "no" | "NO" => return Ok(1),
+                "n" | "N" | "no" | "NO" => return run_missing_project_fallback(args, fallback),
                 _ => {}
             }
         }
     }
-    eprintln!(
-        "is: no IndexSearch project found; run `istool index .` at the project root"
-    );
-    Ok(2)
+    run_missing_project_fallback(args, fallback)
 }
 
-fn agent_auto_project_mode() -> bool {
+fn run_missing_project_fallback(
+    args: &[String],
+    fallback: &ExternalFallback,
+) -> Result<i32, String> {
+    match fallback {
+        ExternalFallback::Ripgrep => run_system_ripgrep(&ripgrep_stdin_args(args)),
+        ExternalFallback::Grep { original_args } => run_system_grep(original_args),
+    }
+}
+
+fn missing_project_should_skip_prompt() -> bool {
     if env::var_os("INDEXSEARCH_NO_AGENT_AUTO_PROJECT").is_some() {
         return false;
     }
     env::var_os("INDEXSEARCH_AGENT_AUTO_PROJECT").is_some()
-        || !(io::stdin().is_terminal() && io::stderr().is_terminal())
-}
-
-fn agent_auto_project_root(paths: &[SearchPathArg]) -> Result<PathBuf, String> {
-    let cwd = env::current_dir().map_err(|err| err.to_string())?;
-    if paths.len() == 1 {
-        let path = &paths[0];
-        if path.arg_index.is_some() && !path.abs.starts_with(&cwd) {
-            if path.abs.is_file() {
-                return Ok(path
-                    .abs
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| path.abs.clone()));
-            }
-            return Ok(path.abs.clone());
-        }
-    }
-    Ok(cwd)
 }
 
 fn ensure_project_service(
@@ -1590,16 +1578,19 @@ fn hide_project_service_startup_parent(show_progress: bool) -> bool {
     !show_progress
 }
 
+#[cfg(windows)]
 fn hidden_background_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut command = Command::new(program);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+    use std::os::windows::process::CommandExt;
+    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
+    command.creation_flags(CREATE_NO_WINDOW);
     command
+}
+
+#[cfg(not(windows))]
+fn hidden_background_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    Command::new(program)
 }
 
 fn read_valid_record(root: &Path) -> Option<DaemonRecord> {
@@ -1919,12 +1910,8 @@ fn project_config_path(root: &Path) -> PathBuf {
     root.join(INDEX_DIR).join(PROJECT_CONFIG_FILE)
 }
 
-fn legacy_project_config_path(root: &Path) -> PathBuf {
-    root.join(LEGACY_PROJECT_FILE)
-}
-
 fn project_config_exists(root: &Path) -> bool {
-    project_config_path(root).is_file() || legacy_project_config_path(root).is_file()
+    project_config_path(root).is_file()
 }
 
 fn project_marker_exists(root: &Path) -> bool {
@@ -2254,6 +2241,30 @@ mod tests {
             false
         ));
         assert!(!rel_requires_external_fallback(&cfg, "Game", false));
+    }
+
+    #[test]
+    fn recursive_ignored_directory_target_falls_back_to_external_tool() {
+        let cfg = FrontendProjectConfig {
+            paths_ignore: FrontendMatcher::new(&[
+                "**/Binaries/".to_string(),
+                "**/DerivedDataCache/".to_string(),
+                "**/Intermediate/".to_string(),
+            ])
+            .unwrap(),
+            ..Default::default()
+        };
+        for rel in [
+            "Binaries",
+            "Project/Binaries",
+            "Plugins/Foo/Binaries",
+            "DerivedDataCache",
+            "Project/DerivedDataCache",
+            "Plugins/Foo/Intermediate",
+        ] {
+            assert!(rel_requires_external_fallback(&cfg, rel, false), "{rel}");
+        }
+        assert!(!rel_requires_external_fallback(&cfg, "Source", false));
     }
 
     #[test]

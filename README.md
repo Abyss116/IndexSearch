@@ -73,12 +73,14 @@ daemon. That daemon keeps the index mmaped, watches filesystem changes, serves
 future searches, and can compact deltas while idle.
 
 If no IndexSearch project exists above the current directory, interactive `is`
-asks whether to create one in the current directory. `istool index .` always
-rebuilds the base index explicitly.
+asks whether to create one in the current directory. Choosing `n` runs the
+current search through the external compatible searcher instead. `istool index .`
+always rebuilds the base index explicitly.
 
-When `is` is used non-interactively by coding agents, missing project config is
-created automatically and the first search builds the index before returning
-results.
+When `is` or `isgrep` is used non-interactively by coding agents outside an
+IndexSearch project, it does not create project config. The one-off search is
+routed internally through `rg` or `grep` so the command still returns results
+without leaving `.indexsearch/` behind.
 
 Manage project services:
 
@@ -112,6 +114,7 @@ Project rules live in `.indexsearch/is-project-config.txt`.
 [IndexSearch.paths.ignore]
 .git/
 out/
+**/Intermediate/
 
 [IndexSearch.paths.live]
 run-logs/
@@ -131,6 +134,10 @@ paths are routed internally through `rg`, for example `is Error Saved/Logs`,
 while ordinary project searches stay fast and stable. The bundled Unreal Engine
 template uses this for logs and shader debug output, while excluding `Saved/`
 from persistent indexing.
+
+Use `**/Name/` for a directory name that should match at any depth, such as
+`**/DerivedDataCache/`. Directory patterns with a trailing slash also cover the
+directory's full subtree.
 
 When a command names multiple explicit paths, IndexSearch splits the work: paths
 covered by `IndexSearch.paths.ignore`, `IndexSearch.paths.live`, or file

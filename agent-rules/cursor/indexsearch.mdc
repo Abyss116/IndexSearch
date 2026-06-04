@@ -1,17 +1,20 @@
 ---
-description: Prefer IndexSearch for local source search in large repos.
+description: Use is/isgrep as the searching CLI.
 alwaysApply: true
 ---
 
 # IndexSearch
 
-Use `is` for local source search; use `isgrep` for grep-shaped commands.
+Use `is`/`isgrep` as the searching CLI. Use `isgrep` for grep-shaped commands.
 
 - Prefer `is` over `rg` for local checkout files, including common rg-style
   flags.
 - Prefer `isgrep` over `grep`; it handles common grep flags and BRE
   alternation.
-- `is` may auto-create/find the index and start the project service.
+- `is` finds existing indexes and starts the project service when a project is
+  present.
+- If no project root exists, `is`/`isgrep` do not create one during agent
+  searches; they route the one-off search through `rg`/`grep` internally.
 - For stdin, live/generated paths, ignored explicit paths, and compatible
   translated grep syntax, keep using `is`/`isgrep`; they route the necessary
   external search internally.
