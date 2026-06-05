@@ -21,6 +21,8 @@ Rules:
 - Prefer `is` over `rg`; do not call remote/deferred search tools for files in
   the local checkout.
 - Prefer `isgrep` over `grep`; it handles common grep flags and BRE alternation.
+- `isgrep` defaults to grep Basic Regex: use `A\|B` for BRE alternation, or
+  add `-E` when converting rg/RTK-style patterns that use bare `A|B`.
 - `is` finds existing indexes and starts the project service when a project is
   present.
 - If no project root exists, `is`/`isgrep` do not create one during agent

@@ -10,14 +10,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
-
 const INDEX_DIR: &str = ".indexsearch";
 const INDEX_FILE: &str = "index.bin";
 const PROJECT_CONFIG_FILE: &str = "is-project-config.txt";
 const SEARCH_DAEMON_FILE: &str = "search-daemon.txt";
 const MAINTENANCE_FILE: &str = "maintenance.txt";
 const PROJECTS_DIR: &str = "projects";
+const GREP_FRONTEND_ARG: &str = "--__indexsearch-grep-frontend";
 const REQUEST_MAGIC: &[u8; 8] = b"ISDREQ1\n";
 const RESPONSE_MAGIC: &[u8; 8] = b"ISDRES1\n";
 const STDOUT_FRAME: u8 = 1;
@@ -125,24 +124,6 @@ fn main() {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GrepRegexMode {
-    Basic,
-    Extended,
-    Fixed,
-}
-
-enum GrepTranslation {
-    Search(Vec<String>),
-    FallbackToGrep,
-}
-
-#[derive(Clone)]
-enum ExternalFallback {
-    Ripgrep,
-    Grep { original_args: Vec<String> },
-}
-
 fn run_grep_frontend(args: &[String]) -> Result<i32, String> {
     let first = first_search_flag(args);
     if args.is_empty() {
@@ -157,15 +138,45 @@ fn run_grep_frontend(args: &[String]) -> Result<i32, String> {
         println!("{} {}", frontend_command_name(), display_version());
         return Ok(0);
     }
-    match translate_grep_args(args)? {
-        GrepTranslation::Search(search_args) => run_with_fallback(
-            &search_args,
-            ExternalFallback::Grep {
-                original_args: args.to_vec(),
-            },
-        ),
-        GrepTranslation::FallbackToGrep => run_system_grep(args),
+    if stdin_has_searchable_stream() {
+        return run_system_grep(args);
     }
+
+    let total_timer = Instant::now();
+    let mut profile = FrontendProfile::new(args);
+    let path_timer = Instant::now();
+    let search_paths = grep_search_path_args(args)?;
+    profile.record("frontend_resolve_search_paths", path_timer);
+    let missing_project = search_paths
+        .iter()
+        .any(|path| find_project_root(&path.abs).is_none());
+    if missing_project {
+        if search_paths.len() == 1 && search_paths[0].arg_index.is_none() {
+            return handle_missing_grep_project(args);
+        }
+        return run_system_grep(args);
+    }
+    let root_timer = Instant::now();
+    let runs = match search_runs(&search_paths) {
+        Ok(groups) => groups,
+        Err(MissingProject::Single) => return handle_missing_grep_project(args),
+        Err(MissingProject::Path(_)) => return run_system_grep(args),
+    };
+    profile.record("frontend_find_project_roots", root_timer);
+    if runs.len() > 1 {
+        profile.record_value("frontend_search_run_count", runs.len() as f64);
+    }
+    let mut final_code = 1;
+    for run in runs {
+        let SearchRunKind::Indexed(root) = run.kind;
+        let group_args = grep_args_for_group(args, &run.path_indexes);
+        let daemon_args = grep_daemon_args(&group_args);
+        let code = run_search_group_with_daemon_args(&daemon_args, root, &mut profile)?;
+        final_code = combine_exit_codes(final_code, code);
+    }
+    profile.record("frontend_total", total_timer);
+    profile.print();
+    Ok(final_code)
 }
 
 fn print_isgrep_help() {
@@ -175,6 +186,7 @@ fn print_isgrep_help() {
     println!("Description");
     println!("  grep-compatible frontend for indexed IndexSearch searches");
     println!("  Defaults to grep Basic Regex syntax, so `A\\|B` works as alternation.");
+    println!("  Use `-E` for rg/RTK-style bare `A|B` alternation.");
     println!("  Unsupported grep-only semantics are handled through system grep internally.");
     println!();
     println!("Common Options");
@@ -190,385 +202,68 @@ fn print_isgrep_help() {
     println!("  -r, -R                          accepted for recursive grep commands");
 }
 
-fn translate_grep_args(args: &[String]) -> Result<GrepTranslation, String> {
-    let mut out = Vec::new();
-    let mut patterns = Vec::new();
-    let mut paths = Vec::new();
-    let mut mode = GrepRegexMode::Basic;
-    let mut positional_only = false;
-    let mut filename_override = false;
-    let mut i = 0usize;
-    while i < args.len() {
-        let arg = &args[i];
-        if positional_only {
-            consume_grep_positional(arg, &mut patterns, &mut paths);
-            i += 1;
-            continue;
-        }
-        if arg == "--" {
-            positional_only = true;
-            i += 1;
-            continue;
-        }
-        if let Some(long) = arg.strip_prefix("--") {
-            if long.is_empty() {
-                positional_only = true;
-                i += 1;
-                continue;
-            }
-            match translate_grep_long_option(
-                args,
-                &mut i,
-                long,
-                &mut out,
-                &mut patterns,
-                &mut mode,
-                &mut filename_override,
-            )? {
-                GrepOptionOutcome::Translated => {
-                    i += 1;
-                    continue;
-                }
-                GrepOptionOutcome::Fallback => return Ok(GrepTranslation::FallbackToGrep),
-            }
-        }
-        if arg.starts_with('-') && arg != "-" {
-            match translate_grep_short_options(
-                args,
-                &mut i,
-                arg,
-                &mut out,
-                &mut patterns,
-                &mut mode,
-                &mut filename_override,
-            )? {
-                GrepOptionOutcome::Translated => {
-                    i += 1;
-                    continue;
-                }
-                GrepOptionOutcome::Fallback => return Ok(GrepTranslation::FallbackToGrep),
-            }
-        }
-        consume_grep_positional(arg, &mut patterns, &mut paths);
-        i += 1;
-    }
-
-    if patterns.is_empty() {
-        return Err("a grep pattern is required".to_string());
-    }
-    if !filename_override && paths.len() == 1 && PathBuf::from(&paths[0]).is_file() {
-        out.push("-I".to_string());
-    }
-    let Some(pattern) = build_grep_search_pattern(&patterns, mode) else {
-        return Ok(GrepTranslation::FallbackToGrep);
-    };
-    if mode == GrepRegexMode::Fixed && patterns.len() == 1 && !patterns[0].is_empty() {
-        out.push("-F".to_string());
-    }
+fn grep_daemon_args(args: &[String]) -> Vec<String> {
+    let grep_args = grep_frontend_daemon_args(args);
+    let mut out = Vec::with_capacity(args.len() + 5);
+    out.push(GREP_FRONTEND_ARG.to_string());
+    out.extend(search_output_default_args(&grep_args));
     out.push("--".to_string());
-    out.push(pattern);
-    out.extend(paths);
-    Ok(GrepTranslation::Search(out))
-}
-
-enum GrepOptionOutcome {
-    Translated,
-    Fallback,
-}
-
-fn consume_grep_positional(arg: &str, patterns: &mut Vec<String>, paths: &mut Vec<String>) {
-    if patterns.is_empty() {
-        patterns.push(arg.to_string());
-    } else {
-        paths.push(arg.to_string());
-    }
-}
-
-fn translate_grep_long_option(
-    args: &[String],
-    i: &mut usize,
-    long: &str,
-    out: &mut Vec<String>,
-    patterns: &mut Vec<String>,
-    mode: &mut GrepRegexMode,
-    filename_override: &mut bool,
-) -> Result<GrepOptionOutcome, String> {
-    let (name, inline_value) = long
-        .split_once('=')
-        .map(|(name, value)| (name, Some(value.to_string())))
-        .unwrap_or((long, None));
-    match name {
-        "help" => {
-            print_isgrep_help();
-            std::process::exit(0);
-        }
-        "version" => {
-            println!("{} {}", frontend_command_name(), display_version());
-            std::process::exit(0);
-        }
-        "basic-regexp" => *mode = GrepRegexMode::Basic,
-        "extended-regexp" => *mode = GrepRegexMode::Extended,
-        "fixed-strings" => *mode = GrepRegexMode::Fixed,
-        "perl-regexp" => return Ok(GrepOptionOutcome::Fallback),
-        "regexp" => patterns.push(grep_option_value(args, i, "--regexp", inline_value)?),
-        "file" => {
-            let file = grep_option_value(args, i, "--file", inline_value)?;
-            let Ok(text) = fs::read_to_string(file) else {
-                return Ok(GrepOptionOutcome::Fallback);
-            };
-            patterns.extend(text.lines().map(str::to_string));
-        }
-        "ignore-case" => out.push("-i".to_string()),
-        "invert-match" => out.push("-v".to_string()),
-        "word-regexp" => out.push("-w".to_string()),
-        "line-regexp" => out.push("-x".to_string()),
-        "line-number" => out.push("-n".to_string()),
-        "with-filename" => {
-            *filename_override = true;
-            out.push("-H".to_string());
-        }
-        "no-filename" => {
-            *filename_override = true;
-            out.push("-I".to_string());
-        }
-        "files-with-matches" => out.push("-l".to_string()),
-        "files-without-match" => out.push("--files-without-match".to_string()),
-        "count" => out.push("-c".to_string()),
-        "only-matching" => out.push("-o".to_string()),
-        "quiet" | "silent" => out.push("-q".to_string()),
-        "no-messages" => out.push("--no-messages".to_string()),
-        "after-context" => push_grep_value(out, "-A", grep_option_value(args, i, "--after-context", inline_value)?),
-        "before-context" => push_grep_value(out, "-B", grep_option_value(args, i, "--before-context", inline_value)?),
-        "context" => push_grep_value(out, "-C", grep_option_value(args, i, "--context", inline_value)?),
-        "max-count" => push_grep_value(out, "-m", grep_option_value(args, i, "--max-count", inline_value)?),
-        "include" => push_grep_value(out, "-g", grep_option_value(args, i, "--include", inline_value)?),
-        "exclude" => {
-            let value = grep_option_value(args, i, "--exclude", inline_value)?;
-            push_grep_value(out, "-g", format!("!{value}"));
-        }
-        "exclude-dir" => {
-            let value = grep_option_value(args, i, "--exclude-dir", inline_value)?;
-            push_grep_value(out, "-g", format!("!{value}/**"));
-            push_grep_value(out, "-g", format!("!**/{value}/**"));
-        }
-        "recursive" => {}
-        "dereference-recursive" => out.push("--follow".to_string()),
-        "color" | "colour" => {
-            let value = inline_value.unwrap_or_else(|| "auto".to_string());
-            out.push(format!("--color={value}"));
-        }
-        "binary-files" => {
-            let _ = inline_value.unwrap_or_else(|| "binary".to_string());
-        }
-        "text" | "binary" | "devices" | "mmap" | "line-buffered" | "initial-tab" => {}
-        "directories" => {
-            let value = grep_option_value(args, i, "--directories", inline_value)?;
-            if value != "recurse" {
-                return Ok(GrepOptionOutcome::Fallback);
-            }
-        }
-        "null" | "null-data" | "byte-offset" | "label" => return Ok(GrepOptionOutcome::Fallback),
-        _ => return Ok(GrepOptionOutcome::Fallback),
-    }
-    Ok(GrepOptionOutcome::Translated)
-}
-
-fn translate_grep_short_options(
-    args: &[String],
-    i: &mut usize,
-    arg: &str,
-    out: &mut Vec<String>,
-    patterns: &mut Vec<String>,
-    mode: &mut GrepRegexMode,
-    filename_override: &mut bool,
-) -> Result<GrepOptionOutcome, String> {
-    let bytes = arg.as_bytes();
-    let mut pos = 1usize;
-    while pos < bytes.len() {
-        let flag = bytes[pos] as char;
-        match flag {
-            'G' => *mode = GrepRegexMode::Basic,
-            'E' => *mode = GrepRegexMode::Extended,
-            'F' => *mode = GrepRegexMode::Fixed,
-            'P' | 'Z' | 'z' | 'b' => return Ok(GrepOptionOutcome::Fallback),
-            'e' => {
-                patterns.push(grep_short_value(args, i, arg, pos, "-e")?);
-                return Ok(GrepOptionOutcome::Translated);
-            }
-            'f' => {
-                let file = grep_short_value(args, i, arg, pos, "-f")?;
-                let Ok(text) = fs::read_to_string(file) else {
-                    return Ok(GrepOptionOutcome::Fallback);
-                };
-                patterns.extend(text.lines().map(str::to_string));
-                return Ok(GrepOptionOutcome::Translated);
-            }
-            'A' => {
-                push_grep_value(out, "-A", grep_short_value(args, i, arg, pos, "-A")?);
-                return Ok(GrepOptionOutcome::Translated);
-            }
-            'B' => {
-                push_grep_value(out, "-B", grep_short_value(args, i, arg, pos, "-B")?);
-                return Ok(GrepOptionOutcome::Translated);
-            }
-            'C' => {
-                push_grep_value(out, "-C", grep_short_value(args, i, arg, pos, "-C")?);
-                return Ok(GrepOptionOutcome::Translated);
-            }
-            'm' => {
-                push_grep_value(out, "-m", grep_short_value(args, i, arg, pos, "-m")?);
-                return Ok(GrepOptionOutcome::Translated);
-            }
-            'd' => {
-                let value = grep_short_value(args, i, arg, pos, "-d")?;
-                if value != "recurse" {
-                    return Ok(GrepOptionOutcome::Fallback);
-                }
-                return Ok(GrepOptionOutcome::Translated);
-            }
-            'D' => return Ok(GrepOptionOutcome::Fallback),
-            'i' | 'y' => out.push("-i".to_string()),
-            'v' => out.push("-v".to_string()),
-            'w' => out.push("-w".to_string()),
-            'x' => out.push("-x".to_string()),
-            'n' => out.push("-n".to_string()),
-            'H' => {
-                *filename_override = true;
-                out.push("-H".to_string());
-            }
-            'h' => {
-                *filename_override = true;
-                out.push("-I".to_string());
-            }
-            'l' => out.push("-l".to_string()),
-            'L' => out.push("--files-without-match".to_string()),
-            'c' => out.push("-c".to_string()),
-            'o' => out.push("-o".to_string()),
-            'q' => out.push("-q".to_string()),
-            's' => out.push("--no-messages".to_string()),
-            'r' => {}
-            'R' => out.push("--follow".to_string()),
-            'a' | 'I' | 'T' | 'U' | 'u' => {}
-            'V' => {
-                println!("{} {}", frontend_command_name(), display_version());
-                std::process::exit(0);
-            }
-            _ => return Ok(GrepOptionOutcome::Fallback),
-        }
-        pos += 1;
-    }
-    Ok(GrepOptionOutcome::Translated)
-}
-
-fn grep_option_value(
-    args: &[String],
-    i: &mut usize,
-    name: &str,
-    inline_value: Option<String>,
-) -> Result<String, String> {
-    if let Some(value) = inline_value {
-        return Ok(value);
-    }
-    *i += 1;
-    args.get(*i)
-        .cloned()
-        .ok_or_else(|| format!("option {name} requires an argument"))
-}
-
-fn grep_short_value(args: &[String], i: &mut usize, arg: &str, pos: usize, name: &str) -> Result<String, String> {
-    if pos + 1 < arg.len() {
-        Ok(arg[pos + 1..].to_string())
-    } else {
-        *i += 1;
-        args.get(*i)
-            .cloned()
-            .ok_or_else(|| format!("option {name} requires an argument"))
-    }
-}
-
-fn push_grep_value(out: &mut Vec<String>, flag: &str, value: String) {
-    out.push(flag.to_string());
-    out.push(value);
-}
-
-fn build_grep_search_pattern(patterns: &[String], mode: GrepRegexMode) -> Option<String> {
-    let mut converted = Vec::with_capacity(patterns.len());
-    for pattern in patterns {
-        if grep_pattern_has_backreference(pattern) {
-            return None;
-        }
-        converted.push(match mode {
-            GrepRegexMode::Basic => translate_basic_grep_regex(pattern),
-            GrepRegexMode::Extended => pattern.clone(),
-            GrepRegexMode::Fixed => regex::escape(pattern),
-        });
-    }
-    if mode == GrepRegexMode::Fixed && patterns.len() == 1 && !patterns[0].is_empty() {
-        return patterns.first().cloned();
-    }
-    Some(join_regex_alternates(&converted))
-}
-
-fn join_regex_alternates(patterns: &[String]) -> String {
-    if patterns.len() == 1 {
-        if patterns[0].is_empty() {
-            "(?:)".to_string()
-        } else {
-            patterns[0].clone()
-        }
-    } else {
-        patterns
-            .iter()
-            .map(|pattern| {
-                if pattern.is_empty() {
-                    "(?:)".to_string()
-                } else {
-                    format!("(?:{pattern})")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("|")
-    }
-}
-
-fn translate_basic_grep_regex(pattern: &str) -> String {
-    let mut out = String::with_capacity(pattern.len());
-    let mut chars = pattern.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            if let Some(next) = chars.next() {
-                if matches!(next, '|' | '(' | ')' | '+' | '?' | '{' | '}') {
-                    out.push(next);
-                } else {
-                    out.push('\\');
-                    out.push(next);
-                }
-            } else {
-                out.push('\\');
-            }
-        } else if matches!(ch, '|' | '(' | ')' | '+' | '?' | '{' | '}') {
-            out.push('\\');
-            out.push(ch);
-        } else {
-            out.push(ch);
-        }
-    }
+    out.extend(grep_args);
     out
 }
 
-fn grep_pattern_has_backreference(pattern: &str) -> bool {
-    let mut escaped = false;
-    for ch in pattern.chars() {
-        if escaped {
-            if matches!(ch, '1'..='9') {
-                return true;
+fn grep_frontend_daemon_args(args: &[String]) -> Vec<String> {
+    let resolved_color = if stdout_supports_color() {
+        "always"
+    } else {
+        "never"
+    };
+    args.iter()
+        .map(|arg| {
+            for flag in ["--color=", "--colour="] {
+                if let Some(value) = arg.strip_prefix(flag) {
+                    return if value == "auto" {
+                        format!("{flag}{resolved_color}")
+                    } else {
+                        arg.clone()
+                    };
+                }
             }
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
+            arg.clone()
+        })
+        .collect()
+}
+
+fn handle_missing_grep_project(args: &[String]) -> Result<i32, String> {
+    let cwd = env::current_dir().map_err(|err| err.to_string())?;
+    if missing_project_should_skip_prompt()
+        || !(io::stdin().is_terminal() && io::stderr().is_terminal())
+    {
+        return run_system_grep(args);
+    }
+    eprint!(
+        "{}: no IndexSearch project found above {}. Create one here? [Y/n] ",
+        frontend_command_name(),
+        display_path(&cwd)
+    );
+    let _ = io::stderr().flush();
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_ok() {
+        match answer.trim() {
+            "" | "y" | "Y" | "yes" | "YES" => {
+                let mut profile = FrontendProfile::default();
+                let (root, _) = ensure_project_service(&cwd, &mut profile)?;
+                if index_path(&root).is_file() {
+                    let daemon_args = grep_daemon_args(args);
+                    return run_search_group_with_daemon_args(&daemon_args, root, &mut profile);
+                }
+                return Ok(2);
+            }
+            "n" | "N" | "no" | "NO" => return run_system_grep(args),
+            _ => {}
         }
     }
-    false
+    run_system_grep(args)
 }
 
 fn run_system_grep(args: &[String]) -> Result<i32, String> {
@@ -598,10 +293,10 @@ fn system_grep_command() -> Command {
 }
 
 fn run(args: &[String]) -> Result<i32, String> {
-    run_with_fallback(args, ExternalFallback::Ripgrep)
+    run_with_fallback(args)
 }
 
-fn run_with_fallback(args: &[String], fallback: ExternalFallback) -> Result<i32, String> {
+fn run_with_fallback(args: &[String]) -> Result<i32, String> {
     let first = first_search_flag(args);
     if args.is_empty() || first.is_some_and(|arg| matches!(arg, "-h" | "--help")) {
         return run_backend_search_help();
@@ -634,14 +329,14 @@ fn run_with_fallback(args: &[String], fallback: ExternalFallback) -> Result<i32,
         .any(|path| find_project_root(&path.abs).is_none());
     if missing_project {
         if search_paths.len() == 1 && search_paths[0].arg_index.is_none() {
-            return handle_missing_project(&search_args, &fallback);
+            return handle_missing_project(&search_args);
         }
-        return run_missing_project_fallback(&search_args, &fallback);
+        return run_system_ripgrep(&ripgrep_stdin_args(&search_args));
     }
     let root_timer = Instant::now();
     let runs = match search_runs(&search_paths) {
         Ok(groups) => groups,
-        Err(MissingProject::Single) => return handle_missing_project(&search_args, &fallback),
+        Err(MissingProject::Single) => return handle_missing_project(&search_args),
         Err(MissingProject::Path(path)) => {
             return Err(format!(
                 "no IndexSearch project found above {}; run `istool index` in that project first",
@@ -655,23 +350,9 @@ fn run_with_fallback(args: &[String], fallback: ExternalFallback) -> Result<i32,
     }
     let mut final_code = 1;
     for run in runs {
-        let code = match run.kind {
-            SearchRunKind::Indexed(root) => {
-                let group_args = search_args_for_group(&search_args, &run.path_indexes);
-                run_indexed_search_group(&group_args, root, &mut profile)?
-            }
-            SearchRunKind::External => match &fallback {
-                ExternalFallback::Ripgrep => {
-                    let group_args = search_args_for_group(&search_args, &run.path_indexes);
-                    run_system_ripgrep(&ripgrep_stdin_args(&group_args))?
-                }
-                ExternalFallback::Grep { .. } => {
-                    let ripgrep_group_args =
-                        search_args_for_group(&search_args, &run.path_indexes);
-                    run_system_ripgrep(&ripgrep_stdin_args(&ripgrep_group_args))?
-                }
-            },
-        };
+        let SearchRunKind::Indexed(root) = run.kind;
+        let group_args = search_args_for_group(&search_args, &run.path_indexes);
+        let code = run_indexed_search_group(&group_args, root, &mut profile)?;
         final_code = combine_exit_codes(final_code, code);
     }
     profile.record("frontend_total", total_timer);
@@ -853,179 +534,22 @@ fn stdin_file_type_is_searchable() -> bool {
     !io::stdin().is_terminal()
 }
 
-fn load_frontend_project_config(root: &Path) -> Result<FrontendProjectConfig, String> {
-    let config = project_config_path(root);
-    let text = if config.is_file() {
-        fs::read_to_string(config).map_err(|err| err.to_string())?
-    } else {
-        return Ok(FrontendProjectConfig::default());
-    };
-    let sections = parse_config_sections(&text);
-    let paths_ignore =
-        FrontendMatcher::new(&clean_config_section(sections.get("IndexSearch.paths.ignore")))?;
-    let paths_live =
-        FrontendMatcher::new(&clean_config_section(sections.get("IndexSearch.paths.live")))?;
-    let files_ignore =
-        FrontendMatcher::new(&clean_config_section(sections.get("IndexSearch.files.ignore")))?;
-    let mut files_include = clean_config_section(sections.get("IndexSearch.files.include"));
-    if files_include.is_empty() {
-        files_include.push("*".to_string());
-    }
-    let files_include = FrontendMatcher::new(&files_include)?;
-    Ok(FrontendProjectConfig {
-        paths_ignore,
-        paths_live,
-        files_ignore,
-        files_include,
-    })
-}
-
-#[derive(Default)]
-struct FrontendProjectConfig {
-    paths_ignore: FrontendMatcher,
-    paths_live: FrontendMatcher,
-    files_ignore: FrontendMatcher,
-    files_include: FrontendMatcher,
-}
-
-#[derive(Default)]
-struct FrontendMatcher {
-    set: Option<GlobSet>,
-}
-
-impl FrontendMatcher {
-    fn new(patterns: &[String]) -> Result<Self, String> {
-        if patterns.is_empty() {
-            return Ok(Self::default());
-        }
-        let mut builder = GlobSetBuilder::new();
-        for pattern in patterns {
-            add_frontend_glob_pattern(&mut builder, pattern)?;
-        }
-        Ok(Self {
-            set: Some(builder.build().map_err(|err| err.to_string())?),
-        })
-    }
-
-    fn is_match(&self, rel: &str) -> bool {
-        self.set.as_ref().is_some_and(|set| set.is_match(rel))
-    }
-}
-
-fn explicit_path_requires_external_fallback(root: &Path, path: &Path) -> bool {
-    let Ok(cfg) = load_frontend_project_config(root) else {
-        return false;
-    };
-    let root = normalized_existing_path(root);
-    let path = normalized_existing_path(path);
-    let Ok(rel_path) = path.strip_prefix(&root) else {
-        return false;
-    };
-    let rel = normalize_rel_path_for_match(rel_path);
-    if rel.is_empty() {
-        return false;
-    }
-    rel_requires_external_fallback(&cfg, &rel, path.is_file())
-}
-
-fn rel_requires_external_fallback(cfg: &FrontendProjectConfig, rel: &str, is_file: bool) -> bool {
-    cfg.paths_ignore.is_match(rel)
-        || cfg.paths_live.is_match(rel)
-        || (is_file && (cfg.files_ignore.is_match(rel) || !cfg.files_include.is_match(rel)))
-}
-
-fn normalize_rel_path_for_match(path: &Path) -> String {
-    let mut rel = path.to_string_lossy().replace('\\', "/");
-    while let Some(stripped) = rel.strip_prefix("./") {
-        rel = stripped.to_string();
-    }
-    rel.trim_end_matches('/').to_string()
-}
-
-fn add_frontend_glob_pattern(builder: &mut GlobSetBuilder, raw: &str) -> Result<(), String> {
-    let mut pat = raw.replace('\\', "/");
-    let directory_only = pat.ends_with('/');
-    while pat.starts_with('/') {
-        pat.remove(0);
-    }
-    while pat.ends_with('/') {
-        pat.pop();
-    }
-    if pat.is_empty() {
-        return Ok(());
-    }
-    let has_slash = pat.contains('/');
-    let mut variants = Vec::new();
-    if has_slash {
-        variants.push(pat.clone());
-        if !pat.starts_with("**/") {
-            variants.push(format!("**/{pat}"));
-        }
-        if directory_only {
-            variants.push(format!("{pat}/**"));
-            if !pat.starts_with("**/") {
-                variants.push(format!("**/{pat}/**"));
-            }
-        }
-    } else {
-        variants.push(pat.clone());
-        variants.push(format!("**/{pat}"));
-        if directory_only {
-            variants.push(format!("{pat}/**"));
-            variants.push(format!("**/{pat}/**"));
-        }
-    }
-    for variant in variants {
-        builder.add(
-            GlobBuilder::new(&variant)
-                .build()
-                .map_err(|err| err.to_string())?,
-        );
-    }
-    Ok(())
-}
-
-fn parse_config_sections(text: &str) -> std::collections::BTreeMap<String, Vec<String>> {
-    let mut sections = std::collections::BTreeMap::<String, Vec<String>>::new();
-    let mut current = String::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
-            continue;
-        }
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            current = trimmed[1..trimmed.len() - 1].trim().to_string();
-            sections.entry(current.clone()).or_default();
-        } else if !current.is_empty() {
-            sections
-                .entry(current.clone())
-                .or_default()
-                .push(trimmed.to_string());
-        }
-    }
-    sections
-}
-
-fn clean_config_section(section: Option<&Vec<String>>) -> Vec<String> {
-    section
-        .into_iter()
-        .flat_map(|lines| lines.iter())
-        .filter_map(|line| {
-            let line = line.split('#').next().unwrap_or("").trim();
-            (!line.is_empty()).then(|| line.to_string())
-        })
-        .collect()
-}
-
 fn run_search_group(
     group_args: &[String],
-    mut root: PathBuf,
+    root: PathBuf,
     profile: &mut FrontendProfile,
 ) -> Result<i32, String> {
     let daemon_args = search_daemon_args(group_args);
-    let record;
+    run_search_group_with_daemon_args(&daemon_args, root, profile)
+}
+
+fn run_search_group_with_daemon_args(
+    daemon_args: &[String],
+    root: PathBuf,
+    profile: &mut FrontendProfile,
+) -> Result<i32, String> {
     let ensure_timer = Instant::now();
-    (root, record) = ensure_project_service(&root, profile)?;
+    let (root, record) = ensure_project_service(&root, profile)?;
     profile.record("frontend_ensure_project_service", ensure_timer);
     request_daemon(&record, &daemon_args, profile).map_err(|err| {
         stop_process(record.pid);
@@ -1043,16 +567,11 @@ fn search_daemon_args(args: &[String]) -> Vec<String> {
     } else {
         "never"
     };
-    let decorated = stdout_supports_decoration();
     let mut out = Vec::with_capacity(args.len() + 3);
-    let mut saw_color = false;
-    let mut saw_heading = false;
-    let mut saw_line_number = false;
     let mut i = 0usize;
     while i < args.len() {
         let arg = &args[i];
         if arg == "--color" {
-            saw_color = true;
             out.push(arg.clone());
             if let Some(value) = args.get(i + 1) {
                 out.push(if value == "auto" {
@@ -1064,7 +583,6 @@ fn search_daemon_args(args: &[String]) -> Vec<String> {
                 continue;
             }
         } else if let Some(value) = arg.strip_prefix("--color=") {
-            saw_color = true;
             out.push(if value == "auto" {
                 format!("--color={resolved_color}")
             } else {
@@ -1072,6 +590,29 @@ fn search_daemon_args(args: &[String]) -> Vec<String> {
             });
             i += 1;
             continue;
+        }
+        out.push(arg.clone());
+        i += 1;
+    }
+    let defaults = search_output_default_args(&out);
+    insert_before_double_dash(&mut out, defaults);
+    out
+}
+
+fn search_output_default_args(args: &[String]) -> Vec<String> {
+    let resolved_color = if stdout_supports_color() {
+        "always"
+    } else {
+        "never"
+    };
+    let decorated = stdout_supports_decoration();
+    let mut defaults = Vec::with_capacity(3);
+    let mut saw_color = false;
+    let mut saw_heading = false;
+    let mut saw_line_number = false;
+    for arg in args {
+        if arg == "--color" || arg.starts_with("--color=") {
+            saw_color = true;
         } else if arg == "--heading" || arg == "--no-heading" {
             saw_heading = true;
         } else if matches!(
@@ -1080,10 +621,7 @@ fn search_daemon_args(args: &[String]) -> Vec<String> {
         ) {
             saw_line_number = true;
         }
-        out.push(arg.clone());
-        i += 1;
     }
-    let mut defaults = Vec::with_capacity(3);
     if !saw_color {
         defaults.push(format!("--color={resolved_color}"));
     }
@@ -1107,8 +645,7 @@ fn search_daemon_args(args: &[String]) -> Vec<String> {
             .to_string(),
         );
     }
-    insert_before_double_dash(&mut out, defaults);
-    out
+    defaults
 }
 
 fn insert_before_double_dash(args: &mut Vec<String>, defaults: Vec<String>) {
@@ -1135,7 +672,6 @@ struct SearchRun {
 
 enum SearchRunKind {
     Indexed(PathBuf),
-    External,
 }
 
 enum MissingProject {
@@ -1220,6 +756,143 @@ fn search_path_args(args: &[String]) -> Option<Vec<SearchPathArg>> {
     )
 }
 
+fn grep_search_path_args(args: &[String]) -> Result<Vec<SearchPathArg>, String> {
+    let mut patterns = 0usize;
+    let mut paths = Vec::new();
+    let mut positional_only = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = &args[i];
+        if positional_only {
+            if patterns == 0 {
+                patterns += 1;
+            } else {
+                paths.push((i, arg.clone()));
+            }
+            i += 1;
+            continue;
+        }
+        if arg == "--" {
+            positional_only = true;
+            i += 1;
+            continue;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            if long.is_empty() {
+                positional_only = true;
+                i += 1;
+                continue;
+            }
+            let (name, inline_value) = long.split_once('=').unwrap_or((long, ""));
+            match name {
+                "regexp" | "file" => {
+                    patterns += 1;
+                    i += if inline_value.is_empty() { 2 } else { 1 };
+                    continue;
+                }
+                "after-context" | "before-context" | "context" | "max-count" | "include"
+                | "exclude" | "exclude-dir" | "directories" | "color" | "colour"
+                | "binary-files" | "devices" | "label" => {
+                    i += if inline_value.is_empty() { 2 } else { 1 };
+                    continue;
+                }
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+        if arg.starts_with('-') && arg != "-" {
+            if let Some(consumed) = consume_grep_short_path_options(args, i, arg, &mut patterns) {
+                i += consumed;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if patterns == 0 {
+            patterns += 1;
+        } else {
+            paths.push((i, arg.clone()));
+        }
+        i += 1;
+    }
+    if patterns == 0 {
+        return Err("a grep pattern is required".to_string());
+    }
+    Ok(search_paths_from_raw(paths))
+}
+
+fn consume_grep_short_path_options(
+    args: &[String],
+    index: usize,
+    arg: &str,
+    patterns: &mut usize,
+) -> Option<usize> {
+    let bytes = arg.as_bytes();
+    let mut pos = 1usize;
+    while pos < bytes.len() {
+        match bytes[pos] as char {
+            'e' | 'f' => {
+                *patterns += 1;
+                return Some(if pos + 1 < arg.len() { 1 } else { 2 });
+            }
+            'A' | 'B' | 'C' | 'm' | 'd' | 'D' => {
+                return Some(if pos + 1 < arg.len() { 1 } else { 2 });
+            }
+            _ => pos += 1,
+        }
+    }
+    if index >= args.len() { None } else { Some(1) }
+}
+
+fn grep_args_for_group(args: &[String], keep_path_indexes: &[Option<usize>]) -> Vec<String> {
+    let explicit_indexes: Vec<usize> = keep_path_indexes.iter().filter_map(|idx| *idx).collect();
+    if explicit_indexes.is_empty() {
+        return args.to_vec();
+    }
+    let all_path_indexes = grep_search_path_args(args)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|path| path.arg_index)
+        .collect::<Vec<_>>();
+    args.iter()
+        .enumerate()
+        .filter_map(|(idx, arg)| {
+            if all_path_indexes.contains(&idx) && !explicit_indexes.contains(&idx) {
+                None
+            } else {
+                Some(arg.clone())
+            }
+        })
+        .collect()
+}
+
+fn search_paths_from_raw(paths: Vec<(usize, String)>) -> Vec<SearchPathArg> {
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if paths.is_empty() {
+        return vec![SearchPathArg {
+            arg_index: None,
+            abs: cwd,
+        }];
+    }
+    paths
+        .into_iter()
+        .map(|(arg_index, raw)| {
+            let path = PathBuf::from(&raw);
+            let abs = if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            };
+            SearchPathArg {
+                arg_index: Some(arg_index),
+                abs,
+            }
+        })
+        .collect()
+}
+
 fn search_runs(paths: &[SearchPathArg]) -> Result<Vec<SearchRun>, MissingProject> {
     let mut runs = Vec::new();
     for path in paths {
@@ -1229,18 +902,7 @@ fn search_runs(paths: &[SearchPathArg]) -> Result<Vec<SearchRun>, MissingProject
             }
             return Err(MissingProject::Path(path.abs.clone()));
         };
-        let use_external = path
-            .arg_index
-            .is_some_and(|_| explicit_path_requires_external_fallback(&root, &path.abs));
-        push_search_run(
-            &mut runs,
-            if use_external {
-                SearchRunKind::External
-            } else {
-                SearchRunKind::Indexed(root)
-            },
-            path.arg_index,
-        );
+        push_search_run(&mut runs, SearchRunKind::Indexed(root), path.arg_index);
     }
     Ok(runs)
 }
@@ -1264,11 +926,9 @@ fn push_search_run(
 
 fn search_run_kind_matches(left: &SearchRunKind, right: &SearchRunKind) -> bool {
     match (left, right) {
-        (SearchRunKind::External, SearchRunKind::External) => true,
         (SearchRunKind::Indexed(left), SearchRunKind::Indexed(right)) => {
             normalized_existing_path(left) == normalized_existing_path(right)
         }
-        _ => false,
     }
 }
 
@@ -1381,12 +1041,12 @@ fn find_project_root(start: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn handle_missing_project(args: &[String], fallback: &ExternalFallback) -> Result<i32, String> {
+fn handle_missing_project(args: &[String]) -> Result<i32, String> {
     let cwd = env::current_dir().map_err(|err| err.to_string())?;
     if missing_project_should_skip_prompt()
         || !(io::stdin().is_terminal() && io::stderr().is_terminal())
     {
-        return run_missing_project_fallback(args, fallback);
+        return run_system_ripgrep(&ripgrep_stdin_args(args));
     }
     if io::stdin().is_terminal() && io::stderr().is_terminal() {
         eprint!(
@@ -1402,26 +1062,18 @@ fn handle_missing_project(args: &[String], fallback: &ExternalFallback) -> Resul
                     let mut profile = FrontendProfile::default();
                     let (root, _) = ensure_project_service(&cwd, &mut profile)?;
                     if index_path(&root).is_file() {
-                        return run_with_fallback(args, fallback.clone());
+                        return run_with_fallback(args);
                     }
                     return Ok(2);
                 }
-                "n" | "N" | "no" | "NO" => return run_missing_project_fallback(args, fallback),
+                "n" | "N" | "no" | "NO" => {
+                    return run_system_ripgrep(&ripgrep_stdin_args(args));
+                }
                 _ => {}
             }
         }
     }
-    run_missing_project_fallback(args, fallback)
-}
-
-fn run_missing_project_fallback(
-    args: &[String],
-    fallback: &ExternalFallback,
-) -> Result<i32, String> {
-    match fallback {
-        ExternalFallback::Ripgrep => run_system_ripgrep(&ripgrep_stdin_args(args)),
-        ExternalFallback::Grep { original_args } => run_system_grep(original_args),
-    }
+    run_system_ripgrep(&ripgrep_stdin_args(args))
 }
 
 fn missing_project_should_skip_prompt() -> bool {
@@ -2207,93 +1859,6 @@ mod tests {
     }
 
     #[test]
-    fn live_path_target_falls_back_to_ripgrep() {
-        let cfg = FrontendProjectConfig {
-            paths_live: FrontendMatcher::new(&["Game/Saved/Logs/".to_string()]).unwrap(),
-            ..Default::default()
-        };
-        assert!(rel_requires_external_fallback(
-            &cfg,
-            "Game/Saved/Logs",
-            false
-        ));
-    }
-
-    #[test]
-    fn project_root_does_not_fallback_just_because_it_contains_live_paths() {
-        let cfg = FrontendProjectConfig {
-            paths_live: FrontendMatcher::new(&["Game/Saved/Logs/".to_string()]).unwrap(),
-            ..Default::default()
-        };
-        assert!(!rel_requires_external_fallback(&cfg, "", false));
-    }
-
-    #[test]
-    fn ignored_directory_target_falls_back_to_external_tool() {
-        let cfg = FrontendProjectConfig {
-            paths_ignore: FrontendMatcher::new(&["Saved/".to_string()]).unwrap(),
-            ..Default::default()
-        };
-        assert!(rel_requires_external_fallback(&cfg, "Game/Saved", false));
-        assert!(rel_requires_external_fallback(
-            &cfg,
-            "Game/Saved/Logs",
-            false
-        ));
-        assert!(!rel_requires_external_fallback(&cfg, "Game", false));
-    }
-
-    #[test]
-    fn recursive_ignored_directory_target_falls_back_to_external_tool() {
-        let cfg = FrontendProjectConfig {
-            paths_ignore: FrontendMatcher::new(&[
-                "**/Binaries/".to_string(),
-                "**/DerivedDataCache/".to_string(),
-                "**/Intermediate/".to_string(),
-            ])
-            .unwrap(),
-            ..Default::default()
-        };
-        for rel in [
-            "Binaries",
-            "Project/Binaries",
-            "Plugins/Foo/Binaries",
-            "DerivedDataCache",
-            "Project/DerivedDataCache",
-            "Plugins/Foo/Intermediate",
-        ] {
-            assert!(rel_requires_external_fallback(&cfg, rel, false), "{rel}");
-        }
-        assert!(!rel_requires_external_fallback(&cfg, "Source", false));
-    }
-
-    #[test]
-    fn live_suffix_pattern_matches_nested_target() {
-        let cfg = FrontendProjectConfig {
-            paths_live: FrontendMatcher::new(&["Saved/Logs/".to_string()]).unwrap(),
-            ..Default::default()
-        };
-        assert!(rel_requires_external_fallback(
-            &cfg,
-            "Game/Saved/Logs",
-            false
-        ));
-    }
-
-    #[test]
-    fn explicit_file_not_in_indexed_file_set_falls_back() {
-        let cfg = FrontendProjectConfig {
-            files_ignore: FrontendMatcher::new(&["*.png".to_string()]).unwrap(),
-            files_include: FrontendMatcher::new(&["*.rs".to_string()]).unwrap(),
-            ..Default::default()
-        };
-        assert!(rel_requires_external_fallback(&cfg, "src/logo.png", true));
-        assert!(rel_requires_external_fallback(&cfg, "src/readme.md", true));
-        assert!(!rel_requires_external_fallback(&cfg, "src/main.rs", true));
-        assert!(!rel_requires_external_fallback(&cfg, "src", false));
-    }
-
-    #[test]
     fn search_args_for_group_keeps_selected_search_paths() {
         let args = vec![
             "-n".to_string(),
@@ -2312,25 +1877,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn grep_translation_without_paths_can_use_ripgrep_stdin_fallback() {
-        let args = vec!["-n".to_string(), r"Needle\|Other".to_string()];
-        let GrepTranslation::Search(search_args) = translate_grep_args(&args).unwrap() else {
-            panic!("basic grep syntax should translate to rg-compatible search args");
-        };
-        assert_eq!(
-            search_args,
-            vec!["-n".to_string(), "--".to_string(), "Needle|Other".to_string()]
-        );
-        assert!(should_fallback_to_ripgrep_stdin(&search_args, true));
-    }
-
-    #[test]
-    fn grep_backreference_still_requires_system_grep() {
-        let args = vec![r"\(a\)\1".to_string()];
-        assert!(matches!(
-            translate_grep_args(&args).unwrap(),
-            GrepTranslation::FallbackToGrep
-        ));
-    }
 }

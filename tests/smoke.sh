@@ -18,6 +18,14 @@ fi
 if [[ ! -x "$grep_bin" && -x "$grep_bin.exe" ]]; then
   grep_bin="$grep_bin.exe"
 fi
+if [[ -z "${INDEXSEARCH_GREP_BIN:-}" && ! -x "$grep_bin" ]]; then
+  if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* ]]; then
+    cp "$bin" "$grep_bin.exe"
+    grep_bin="$grep_bin.exe"
+  else
+    ln -sf "$(basename "$bin")" "$grep_bin"
+  fi
+fi
 test_home="$(mktemp -d)"
 export HOME="$test_home"
 
@@ -639,6 +647,15 @@ printf '%s\n' "$hook_payload" \
 [[ "$hook_status" -eq 2 ]]
 grep -q 'Use `isgrep`' "$hook_err"
 grep -q 'Exit code 1' "$hook_err"
+grep -q 'bare `A|B` alternation' "$hook_err"
+hook_payload='{"tool_name":"Bash","tool_input":{"command":"rtk grep -n \"Foo|Bar\" ."}}'
+hook_status=0
+printf '%s\n' "$hook_payload" \
+  | python3 "$skills_home/.claude/skills/indexsearch/scripts/prefer-isgrep-hook.py" \
+    >/dev/null 2>"$hook_err" || hook_status=$?
+[[ "$hook_status" -eq 2 ]]
+grep -q 'Blocked bare `rtk grep`' "$hook_err"
+grep -q 'add `-E`' "$hook_err"
 grep -q 'IndexSearch Agent Instructions' "$skills_home/.config/opencode/AGENTS.md"
 "$tool_bin" install-skills --target all --scope project --project "$skills_project" --ue-template >/dev/null
 [[ -f "$skills_project/AGENTS.md" ]]

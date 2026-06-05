@@ -86,16 +86,15 @@ jobs:
             cp "target/${{ matrix.target }}/release/is-daemon.exe" "dist/${{ matrix.artifact }}/"
             cp "target/${{ matrix.target }}/release/istool.exe" "dist/${{ matrix.artifact }}/"
             cp "target/${{ matrix.target }}/release/indexsearch.exe" "dist/${{ matrix.artifact }}/"
-            cp "target/${{ matrix.target }}/release/isgrep.exe" "dist/${{ matrix.artifact }}/"
           else
             cp "target/${{ matrix.target }}/release/is-daemon" "dist/${{ matrix.artifact }}/"
             cp "target/${{ matrix.target }}/release/istool" "dist/${{ matrix.artifact }}/"
             cp "target/${{ matrix.target }}/release/indexsearch" "dist/${{ matrix.artifact }}/"
-            cp "target/${{ matrix.target }}/release/isgrep" "dist/${{ matrix.artifact }}/"
+            ln -s indexsearch "dist/${{ matrix.artifact }}/is"
+            ln -s indexsearch "dist/${{ matrix.artifact }}/isgrep"
             chmod +x "dist/${{ matrix.artifact }}/is-daemon"
             chmod +x "dist/${{ matrix.artifact }}/istool"
             chmod +x "dist/${{ matrix.artifact }}/indexsearch"
-            chmod +x "dist/${{ matrix.artifact }}/isgrep"
           fi
           cp README.md "dist/${{ matrix.artifact }}/"
           cp LICENSE-MIT LICENSE-APACHE "dist/${{ matrix.artifact }}/"
@@ -203,16 +202,8 @@ jobs:
                 bin.install "is-daemon" if File.exist?("is-daemon")
                 bin.install "istool"
                 bin.install "indexsearch"
-                if File.exist?("is")
-                  bin.install "is"
-                else
-                  bin.install_symlink "indexsearch" => "is"
-                end
-                if File.exist?("isgrep")
-                  bin.install "isgrep"
-                else
-                  bin.install_symlink "indexsearch" => "isgrep"
-                end
+                bin.install_symlink "indexsearch" => "is"
+                bin.install_symlink "indexsearch" => "isgrep"
                 pkgshare.install "skills" if Dir.exist?("skills")
                 pkgshare.install "agent-rules" if Dir.exist?("agent-rules")
                 pkgshare.install "templates" if Dir.exist?("templates")

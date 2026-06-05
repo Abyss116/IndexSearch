@@ -224,11 +224,13 @@ isgrep -r -n --include="*.rs" "SomeSymbol" .
 ```
 
 `isgrep` defaults to grep Basic Regex syntax, so `A\|B` is translated to the
-Rust regex alternation used by IndexSearch. It also maps grep-specific flags
-whose meanings conflict with `is`, such as `grep -h` and `grep -L`. For grep
-semantics that the indexed backend cannot provide, such as PCRE mode,
-backreferences, or null-data mode, `isgrep` falls back to the system `grep`
-when available.
+Rust regex alternation used by IndexSearch. For rg-style, RTK grep-style, or
+extended-regex patterns with bare `A|B` alternation, keep or add `-E`; plain
+`isgrep "A|B"` follows grep BRE semantics and searches for a literal `|`.
+It also maps grep-specific flags whose meanings conflict with `is`, such as
+`grep -h` and `grep -L`. For grep semantics that the indexed backend cannot
+provide, such as PCRE mode, backreferences, or null-data mode, `isgrep` falls
+back to the system `grep` when available.
 
 For pipeline input, the persistent project index is not used. `is` forwards
 rg-style stdin searches to `rg`; `isgrep` translates compatible grep-style

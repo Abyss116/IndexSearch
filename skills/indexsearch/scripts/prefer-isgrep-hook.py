@@ -14,6 +14,8 @@ WRAPPER_COMMANDS = {"command", "builtin", "env"}
 SEPARATORS = {";", "&&", "||", "|", "(", ")"}
 GREP_COMMANDS = {"grep", "egrep", "fgrep"}
 RG_COMMANDS = {"rg", "ripgrep"}
+RTK_COMMANDS = {"rtk"}
+RTK_PASSTHROUGH_SUBCOMMANDS = {"proxy", "run"}
 
 
 def shell_tokens(command: str) -> list[str]:
@@ -33,11 +35,11 @@ def is_assignment(token: str) -> bool:
 def first_blocked_search(command: str) -> tuple[str, str] | None:
     tokens = shell_tokens(command)
     expect_command = True
-    passthrough_wrapper = False
+    passthrough_wrapper: str | None = None
     for token in tokens:
         if token in SEPARATORS:
             expect_command = True
-            passthrough_wrapper = False
+            passthrough_wrapper = None
             continue
         if not expect_command:
             continue
@@ -45,16 +47,30 @@ def first_blocked_search(command: str) -> tuple[str, str] | None:
             continue
         name = os.path.basename(token)
         if name in WRAPPER_COMMANDS:
-            passthrough_wrapper = True
+            passthrough_wrapper = name
             continue
-        if passthrough_wrapper and token.startswith("-"):
+        if passthrough_wrapper in WRAPPER_COMMANDS and token.startswith("-"):
             continue
+        if name in RTK_COMMANDS:
+            passthrough_wrapper = name
+            continue
+        if passthrough_wrapper == "rtk" and name in RTK_PASSTHROUGH_SUBCOMMANDS:
+            passthrough_wrapper = f"rtk {name}"
+            continue
+        if passthrough_wrapper == "rtk" and name in GREP_COMMANDS:
+            return f"rtk {name}", "isgrep"
+        if passthrough_wrapper == "rtk" and name in RG_COMMANDS:
+            return f"rtk {name}", "is"
+        if passthrough_wrapper in {"rtk proxy", "rtk run"} and name in GREP_COMMANDS:
+            return f"{passthrough_wrapper} {name}", "isgrep"
+        if passthrough_wrapper in {"rtk proxy", "rtk run"} and name in RG_COMMANDS:
+            return f"{passthrough_wrapper} {name}", "is"
         if name in GREP_COMMANDS:
             return name, "isgrep"
         if name in RG_COMMANDS:
             return name, "is"
         expect_command = False
-        passthrough_wrapper = False
+        passthrough_wrapper = None
     return None
 
 
@@ -73,7 +89,9 @@ def main() -> int:
     print(
         f"Blocked bare `{blocked_cmd}`. Use `{replacement}` for indexed local "
         "source search. Exit code 1 from `is`/`isgrep` means no matches; "
-        "adjust the pattern or path while staying on IndexSearch.",
+        "adjust the pattern or path while staying on IndexSearch. When "
+        "converting rg/RTK-style bare `A|B` alternation to `isgrep`, add `-E` "
+        "or use grep BRE `A\\|B`.",
         file=sys.stderr,
     )
     return 2
