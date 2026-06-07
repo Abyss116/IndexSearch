@@ -30,19 +30,22 @@ test_home="$(mktemp -d)"
 export HOME="$test_home"
 
 cleanup() {
+  if [[ -n "${bad_frame_pid:-}" ]]; then
+    kill "$bad_frame_pid" >/dev/null 2>&1 || true
+  fi
   "$tool_bin" stop --all >/dev/null 2>&1 || "$daemon_bin" stop --all >/dev/null 2>&1 || true
   rm -rf "${tmp:-}" "${no_cfg_tmp:-}" "${search_no_cfg_tmp:-}" "${grep_no_cfg_tmp:-}" "${backend_auto_tmp:-}" \
     "${home_registry_tmp:-}" "${outside_log_tmp:-}" "${multi_root_tmp:-}" "${git_tmp:-}" "${ue_git_tmp:-}" "${sub_git_tmp:-}" "${watch_tmp:-}" \
     "${compact_watch_tmp:-}" "${config_watch_tmp:-}" "${offline_watch_tmp:-}" \
     "${implicit_watch_tmp:-}" "${clean_tmp:-}" "${all_home:-}" "${all_watch_a:-}" \
     "${all_watch_b:-}" "${registry_home:-}" "${install_tmp:-}" "${install_project:-}" \
-    "${skills_home:-}" "${skills_project:-}" "$test_home"
+    "${skills_home:-}" "${skills_project:-}" "${bad_frame_tmp:-}" "$test_home"
 }
 
 assert_daemon_capabilities() {
   local record="$1"
   grep -q '^service_name=is-daemon$' "$record"
-  grep -q '^protocol=1$' "$record"
+  grep -q '^protocol=2$' "$record"
   grep -q '^capabilities=.*search' "$record"
   grep -q '^capabilities=.*update' "$record"
   if [[ "$(uname -s)" != MINGW* && "$(uname -s)" != MSYS* && "$(uname -s)" != CYGWIN* ]]; then
@@ -193,6 +196,73 @@ grep -q "$tmp/src/b.txt:1:Needle there" <<<"$result"
 ! grep -q 'out/d.cc' <<<"$result"
 sorted_result="$("$bin" --sort path -n -i needle "$tmp")"
 [[ "$sorted_result" == "$tmp/src/a.cc:2:needle here"* ]]
+
+if [[ "$(uname -s)" != MINGW* && "$(uname -s)" != MSYS* && "$(uname -s)" != CYGWIN* ]]; then
+  "$tool_bin" stop "$tmp" >/dev/null 2>&1 || true
+  bad_frame_tmp="$(mktemp -d)"
+  bad_frame_sock="$bad_frame_tmp/fake.sock"
+  bad_frame_ready="$bad_frame_tmp/ready"
+  python3 - "$bad_frame_sock" "$bad_frame_ready" <<'PY' &
+import os
+import socket
+import sys
+import time
+
+sock_path, ready_path = sys.argv[1:3]
+try:
+    os.unlink(sock_path)
+except FileNotFoundError:
+    pass
+server = socket.socket(socket.AF_UNIX)
+server.bind(sock_path)
+server.listen(1)
+open(ready_path, "w").close()
+conn, _ = server.accept()
+try:
+    conn.settimeout(2.0)
+    try:
+        conn.recv(65536)
+    except Exception:
+        pass
+    conn.sendall(b"ISDRES1\n\x7f")
+    time.sleep(0.05)
+finally:
+    conn.close()
+    server.close()
+PY
+  bad_frame_pid=$!
+  for _ in $(seq 1 100); do
+    [[ -e "$bad_frame_ready" ]] && break
+    sleep 0.02
+  done
+  [[ -e "$bad_frame_ready" ]]
+  daemon_size="$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_size)' "$daemon_bin")"
+  daemon_mtime="$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_mtime_ns)' "$daemon_bin")"
+  index_size="$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_size)' "$tmp/.indexsearch/index.bin")"
+  index_mtime="$(python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_mtime_ns)' "$tmp/.indexsearch/index.bin")"
+  cat > "$tmp/.indexsearch/search-daemon.txt" <<EOF
+version=1
+service_name=is-daemon
+protocol=2
+capabilities=search,update,direct_stdout
+pid=999999
+port=0
+socket_path=$bad_frame_sock
+token=fake-token
+root=$tmp
+exe_path=$daemon_bin
+exe_size=$daemon_size
+exe_mtime=$daemon_mtime
+index_size=$index_size
+index_mtime=$index_mtime
+EOF
+  recovered_result="$("$bin" -n -F needle "$tmp")"
+  grep -q "$tmp/src/a.cc:2:needle here" <<<"$recovered_result"
+  grep -q 'frontend-daemon-recover' "$tmp/.indexsearch/project.log"
+  wait "$bad_frame_pid" >/dev/null 2>&1 || true
+  bad_frame_pid=
+fi
+
 mkdir -p "$tmp/src/sub"
 printf 'needle nested\n' > "$tmp/src/sub/nested.txt"
 "$tool_bin" update --force-scan "$tmp" >/dev/null
@@ -401,7 +471,7 @@ watch_pid="$(awk -F= '$1 == "pid" { print $2 }' "$watch_tmp/.indexsearch/search-
 listed_watch="$("$tool_bin" projects)"
 grep -q "pid=$watch_pid" <<<"$listed_watch"
 grep -q 'service=is-daemon' <<<"$listed_watch"
-grep -q 'protocol=1' <<<"$listed_watch"
+grep -q 'protocol=2' <<<"$listed_watch"
 grep -q 'capabilities=.*search' <<<"$listed_watch"
 grep -q 'capabilities=.*update' <<<"$listed_watch"
 mkdir -p "$watch_tmp/sub"

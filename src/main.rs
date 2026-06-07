@@ -62,7 +62,7 @@ const PROJECT_LOG_FILE: &str = "project.log";
 const SEARCH_DAEMON_FILE: &str = "search-daemon.txt";
 const LOCAL_GIT_EXCLUDE_SECTION: &str = "# Local ignore IndexSearch and IndexGraph";
 const SEARCH_DAEMON_SERVICE_NAME: &str = "is-daemon";
-const SEARCH_DAEMON_PROTOCOL: u32 = 1;
+const SEARCH_DAEMON_PROTOCOL: u32 = 2;
 const SEARCH_DAEMON_CAP_SEARCH: &str = "search";
 const SEARCH_DAEMON_CAP_UPDATE: &str = "update";
 #[cfg(unix)]
@@ -7224,7 +7224,11 @@ fn read_search_daemon_response_to_stdio(stream: &mut SearchDaemonStream) -> Resu
     let mut magic = [0u8; 8];
     stream.read_exact(&mut magic)?;
     if &magic != SEARCH_DAEMON_RESPONSE_MAGIC {
-        bail!("invalid search daemon response");
+        bail!(
+            "invalid search daemon response magic: got {} expected {}",
+            format_bytes_hex(&magic),
+            format_bytes_hex(SEARCH_DAEMON_RESPONSE_MAGIC)
+        );
     }
     let stdout = std::io::stdout();
     let mut out = BufWriter::new(stdout.lock());
@@ -7242,7 +7246,13 @@ fn read_search_daemon_response_to_stdio(stream: &mut SearchDaemonStream) -> Resu
                 err.flush()?;
                 return Ok(code);
             }
-            _ => bail!("invalid search daemon response frame"),
+            _ => bail!(
+                "invalid search daemon response frame: tag=0x{:02x} expected one of 0x{:02x}/0x{:02x}/0x{:02x}",
+                tag[0],
+                SEARCH_DAEMON_STDOUT_FRAME,
+                SEARCH_DAEMON_STDERR_FRAME,
+                SEARCH_DAEMON_DONE_FRAME
+            ),
         }
     }
 }
@@ -7251,7 +7261,11 @@ fn read_search_daemon_response_to_sink(stream: &mut SearchDaemonStream) -> Resul
     let mut magic = [0u8; 8];
     stream.read_exact(&mut magic)?;
     if &magic != SEARCH_DAEMON_RESPONSE_MAGIC {
-        bail!("invalid search daemon response");
+        bail!(
+            "invalid search daemon response magic: got {} expected {}",
+            format_bytes_hex(&magic),
+            format_bytes_hex(SEARCH_DAEMON_RESPONSE_MAGIC)
+        );
     }
     let mut sink = std::io::sink();
     loop {
@@ -7262,9 +7276,23 @@ fn read_search_daemon_response_to_sink(stream: &mut SearchDaemonStream) -> Resul
                 copy_bytes_frame(stream, &mut sink)?
             }
             SEARCH_DAEMON_DONE_FRAME => return Ok(read_u32_from_reader(stream)? as i32),
-            _ => bail!("invalid search daemon response frame"),
+            _ => bail!(
+                "invalid search daemon response frame: tag=0x{:02x} expected one of 0x{:02x}/0x{:02x}/0x{:02x}",
+                tag[0],
+                SEARCH_DAEMON_STDOUT_FRAME,
+                SEARCH_DAEMON_STDERR_FRAME,
+                SEARCH_DAEMON_DONE_FRAME
+            ),
         }
     }
+}
+
+fn format_bytes_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn refresh_index_for_search(cfg: &ProjectConfig, options: &Options) -> Result<()> {
@@ -14796,7 +14824,7 @@ fn search_daemon_client_exe_candidates() -> Vec<PathBuf> {
 fn read_search_daemon_record(path: &Path) -> Result<SearchDaemonRecord> {
     let text = fs::read_to_string(path)?;
     let mut service_name = SEARCH_DAEMON_SERVICE_NAME.to_string();
-    let mut protocol = SEARCH_DAEMON_PROTOCOL;
+    let mut protocol = 0;
     let mut capabilities = None;
     let mut pid = 0;
     let mut port = 0;
@@ -15138,7 +15166,11 @@ fn process_alive(pid: u32) -> bool {
 fn stop_process(pid: u32) {
     #[cfg(unix)]
     {
-        let _ = Command::new("kill").arg(pid.to_string()).status();
+        let _ = Command::new("kill")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
     #[cfg(windows)]
     {

@@ -14,8 +14,10 @@ const INDEX_DIR: &str = ".indexsearch";
 const INDEX_FILE: &str = "index.bin";
 const PROJECT_CONFIG_FILE: &str = "is-project-config.txt";
 const SEARCH_DAEMON_FILE: &str = "search-daemon.txt";
+const PROJECT_LOG_FILE: &str = "project.log";
 const MAINTENANCE_FILE: &str = "maintenance.txt";
 const PROJECTS_DIR: &str = "projects";
+const SEARCH_DAEMON_PROTOCOL: u32 = 2;
 const GREP_FRONTEND_ARG: &str = "--__indexsearch-grep-frontend";
 const REQUEST_MAGIC: &[u8; 8] = b"ISDREQ1\n";
 const RESPONSE_MAGIC: &[u8; 8] = b"ISDRES1\n";
@@ -171,7 +173,12 @@ fn run_grep_frontend(args: &[String]) -> Result<i32, String> {
         let SearchRunKind::Indexed(root) = run.kind;
         let group_args = grep_args_for_group(args, &run.path_indexes);
         let daemon_args = grep_daemon_args(&group_args);
-        let code = run_search_group_with_daemon_args(&daemon_args, root, &mut profile)?;
+        let code = run_search_group_with_daemon_args(
+            &daemon_args,
+            root,
+            &mut profile,
+            DaemonFailureFallback::Grep(group_args),
+        )?;
         final_code = combine_exit_codes(final_code, code);
     }
     profile.record("frontend_total", total_timer);
@@ -255,7 +262,12 @@ fn handle_missing_grep_project(args: &[String]) -> Result<i32, String> {
                 let (root, _) = ensure_project_service(&cwd, &mut profile)?;
                 if index_path(&root).is_file() {
                     let daemon_args = grep_daemon_args(args);
-                    return run_search_group_with_daemon_args(&daemon_args, root, &mut profile);
+                    return run_search_group_with_daemon_args(
+                        &daemon_args,
+                        root,
+                        &mut profile,
+                        DaemonFailureFallback::Grep(args.to_vec()),
+                    );
                 }
                 return Ok(2);
             }
@@ -540,25 +552,96 @@ fn run_search_group(
     profile: &mut FrontendProfile,
 ) -> Result<i32, String> {
     let daemon_args = search_daemon_args(group_args);
-    run_search_group_with_daemon_args(&daemon_args, root, profile)
+    run_search_group_with_daemon_args(
+        &daemon_args,
+        root,
+        profile,
+        DaemonFailureFallback::Ripgrep(ripgrep_stdin_args(group_args)),
+    )
 }
 
 fn run_search_group_with_daemon_args(
     daemon_args: &[String],
     root: PathBuf,
     profile: &mut FrontendProfile,
+    fallback: DaemonFailureFallback,
 ) -> Result<i32, String> {
     let ensure_timer = Instant::now();
     let (root, record) = ensure_project_service(&root, profile)?;
     profile.record("frontend_ensure_project_service", ensure_timer);
-    request_daemon(&record, &daemon_args, profile).map_err(|err| {
-        stop_process(record.pid);
-        let _ = fs::remove_file(record_path(&root));
-        format!(
-            "project service request failed for {}: {err}",
-            display_path(&root)
-        )
-    })
+    match request_daemon(&record, daemon_args, profile) {
+        Ok(code) => Ok(code),
+        Err(err) if is_recoverable_daemon_request_error(&err) => {
+            recover_bad_project_service(&root, &record, &err);
+            let retry_timer = Instant::now();
+            let (_, retry_record) = ensure_project_service(&root, profile)?;
+            profile.record("frontend_recover_project_service", retry_timer);
+            match request_daemon(&retry_record, daemon_args, profile) {
+                Ok(code) => Ok(code),
+                Err(retry_err) if is_recoverable_daemon_request_error(&retry_err) => {
+                    recover_bad_project_service(&root, &retry_record, &retry_err);
+                    append_frontend_project_log(
+                        &root,
+                        &format!(
+                            "frontend-daemon-fallback reason={} action=external",
+                            clean_log_text(&retry_err.to_string(), 240)
+                        ),
+                    );
+                    run_daemon_failure_fallback(fallback)
+                }
+                Err(retry_err) => {
+                    recover_bad_project_service(&root, &retry_record, &retry_err);
+                    Err(format!(
+                        "project service request failed for {} after recovery: {retry_err}",
+                        display_path(&root)
+                    ))
+                }
+            }
+        }
+        Err(err) => {
+            recover_bad_project_service(&root, &record, &err);
+            Err(format!(
+                "project service request failed for {}: {err}",
+                display_path(&root)
+            ))
+        }
+    }
+}
+
+enum DaemonFailureFallback {
+    Ripgrep(Vec<String>),
+    Grep(Vec<String>),
+}
+
+fn run_daemon_failure_fallback(fallback: DaemonFailureFallback) -> Result<i32, String> {
+    match fallback {
+        DaemonFailureFallback::Ripgrep(args) => run_system_ripgrep(&args),
+        DaemonFailureFallback::Grep(args) => run_system_grep(&args),
+    }
+}
+
+fn recover_bad_project_service(root: &Path, record: &DaemonRecord, err: &io::Error) {
+    append_frontend_project_log(
+        root,
+        &format!(
+            "frontend-daemon-recover pid={} reason={}",
+            record.pid,
+            clean_log_text(&err.to_string(), 240)
+        ),
+    );
+    stop_process(record.pid);
+    let _ = fs::remove_file(record_path(root));
+}
+
+fn is_recoverable_daemon_request_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::InvalidData
+            | io::ErrorKind::BrokenPipe
+    )
 }
 
 fn search_daemon_args(args: &[String]) -> Vec<String> {
@@ -1255,6 +1338,9 @@ fn read_valid_record(root: &Path) -> Option<DaemonRecord> {
 }
 
 fn record_matches(record: &DaemonRecord) -> bool {
+    if record.protocol != SEARCH_DAEMON_PROTOCOL {
+        return false;
+    }
     let Ok(index_meta) = fs::metadata(index_path(&record.root)) else {
         return false;
     };
@@ -1339,7 +1425,11 @@ fn read_daemon_response(mut stream: &mut impl Read) -> io::Result<i32> {
     if &magic != RESPONSE_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "invalid daemon response",
+            format!(
+                "invalid daemon response magic: got {} expected {}",
+                format_bytes_hex(&magic),
+                format_bytes_hex(RESPONSE_MAGIC)
+            ),
         ));
     }
     let stdout = io::stdout();
@@ -1373,11 +1463,22 @@ fn read_daemon_response(mut stream: &mut impl Read) -> io::Result<i32> {
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "invalid daemon response frame",
+                    format!(
+                        "invalid daemon response frame: tag=0x{:02x} expected one of 0x{:02x}/0x{:02x}/0x{:02x}",
+                        tag[0], STDOUT_FRAME, STDERR_FRAME, DONE_FRAME
+                    ),
                 ));
             }
         }
     }
+}
+
+fn format_bytes_hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn is_broken_pipe(err: &io::Error) -> bool {
@@ -1574,6 +1675,44 @@ fn record_path(root: &Path) -> PathBuf {
     root.join(INDEX_DIR).join(SEARCH_DAEMON_FILE)
 }
 
+fn project_log_path(root: &Path) -> PathBuf {
+    root.join(INDEX_DIR).join(PROJECT_LOG_FILE)
+}
+
+fn append_frontend_project_log(root: &Path, message: &str) {
+    let _ = fs::create_dir_all(root.join(INDEX_DIR));
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(project_log_path(root))
+    else {
+        return;
+    };
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string());
+    let _ = writeln!(file, "{timestamp} {message}");
+}
+
+fn clean_log_text(value: &str, max_len: usize) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        let clean = match ch {
+            '\r' | '\n' | '\t' => ' ',
+            _ if ch.is_control() => ' ',
+            _ => ch,
+        };
+        out.push(clean);
+        if out.len() >= max_len {
+            out.truncate(max_len);
+            out.push_str("...");
+            break;
+        }
+    }
+    out
+}
+
 fn project_registry_dir() -> PathBuf {
     env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
@@ -1589,6 +1728,7 @@ fn normalized_existing_path(path: &Path) -> PathBuf {
 
 #[derive(Default)]
 struct DaemonRecord {
+    protocol: u32,
     pid: u32,
     port: u16,
     socket_path: Option<PathBuf>,
@@ -1609,6 +1749,7 @@ fn read_record(path: &Path) -> Result<DaemonRecord, String> {
             continue;
         };
         match key {
+            "protocol" => record.protocol = value.parse().map_err(|_| "invalid daemon protocol")?,
             "pid" => record.pid = value.parse().map_err(|_| "invalid daemon pid")?,
             "port" => record.port = value.parse().map_err(|_| "invalid daemon port")?,
             "socket_path" => record.socket_path = Some(PathBuf::from(value)),
@@ -1625,6 +1766,7 @@ fn read_record(path: &Path) -> Result<DaemonRecord, String> {
         }
     }
     if record.pid == 0
+        || record.protocol == 0
         || (record.port == 0 && record.socket_path.is_none())
         || record.token.is_empty()
         || record.root.as_os_str().is_empty()
@@ -1663,7 +1805,11 @@ fn read_project_record(path: &Path) -> Result<ProjectRecord, String> {
 fn stop_process(pid: u32) {
     #[cfg(unix)]
     {
-        let _ = Command::new("kill").arg(pid.to_string()).status();
+        let _ = Command::new("kill")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
     #[cfg(windows)]
     {
@@ -1802,6 +1948,42 @@ mod tests {
     fn displayed_version_includes_build_metadata() {
         let version = display_version();
         assert!(version.starts_with(concat!(env!("CARGO_PKG_VERSION"), "+build.")));
+    }
+
+    #[test]
+    fn invalid_daemon_response_frame_reports_tag() {
+        let mut response = RESPONSE_MAGIC.to_vec();
+        response.push(0x7f);
+        let err = read_daemon_response(&mut response.as_slice()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("tag=0x7f"));
+    }
+
+    #[test]
+    fn invalid_daemon_response_magic_reports_bytes() {
+        let mut response = b"notmagic".to_vec();
+        response.push(DONE_FRAME);
+        response.extend_from_slice(&0u32.to_le_bytes());
+        let err = read_daemon_response(&mut response.as_slice()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("invalid daemon response magic"));
+        assert!(err.to_string().contains("6e 6f 74"));
+    }
+
+    #[test]
+    fn daemon_record_requires_protocol() {
+        let path = env::temp_dir().join(format!(
+            "indexsearch-daemon-record-{}-missing-protocol.txt",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            "pid=1\nport=1\ntoken=t\nroot=/tmp\nexe_path=/bin/echo\nexe_size=1\nexe_mtime=1\nindex_size=1\nindex_mtime=1\n",
+        )
+        .unwrap();
+        let result = read_record(&path);
+        let _ = fs::remove_file(path);
+        assert!(result.is_err());
     }
 
     #[test]
