@@ -86,6 +86,8 @@ jobs:
             cp "target/${{ matrix.target }}/release/is-daemon.exe" "dist/${{ matrix.artifact }}/"
             cp "target/${{ matrix.target }}/release/istool.exe" "dist/${{ matrix.artifact }}/"
             cp "target/${{ matrix.target }}/release/indexsearch.exe" "dist/${{ matrix.artifact }}/"
+            cp "target/${{ matrix.target }}/release/indexsearch.exe" "dist/${{ matrix.artifact }}/is.exe"
+            cp "target/${{ matrix.target }}/release/indexsearch.exe" "dist/${{ matrix.artifact }}/isgrep.exe"
           else
             cp "target/${{ matrix.target }}/release/is-daemon" "dist/${{ matrix.artifact }}/"
             cp "target/${{ matrix.target }}/release/istool" "dist/${{ matrix.artifact }}/"
@@ -260,6 +262,5 @@ jobs:
             exit 0
           }
 
-          Write-Host "wingetcreate update failed. The package may not be accepted into winget-pkgs yet."
-          Write-Host "Skipping automatic initial submission to avoid creating duplicate new-package PRs."
-          exit 0
+          Write-Error "wingetcreate update failed with exit code $LASTEXITCODE."
+          exit $LASTEXITCODE
