@@ -7,6 +7,7 @@ import argparse
 import fnmatch
 import json
 import os
+import re
 import shutil
 import statistics
 import subprocess
@@ -186,6 +187,23 @@ def measure(cmd: list[str], repeats: int) -> dict[str, float]:
     }
 
 
+def measure_is_stats(cmd: list[str], repeats: int) -> dict[str, float]:
+    stats_cmd = [*cmd, "--stats"]
+    run(stats_cmd)
+    values = []
+    for _ in range(repeats):
+        proc = subprocess.run(stats_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        match = re.search(r"^([0-9]+(?:\.[0-9]+)?)ms$", proc.stderr, re.MULTILINE)
+        if not match:
+            raise RuntimeError(f"missing is --stats timing for command: {' '.join(stats_cmd)}")
+        values.append(float(match.group(1)))
+    return {
+        "min_ms": min(values),
+        "median_ms": statistics.median(values),
+        "max_ms": max(values),
+    }
+
+
 def run_grep(files: list[str], grep_args: list[str], pattern: str) -> None:
     for start in range(0, len(files), GREP_BATCH_SIZE):
         batch = files[start : start + GREP_BATCH_SIZE]
@@ -261,107 +279,99 @@ def main() -> int:
 
     base_rg = rg_flags(True)
     rg_cpp = rg_flags(False)
-    grep_all_files = collect_grep_files(root, INCLUDES)
-    grep_cpp_files = collect_grep_files(root, ["*.cpp"])
+    os.chdir(root)
+    os.environ["PWD"] = str(root)
+    search_root = "."
     cases = [
         (
             "Literal: common token",
             "Nanite",
-            ["is", "-F", "Nanite", str(root)],
+            ["is", "-F", "Nanite"],
             ["qgrep", "search", str(qcfg), "l", "Nanite"],
-            ["rg", *base_rg, "-F", "Nanite", str(root)],
+            ["rg", *base_rg, "-F", "Nanite", search_root],
             ["-F"],
             "Nanite",
-            grep_all_files,
-            len(grep_all_files),
+            INCLUDES,
         ),
         (
             "Literal: long symbol",
             "SkeletalMeshComponent",
-            ["is", "-F", "SkeletalMeshComponent", str(root)],
+            ["is", "-F", "SkeletalMeshComponent"],
             ["qgrep", "search", str(qcfg), "l", "SkeletalMeshComponent"],
-            ["rg", *base_rg, "-F", "SkeletalMeshComponent", str(root)],
+            ["rg", *base_rg, "-F", "SkeletalMeshComponent", search_root],
             ["-F"],
             "SkeletalMeshComponent",
-            grep_all_files,
-            len(grep_all_files),
+            INCLUDES,
         ),
         (
             "Literal: missing",
             "DefinitelyMissingIndexSearchNeedle",
-            ["is", "-F", "DefinitelyMissingIndexSearchNeedle", str(root)],
+            ["is", "-F", "DefinitelyMissingIndexSearchNeedle"],
             ["qgrep", "search", str(qcfg), "l", "DefinitelyMissingIndexSearchNeedle"],
-            ["rg", *base_rg, "-F", "DefinitelyMissingIndexSearchNeedle", str(root)],
+            ["rg", *base_rg, "-F", "DefinitelyMissingIndexSearchNeedle", search_root],
             ["-F"],
             "DefinitelyMissingIndexSearchNeedle",
-            grep_all_files,
-            len(grep_all_files),
+            INCLUDES,
         ),
         (
             "Case-insensitive literal",
             "skeletalmeshcomponent",
-            ["is", "-i", "-F", "skeletalmeshcomponent", str(root)],
+            ["is", "-i", "-F", "skeletalmeshcomponent"],
             ["qgrep", "search", str(qcfg), "il", "skeletalmeshcomponent"],
-            ["rg", *base_rg, "-i", "-F", "skeletalmeshcomponent", str(root)],
+            ["rg", *base_rg, "-i", "-F", "skeletalmeshcomponent", search_root],
             ["-i", "-F"],
             "skeletalmeshcomponent",
-            grep_all_files,
-            len(grep_all_files),
+            INCLUDES,
         ),
         (
             "Word regex",
             r"\bActor\b",
-            ["is", "-w", "Actor", str(root)],
+            ["is", "-w", "Actor"],
             ["qgrep", "search", str(qcfg), "", r"\bActor\b"],
-            ["rg", *base_rg, "-w", "Actor", str(root)],
+            ["rg", *base_rg, "-w", "Actor", search_root],
             ["-w"],
             "Actor",
-            grep_all_files,
-            len(grep_all_files),
+            INCLUDES,
         ),
         (
             "Regex: alternation",
             "(Nanite|Lumen|SkeletalMeshComponent)",
-            ["is", "(Nanite|Lumen|SkeletalMeshComponent)", str(root)],
+            ["is", "(Nanite|Lumen|SkeletalMeshComponent)"],
             ["qgrep", "search", str(qcfg), "", "(Nanite|Lumen|SkeletalMeshComponent)"],
-            ["rg", *base_rg, "(Nanite|Lumen|SkeletalMeshComponent)", str(root)],
+            ["rg", *base_rg, "(Nanite|Lumen|SkeletalMeshComponent)", search_root],
             ["-E"],
             "(Nanite|Lumen|SkeletalMeshComponent)",
-            grep_all_files,
-            len(grep_all_files),
+            INCLUDES,
         ),
         (
             "Regex: prefix/suffix",
             "Skeletal[A-Za-z0-9_]*Component",
-            ["is", "Skeletal[A-Za-z0-9_]*Component", str(root)],
+            ["is", "Skeletal[A-Za-z0-9_]*Component"],
             ["qgrep", "search", str(qcfg), "", "Skeletal[A-Za-z0-9_]*Component"],
-            ["rg", *base_rg, "Skeletal[A-Za-z0-9_]*Component", str(root)],
+            ["rg", *base_rg, "Skeletal[A-Za-z0-9_]*Component", search_root],
             ["-E"],
             "Skeletal[A-Za-z0-9_]*Component",
-            grep_all_files,
-            len(grep_all_files),
+            INCLUDES,
         ),
         (
             "Regex: qualified call",
             r"[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(",
-            ["is", r"[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(", str(root)],
+            ["is", r"[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\("],
             ["qgrep", "search", str(qcfg), "", r"[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\("],
-            ["rg", *base_rg, r"[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(", str(root)],
+            ["rg", *base_rg, r"[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(", search_root],
             ["-E"],
             r"[A-Za-z_][A-Za-z0-9_]*::[A-Za-z0-9_]+\(",
-            grep_all_files,
-            len(grep_all_files),
+            INCLUDES,
         ),
         (
             "Glob: *.cpp literal",
             "Nanite in *.cpp",
-            ["is", "-F", "-g", "*.cpp", "Nanite", str(root)],
+            ["is", "-F", "-g", "*.cpp", "Nanite"],
             ["qgrep", "search", str(qcfg), r"lfi\.cpp$", "Nanite"],
-            ["rg", *rg_cpp, "-g", "*.cpp", "-F", "Nanite", str(root)],
+            ["rg", *rg_cpp, "-g", "*.cpp", "-F", "Nanite", search_root],
             ["-F"],
             "Nanite",
-            grep_cpp_files,
-            len(grep_cpp_files),
+            ["*.cpp"],
         ),
     ]
     if args.case:
@@ -372,25 +382,26 @@ def main() -> int:
             parser.error(f"unknown benchmark case(s): {', '.join(sorted(unknown))}")
         cases = [case for case in cases if case[0] in selected]
 
-    subprocess.run(["is", "-F", "Nanite", str(root)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["is", "-F", "Nanite"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     rows = []
-    for name, pattern, is_cmd, qgrep_cmd, rg_cmd, grep_args, grep_pattern, grep_files, grep_file_count in cases:
+    for name, pattern, is_cmd, qgrep_cmd, rg_cmd, grep_args, grep_pattern, grep_include_globs in cases:
+        timings = {
+            "indexsearch": measure_is_stats(is_cmd, args.search_repeats),
+            "qgrep": measure(qgrep_cmd, args.search_repeats),
+            "rg": measure(rg_cmd, args.rg_repeats),
+        }
         matches = {
             "indexsearch": count_lines(is_cmd),
             "qgrep": count_lines(qgrep_cmd),
             "rg": count_lines(rg_cmd),
-            "grep": count_grep_lines(grep_files, grep_args, grep_pattern),
         }
-        timings = {
-            "indexsearch": measure(is_cmd, args.search_repeats),
-            "qgrep": measure(qgrep_cmd, args.search_repeats),
-            "rg": measure(rg_cmd, args.rg_repeats),
-            "grep": measure_grep(grep_files, grep_args, grep_pattern, args.grep_repeats),
-        }
+        grep_files = collect_grep_files(root, grep_include_globs)
+        timings["grep"] = measure_grep(grep_files, grep_args, grep_pattern, args.grep_repeats)
+        matches["grep"] = count_grep_lines(grep_files, grep_args, grep_pattern)
         row = {
             "case": name,
             "pattern": pattern,
-            "grep_files": grep_file_count,
+            "grep_files": len(grep_files),
             "matches": matches,
             "timings": timings,
             "speedups": {

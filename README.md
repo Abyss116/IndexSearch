@@ -267,19 +267,21 @@ reports from large repositories.
 
 ## Performance Snapshot
 
-Local Unreal Engine benchmark on macOS, hot filesystem cache. Search timings
-are medians with stdout discarded. The grep column uses macOS `/usr/bin/grep`
-over the same pre-enumerated benchmark file set because BSD grep does not
-provide recursive include/exclude glob options.
+Local Unreal Engine benchmark on macOS, hot filesystem cache. The `is` column
+uses median `is --stats` search time with stdout discarded, matching the timing
+shown by the CLI. qgrep, `rg`, and grep columns are median process wall times.
+The grep column uses macOS `/usr/bin/grep` over the same pre-enumerated
+benchmark file set because BSD grep does not provide recursive include/exclude
+glob options.
 
 | Workload | `is` | qgrep | `rg` | grep | vs qgrep | vs `rg` | vs grep |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Fresh index / qgrep update | 10.56s | 18.28s | n/a | n/a | 1.7x | n/a | n/a |
-| `Nanite` | 8.45ms | 24.34ms | 3019.44ms | 26092.21ms | 2.9x | 357x | 3089x |
-| `SkeletalMeshComponent` | 7.77ms | 19.18ms | 2937.46ms | 26779.67ms | 2.5x | 378x | 3447x |
-| missing literal | 4.48ms | 12.73ms | 3008.45ms | 28454.38ms | 2.8x | 671x | 6349x |
-| qualified-call regex | 139.16ms | 521.25ms | 4348.05ms | 80021.88ms | 3.7x | 31x | 575x |
-| `Nanite` in `*.cpp` | 6.71ms | 23.07ms | 1082.45ms | 4337.65ms | 3.4x | 161x | 647x |
+| `Nanite` | 3.71ms | 23.47ms | 2784.08ms | 32528.27ms | 6.3x | 751x | 8772x |
+| `SkeletalMeshComponent` | 3.33ms | 18.04ms | 2769.81ms | 33534.75ms | 5.4x | 832x | 10067x |
+| missing literal | 0.08ms | 14.86ms | 2767.36ms | 33634.95ms | 186x | 34592x | 420437x |
+| qualified-call regex | 77.61ms | 358.93ms | 3030.85ms | 85606.64ms | 4.6x | 39x | 1103x |
+| `Nanite` in `*.cpp` | 1.96ms | 24.03ms | 967.51ms | 5492.97ms | 12.2x | 493x | 2797x |
 
 The unrestricted rows use each tool's closest CLI-equivalent filtering rules,
 so matched-line counts can differ slightly. The `*.cpp` row is a stricter
