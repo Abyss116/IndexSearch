@@ -34,8 +34,13 @@ Homebrew:
 
 ```bash
 brew tap Abyss116/indexsearch
+brew trust Abyss116/indexsearch
 brew install indexsearch
 ```
+
+`brew trust` is a one-time local trust grant for the third-party tap. Homebrew
+may require it before future `brew update` / `brew upgrade` runs can update the
+formula.
 
 WinGet, after package-manager moderation has accepted the manifest:
 
@@ -262,23 +267,34 @@ reports from large repositories.
 
 ## Performance Snapshot
 
-Local Unreal Engine benchmark on macOS, hot filesystem cache, stdout redirected
-to `/dev/null`:
+Local Unreal Engine benchmark on macOS, hot filesystem cache. Search timings
+are medians with stdout discarded. The grep column uses macOS `/usr/bin/grep`
+over the same pre-enumerated benchmark file set because BSD grep does not
+provide recursive include/exclude glob options.
 
-| Workload | `is` | qgrep | `rg` |
-| --- | ---: | ---: | ---: |
-| Fresh index | 10.57s | about 21s | n/a |
-| Compact | 2.31s | n/a | n/a |
-| `Nanite` | 7.61ms | 21.52ms | 3139.98ms |
-| `SkeletalMeshComponent` | 7.46ms | 19.53ms | 3216.95ms |
-| missing literal | 2.63ms | 13.64ms | 3194.67ms |
-| qualified-call regex | 85.05ms | 357.42ms | 3217.22ms |
+| Workload | `is` | qgrep | `rg` | grep | vs qgrep | vs `rg` | vs grep |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Fresh index / qgrep update | 10.56s | 18.28s | n/a | n/a | 1.7x | n/a | n/a |
+| `Nanite` | 8.45ms | 24.34ms | 3019.44ms | 26092.21ms | 2.9x | 357x | 3089x |
+| `SkeletalMeshComponent` | 7.77ms | 19.18ms | 2937.46ms | 26779.67ms | 2.5x | 378x | 3447x |
+| missing literal | 4.48ms | 12.73ms | 3008.45ms | 28454.38ms | 2.8x | 671x | 6349x |
+| qualified-call regex | 139.16ms | 521.25ms | 4348.05ms | 80021.88ms | 3.7x | 31x | 575x |
+| `Nanite` in `*.cpp` | 6.71ms | 23.07ms | 1082.45ms | 4337.65ms | 3.4x | 161x | 647x |
 
-To reproduce the search benchmark:
+The unrestricted rows use each tool's closest CLI-equivalent filtering rules,
+so matched-line counts can differ slightly. The `*.cpp` row is a stricter
+same-file-set comparison and matched 10,136 lines for all four tools.
+
+To reproduce the table:
 
 ```bash
 python3 scripts/benchmark-ue.py /path/to/UnrealEngine --prepare-qgrep \
-  --search-repeats 7 --rg-repeats 3
+  --search-repeats 5 --rg-repeats 3 --grep-repeats 1 \
+  --case 'Literal: common token' \
+  --case 'Literal: long symbol' \
+  --case 'Literal: missing' \
+  --case 'Regex: qualified call' \
+  --case 'Glob: *.cpp literal'
 ```
 
 ## Build
