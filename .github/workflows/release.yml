@@ -256,11 +256,45 @@ jobs:
           $version = $env:GITHUB_REF_NAME.TrimStart("v")
           $installerUrl = "https://github.com/Abyss116/IndexSearch/releases/download/$env:GITHUB_REF_NAME/indexsearch-windows-x86_64.zip"
           $url = "$installerUrl|x64"
+          $manifestRoot = Join-Path $PWD "winget-manifests"
           Invoke-WebRequest https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
-          .\wingetcreate.exe update Abyss116.IndexSearch -u $url -v $version -t $env:WINGET_TOKEN --submit
+          .\wingetcreate.exe update Abyss116.IndexSearch -u $url -v $version -t $env:WINGET_TOKEN --out $manifestRoot
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "wingetcreate update failed with exit code $LASTEXITCODE."
+            exit $LASTEXITCODE
+          }
+          $manifestDir = Get-ChildItem -Path $manifestRoot -Directory -Recurse |
+            Where-Object { Test-Path (Join-Path $_.FullName "Abyss116.IndexSearch.installer.yaml") } |
+            Select-Object -First 1
+          if (-not $manifestDir) {
+            Write-Error "wingetcreate did not produce an installer manifest."
+            exit 1
+          }
+          $installerManifest = Join-Path $manifestDir.FullName "Abyss116.IndexSearch.installer.yaml"
+          $nestedInstallerFiles = @(
+            "- RelativeFilePath: is-daemon.exe`n  PortableCommandAlias: is-daemon",
+            "- RelativeFilePath: indexsearch.exe`n  PortableCommandAlias: indexsearch",
+            "- RelativeFilePath: is.exe`n  PortableCommandAlias: is",
+            "- RelativeFilePath: isgrep.exe`n  PortableCommandAlias: isgrep",
+            "- RelativeFilePath: istool.exe`n  PortableCommandAlias: istool"
+          ) -join "`n"
+          $content = Get-Content -Raw $installerManifest
+          $content = [regex]::Replace(
+            $content,
+            "(?ms)NestedInstallerFiles:\r?\n.*?(?=Installers:\r?\n)",
+            "NestedInstallerFiles:`n$nestedInstallerFiles`n")
+          Set-Content -Path $installerManifest -Value $content -NoNewline -Encoding utf8
+          foreach ($requiredFile in @("is-daemon.exe", "indexsearch.exe", "is.exe", "isgrep.exe", "istool.exe")) {
+            if (-not (Select-String -Path $installerManifest -Pattern "RelativeFilePath: $requiredFile" -Quiet)) {
+              Write-Error "missing nested installer entry for $requiredFile"
+              exit 1
+            }
+          }
+          Get-Content $installerManifest
+          .\wingetcreate.exe submit $manifestDir.FullName -t $env:WINGET_TOKEN -p "New version: Abyss116.IndexSearch version $version" --no-open
           if ($LASTEXITCODE -eq 0) {
             exit 0
           }
 
-          Write-Error "wingetcreate update failed with exit code $LASTEXITCODE."
+          Write-Error "wingetcreate submit failed with exit code $LASTEXITCODE."
           exit $LASTEXITCODE
