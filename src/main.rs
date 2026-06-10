@@ -60,7 +60,8 @@ const MAINTENANCE_FILE: &str = "maintenance.txt";
 const STATE_FILE: &str = "state.txt";
 const PROJECT_LOG_FILE: &str = "project.log";
 const SEARCH_DAEMON_FILE: &str = "search-daemon.txt";
-const LOCAL_GIT_EXCLUDE_SECTION: &str = "# Local ignore IndexSearch and IndexGraph";
+const INDEXSEARCH_GITIGNORE_FILE: &str = ".gitignore";
+const INDEXSEARCH_GITIGNORE_PATTERN: &str = "*";
 const SEARCH_DAEMON_SERVICE_NAME: &str = "is-daemon";
 const SEARCH_DAEMON_PROTOCOL: u32 = 2;
 const SEARCH_DAEMON_CAP_SEARCH: &str = "search";
@@ -8187,7 +8188,7 @@ fn load_config_inner(start: &Path, create_default: bool) -> Result<ProjectConfig
         discover_root(start)?
     };
     if create_default {
-        ensure_local_git_excludes_for_project(&root)?;
+        ensure_indexsearch_gitignore(&root)?;
     }
     let path = project_config_path(&root);
     let (config_path, text) = if path.exists() {
@@ -8294,88 +8295,24 @@ fn is_unreal_root(path: &Path) -> bool {
         })
 }
 
-fn ensure_local_git_excludes_for_project(root: &Path) -> Result<()> {
-    let Some(target) = git_exclude_target(root)? else {
-        return Ok(());
-    };
-    let existing = fs::read_to_string(&target.exclude_path).unwrap_or_default();
-    if git_exclude_has_pattern(&existing, &target.pattern) {
+fn ensure_indexsearch_gitignore(root: &Path) -> Result<()> {
+    let path = root.join(INDEX_DIR).join(INDEXSEARCH_GITIGNORE_FILE);
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    if git_exclude_has_pattern(&existing, INDEXSEARCH_GITIGNORE_PATTERN) {
         return Ok(());
     }
 
-    if let Some(parent) = target.exclude_path.parent() {
+    if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let mut updated = existing;
     if !updated.is_empty() && !updated.ends_with('\n') {
         updated.push('\n');
     }
-    if !updated
-        .lines()
-        .any(|line| line.trim() == LOCAL_GIT_EXCLUDE_SECTION)
-    {
-        if !updated.is_empty() {
-            updated.push('\n');
-        }
-        updated.push_str(LOCAL_GIT_EXCLUDE_SECTION);
-        updated.push('\n');
-    }
-    updated.push_str(&target.pattern);
+    updated.push_str(INDEXSEARCH_GITIGNORE_PATTERN);
     updated.push('\n');
-    fs::write(target.exclude_path, updated)?;
+    fs::write(path, updated)?;
     Ok(())
-}
-
-struct GitExcludeTarget {
-    exclude_path: PathBuf,
-    pattern: String,
-}
-
-fn git_exclude_target(root: &Path) -> Result<Option<GitExcludeTarget>> {
-    let Some(exclude_value) = git_rev_parse(root, &["--git-path", "info/exclude"])? else {
-        return Ok(None);
-    };
-    let path = PathBuf::from(exclude_value);
-    let exclude_path = if path.is_absolute() {
-        path
-    } else {
-        root.join(path)
-    };
-    let prefix = git_rev_parse(root, &["--show-prefix"])?.unwrap_or_default();
-    Ok(Some(GitExcludeTarget {
-        exclude_path,
-        pattern: local_git_exclude_pattern(&prefix),
-    }))
-}
-
-fn git_rev_parse(root: &Path, args: &[&str]) -> Result<Option<String>> {
-    let output = hidden_background_command("git")
-        .arg("-C")
-        .arg(root)
-        .arg("rev-parse")
-        .args(args)
-        .output();
-    let Ok(output) = output else {
-        return Ok(None);
-    };
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if value.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(value))
-}
-
-fn local_git_exclude_pattern(prefix: &str) -> String {
-    let prefix = prefix.trim().replace('\\', "/");
-    let prefix = prefix.trim_matches('/');
-    if prefix.is_empty() {
-        "/.indexsearch/".to_string()
-    } else {
-        format!("/{prefix}/.indexsearch/")
-    }
 }
 
 fn git_exclude_has_pattern(text: &str, pattern: &str) -> bool {

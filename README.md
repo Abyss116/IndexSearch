@@ -161,9 +161,9 @@ cd /path/to/UnrealEngine
 istool index .
 ```
 
-When indexing a Git project, IndexSearch also adds an anchored local ignore to
-`.git/info/exclude`, for example `/.indexsearch/` at the repository root or
-`/nested/project/.indexsearch/` for a project rooted in a subdirectory.
+When creating a project, IndexSearch writes `.indexsearch/.gitignore` with `*`
+so local index files stay out of Git status even in repositories that use
+allow-list style root `.gitignore` rules.
 
 If the first interactive search discovers an Unreal Engine root or a `.uproject`
 root, the generated config uses the UE template automatically.

@@ -101,18 +101,21 @@ printf 'auto_config_symbol\n' > "$no_cfg_tmp/a.txt"
 
 ue_git_tmp="$(mktemp -d)"
 git -C "$ue_git_tmp" init -q
+printf '*\n!*/\n!*.txt\n!.git*\n' > "$ue_git_tmp/.gitignore"
 "$tool_bin" index "$ue_git_tmp" >/dev/null
-grep -q '# Local ignore IndexSearch and IndexGraph' "$ue_git_tmp/.git/info/exclude"
-grep -qx '/.indexsearch/' "$ue_git_tmp/.git/info/exclude"
 [[ -f "$ue_git_tmp/.indexsearch/is-project-config.txt" ]]
+grep -qx '*' "$ue_git_tmp/.indexsearch/.gitignore"
+git -C "$ue_git_tmp" check-ignore -q .indexsearch/.gitignore
+git -C "$ue_git_tmp" check-ignore -q .indexsearch/is-project-config.txt
 "$tool_bin" index "$ue_git_tmp" >/dev/null
-[[ "$(grep -cx '/.indexsearch/' "$ue_git_tmp/.git/info/exclude")" -eq 1 ]]
+[[ "$(grep -cx '*' "$ue_git_tmp/.indexsearch/.gitignore")" -eq 1 ]]
 
 sub_git_tmp="$(mktemp -d)"
 git -C "$sub_git_tmp" init -q
 mkdir -p "$sub_git_tmp/nested/project"
 "$tool_bin" index "$sub_git_tmp/nested/project" >/dev/null
-grep -qx '/nested/project/.indexsearch/' "$sub_git_tmp/.git/info/exclude"
+grep -qx '*' "$sub_git_tmp/nested/project/.indexsearch/.gitignore"
+git -C "$sub_git_tmp" check-ignore -q nested/project/.indexsearch/.gitignore
 git -C "$sub_git_tmp" check-ignore -q nested/project/.indexsearch/is-project-config.txt
 
 help_out="$("$bin" --help)"
