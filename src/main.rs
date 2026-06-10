@@ -76,6 +76,7 @@ const SEARCH_DAEMON_CONTROL_ARG: &str = "--__indexsearch-daemon-control";
 const SEARCH_DAEMON_CONTROL_UPDATE: &str = "update";
 const SEARCH_DAEMON_CONTROL_SHUTDOWN: &str = "shutdown";
 const SEARCH_DAEMON_SKIP_STARTUP_SYNC_ARG: &str = "--__indexsearch-daemon-skip-startup-sync";
+const SEARCH_DAEMON_BACKGROUND_RECONCILE_ARG: &str = "--__indexsearch-daemon-background-reconcile";
 const GREP_FRONTEND_ARG: &str = "--__indexsearch-grep-frontend";
 const SEARCH_DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_millis(20);
 #[cfg(windows)]
@@ -400,6 +401,7 @@ struct WatchOptions {
     idle_seconds: u64,
     compact_delta_count: usize,
     compact_delta_bytes: u64,
+    startup_reconcile: bool,
 }
 
 impl Default for WatchOptions {
@@ -408,6 +410,7 @@ impl Default for WatchOptions {
             idle_seconds: 5,
             compact_delta_count: 16,
             compact_delta_bytes: 256 * 1024 * 1024,
+            startup_reconcile: false,
         }
     }
 }
@@ -4036,6 +4039,108 @@ fn start_embedded_watch_thread(
     })
 }
 
+fn start_startup_reconcile_thread(
+    cfg: ProjectConfig,
+    search_record: Option<SearchDaemonRecord>,
+    watch_state: Arc<WatchState>,
+) {
+    std::thread::spawn(move || {
+        let result = (|| -> Result<()> {
+            let _io = watch_state.index_io.lock().unwrap();
+            reconcile_filesystem_scan_for_daemon(&cfg, search_record.as_ref(), watch_state.as_ref())
+        })();
+        if let Err(err) = result {
+            let _ = append_project_log(
+                &cfg.root,
+                &format!(
+                    "startup-reconcile-error {}",
+                    log_quote(&format!("{err:#}"), 512)
+                ),
+            );
+        }
+    });
+}
+
+fn reconcile_filesystem_scan_for_daemon(
+    cfg: &ProjectConfig,
+    search_record: Option<&SearchDaemonRecord>,
+    watch_state: &WatchState,
+) -> Result<()> {
+    if watch_state.restart_required.load(AtomicOrdering::Relaxed) {
+        return Ok(());
+    }
+    let timer = Instant::now();
+    let options = Options {
+        max_filesize: DEFAULT_MAX_FILE_SIZE,
+        ..Options::default()
+    };
+    let mut timings = Timings::default();
+    let mut scanned = 0;
+    let mut skipped = 0;
+    let (changes, visible_before) =
+        collect_filesystem_changes(cfg, &options, &mut scanned, &mut skipped, &mut timings)?;
+    if watch_state.restart_required.load(AtomicOrdering::Relaxed) {
+        return Ok(());
+    }
+    if changes.is_empty() {
+        save_index_state(&cfg.root)?;
+        append_project_log(
+            &cfg.root,
+            &format!(
+                "startup-reconcile-current files={} skipped={} scanned={} elapsed={} {}",
+                visible_before,
+                skipped,
+                scanned,
+                format_elapsed_duration(timer.elapsed()),
+                timing_summary(&timings)
+            ),
+        )?;
+        return Ok(());
+    }
+
+    let process_timer = Instant::now();
+    let mut changed_scanned = 0;
+    let mut changed_skipped = 0;
+    let (delta, meta, stats) = build_delta_index(
+        cfg,
+        &options,
+        &changes,
+        &mut changed_scanned,
+        &mut changed_skipped,
+        Some(&mut timings),
+    )?;
+    timings.process += process_timer.elapsed().as_secs_f64();
+    skipped += changed_skipped;
+
+    if stats.added == 0 && stats.updated == 0 && stats.removed == 0 {
+        save_index_state(&cfg.root)?;
+    } else {
+        let write_timer = Instant::now();
+        save_delta(&cfg.root, &delta, &meta)?;
+        save_index_state(&cfg.root)?;
+        timings.write += write_timer.elapsed().as_secs_f64();
+        if let Some(record) = search_record {
+            let _ = refresh_search_daemon_record(record);
+        }
+    }
+    append_project_log(
+        &cfg.root,
+        &format!(
+            "startup-reconcile files={} reused={} added={} modified={} removed={} skipped={} scanned={} elapsed={} {}",
+            stats.reused + stats.updated + stats.added,
+            stats.reused,
+            stats.added,
+            stats.updated,
+            stats.removed,
+            skipped,
+            scanned,
+            format_elapsed_duration(timer.elapsed()),
+            timing_summary(&timings)
+        ),
+    )?;
+    Ok(())
+}
+
 fn run_watch_loop(
     cfg: &ProjectConfig,
     watch_options: WatchOptions,
@@ -4052,6 +4157,13 @@ fn run_watch_loop(
         NotifyConfig::default(),
     )?;
     watcher.watch(&cfg.root, RecursiveMode::Recursive)?;
+    if watch_options.startup_reconcile {
+        start_startup_reconcile_thread(
+            cfg.clone(),
+            search_record.cloned(),
+            Arc::clone(&watch_state),
+        );
+    }
 
     let idle = Duration::from_secs(watch_options.idle_seconds.max(1));
     loop {
@@ -4063,7 +4175,15 @@ fn run_watch_loop(
                 let mut pending = watch_state.pending.lock().unwrap();
                 collect_event_paths(cfg, event, &mut pending, watch_state.as_ref());
             }
-            Ok(Err(_)) => {}
+            Ok(Err(err)) => {
+                let _ = append_project_log(
+                    &cfg.root,
+                    &format!(
+                        "project-service-watch-error {}",
+                        log_quote(&format!("{err:#}"), 512)
+                    ),
+                );
+            }
             Err(RecvTimeoutError::Timeout) => {
                 if watch_state.restart_required.load(AtomicOrdering::Relaxed) {
                     if let Some(flag) = shutdown {
@@ -4115,15 +4235,19 @@ fn collect_event_paths(
                     .store(true, AtomicOrdering::Relaxed);
                 continue;
             }
-            if path.starts_with(cfg.root.join(INDEX_DIR)) || path.is_dir() {
+            if is_index_internal_rel(&rel) || is_hidden(&rel) || !is_searchable(cfg, &rel) {
                 continue;
             }
-            if path.exists() && (is_hidden(&rel) || !is_searchable(cfg, &rel)) {
+            if path.is_dir() {
                 continue;
             }
             pending.insert(rel);
         }
     }
+}
+
+fn is_index_internal_rel(rel: &str) -> bool {
+    rel == INDEX_DIR || rel.starts_with(".indexsearch/")
 }
 
 fn watch_event_can_change_index(kind: &EventKind) -> bool {
@@ -6045,9 +6169,7 @@ fn start_search_daemon(root: &Path) -> Result<()> {
 fn start_search_daemon_with_exe(root: &Path, exe: &Path) -> Result<()> {
     let mut command = hidden_background_command(exe);
     command
-        .arg("search-daemon")
-        .arg("--detach")
-        .arg(root)
+        .args(search_daemon_detach_args(root))
         .env("INDEXSEARCH_NO_PROGRESS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -6057,6 +6179,16 @@ fn start_search_daemon_with_exe(root: &Path, exe: &Path) -> Result<()> {
         bail!("failed to start project service for {}", display_path(root));
     }
     Ok(())
+}
+
+fn search_daemon_detach_args(root: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("search-daemon"),
+        OsString::from("--detach"),
+        root.as_os_str().to_os_string(),
+        OsString::from(SEARCH_DAEMON_SKIP_STARTUP_SYNC_ARG),
+        OsString::from(SEARCH_DAEMON_BACKGROUND_RECONCILE_ARG),
+    ]
 }
 
 fn wait_for_installed_search_daemon_ready(root: &Path, daemon_path: &Path) -> Result<()> {
@@ -6165,6 +6297,7 @@ fn command_search_daemon(args: &[String]) -> Result<i32> {
         match args[i].as_str() {
             "--detach" => detach = true,
             SEARCH_DAEMON_SKIP_STARTUP_SYNC_ARG => skip_startup_sync = true,
+            SEARCH_DAEMON_BACKGROUND_RECONCILE_ARG => watch_options.startup_reconcile = true,
             "--idle-seconds" => {
                 i += 1;
                 let value = args.get(i).context("missing --idle-seconds value")?;
@@ -6187,11 +6320,16 @@ fn command_search_daemon(args: &[String]) -> Result<i32> {
     let root = root.context("search-daemon requires a root")?;
     let cfg = load_or_create_config(&root)?;
     stop_child_project_services(&cfg.root)?;
-    if !skip_startup_sync {
+    let index_current = index_matches_config(&cfg);
+    let startup_sync_needed = !index_current || (!skip_startup_sync && !detach);
+    if startup_sync_needed {
         let flow = ConsoleFlow::start();
         flow.step_done(format!("Resolved project {}", display_path(&cfg.root)));
         sync_index_before_service(&cfg, &flow)?;
         flow.done();
+        watch_options.startup_reconcile = false;
+    } else if detach {
+        watch_options.startup_reconcile = true;
     }
     if detach {
         spawn_search_daemon_detached(&cfg.root, watch_options)?;
@@ -6200,8 +6338,14 @@ fn command_search_daemon(args: &[String]) -> Result<i32> {
     run_search_daemon(&cfg.root, watch_options)
 }
 
+fn index_matches_config(cfg: &ProjectConfig) -> bool {
+    MappedIndex::open(&index_path(&cfg.root))
+        .map(|index| index.config_hash == cfg.hash)
+        .unwrap_or(false)
+}
+
 fn search_daemon_child_args(root: &Path, options: WatchOptions) -> Vec<OsString> {
-    vec![
+    let mut args = vec![
         OsString::from("search-daemon"),
         root.as_os_str().to_os_string(),
         OsString::from(SEARCH_DAEMON_SKIP_STARTUP_SYNC_ARG),
@@ -6211,7 +6355,11 @@ fn search_daemon_child_args(root: &Path, options: WatchOptions) -> Vec<OsString>
         OsString::from(options.compact_delta_count.to_string()),
         OsString::from("--compact-delta-bytes"),
         OsString::from(options.compact_delta_bytes.to_string()),
-    ]
+    ];
+    if options.startup_reconcile {
+        args.push(OsString::from(SEARCH_DAEMON_BACKGROUND_RECONCILE_ARG));
+    }
+    args
 }
 
 fn spawn_search_daemon_detached(root: &Path, options: WatchOptions) -> Result<()> {
@@ -15670,6 +15818,53 @@ mod tests {
     }
 
     #[test]
+    fn automatic_search_daemon_start_skips_startup_sync() {
+        let args = search_daemon_detach_args(Path::new(r"D:\Project"));
+        let rendered: Vec<String> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "search-daemon",
+                "--detach",
+                r"D:\Project",
+                SEARCH_DAEMON_SKIP_STARTUP_SYNC_ARG,
+                SEARCH_DAEMON_BACKGROUND_RECONCILE_ARG,
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_index_cannot_skip_startup_sync() {
+        let cfg = ProjectConfig {
+            root: env::temp_dir().join(format!("indexsearch-missing-index-{}", std::process::id())),
+            path: None,
+            paths_ignore: MatcherSet::default(),
+            paths_live: MatcherSet::default(),
+            files_ignore: MatcherSet::default(),
+            files_include: MatcherSet::new(&["*".to_string()]).unwrap(),
+            hash: 0,
+        };
+
+        assert!(!index_matches_config(&cfg));
+    }
+
+    #[test]
+    fn current_index_daemon_start_does_not_reconcile_again() {
+        let args = search_daemon_child_args(Path::new(r"D:\Project"), WatchOptions::default());
+        let rendered: Vec<String> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(rendered.contains(&SEARCH_DAEMON_SKIP_STARTUP_SYNC_ARG.to_string()));
+        assert!(!rendered.contains(&SEARCH_DAEMON_BACKGROUND_RECONCILE_ARG.to_string()));
+    }
+
+    #[test]
     fn unsupported_rg_flags_are_recorded_and_ignored() {
         let options =
             parse_search_args(&args(["--pcre2", "--pre", "cat", "Needle", "."].as_slice()))
@@ -15886,6 +16081,60 @@ mod tests {
         assert!(should_descend_rel(&cfg, &Options::default(), "Source"));
         assert!(!is_searchable(&cfg, "Plugins/Foo/Binaries/Generated.txt"));
         assert!(is_searchable(&cfg, "Plugins/Foo/Source/Module.cpp"));
+    }
+
+    #[test]
+    fn watch_events_ignore_unreal_output_paths_even_when_missing() {
+        let root = env::temp_dir().join(format!("indexsearch-watch-ignore-{}", std::process::id()));
+        let cfg = ProjectConfig {
+            root: root.clone(),
+            path: None,
+            paths_ignore: MatcherSet::new(&[
+                "**/Binaries/".to_string(),
+                "**/DerivedDataCache/".to_string(),
+                "**/Intermediate/".to_string(),
+            ])
+            .unwrap(),
+            paths_live: MatcherSet::default(),
+            files_ignore: MatcherSet::default(),
+            files_include: MatcherSet::new(&["*".to_string()]).unwrap(),
+            hash: 0,
+        };
+        let watch_state = WatchState::default();
+        let mut pending = HashSet::default();
+
+        for rel in [
+            "DerivedDataCache/Transient.ddc",
+            "Project/DerivedDataCache/Transient.ddc",
+            "Plugins/Foo/Intermediate/Build.tmp",
+            "Plugins/Foo/Binaries/Generated.dll",
+        ] {
+            collect_event_paths(
+                &cfg,
+                Event::new(EventKind::Any).add_path(root.join(rel)),
+                &mut pending,
+                &watch_state,
+            );
+        }
+
+        assert!(pending.is_empty());
+        assert!(!watch_state.restart_required.load(AtomicOrdering::Relaxed));
+
+        collect_event_paths(
+            &cfg,
+            Event::new(EventKind::Any).add_path(root.join("Source/New.cpp")),
+            &mut pending,
+            &watch_state,
+        );
+        assert!(pending.contains("Source/New.cpp"));
+
+        collect_event_paths(
+            &cfg,
+            Event::new(EventKind::Any).add_path(root.join(PROJECT_CONFIG_REL)),
+            &mut pending,
+            &watch_state,
+        );
+        assert!(watch_state.restart_required.load(AtomicOrdering::Relaxed));
     }
 
     #[test]

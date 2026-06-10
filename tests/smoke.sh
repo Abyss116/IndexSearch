@@ -36,7 +36,7 @@ cleanup() {
   "$tool_bin" stop --all >/dev/null 2>&1 || "$daemon_bin" stop --all >/dev/null 2>&1 || true
   rm -rf "${tmp:-}" "${no_cfg_tmp:-}" "${search_no_cfg_tmp:-}" "${grep_no_cfg_tmp:-}" "${backend_auto_tmp:-}" \
     "${home_registry_tmp:-}" "${outside_log_tmp:-}" "${multi_root_tmp:-}" "${git_tmp:-}" "${ue_git_tmp:-}" "${sub_git_tmp:-}" "${watch_tmp:-}" \
-    "${compact_watch_tmp:-}" "${config_watch_tmp:-}" "${offline_watch_tmp:-}" \
+    "${compact_watch_tmp:-}" "${config_watch_tmp:-}" "${offline_watch_tmp:-}" "${crash_reconcile_tmp:-}" \
     "${implicit_watch_tmp:-}" "${clean_tmp:-}" "${all_home:-}" "${all_watch_a:-}" \
     "${all_watch_b:-}" "${registry_home:-}" "${install_tmp:-}" "${install_project:-}" \
     "${skills_home:-}" "${skills_project:-}" "${bad_frame_tmp:-}" "$test_home"
@@ -587,12 +587,51 @@ printf 'offline_old\n' > "$offline_watch_tmp/a.txt"
 "$tool_bin" stop "$offline_watch_tmp" >/dev/null 2>&1 || true
 printf 'offline_new\n' > "$offline_watch_tmp/a.txt"
 printf 'offline_added\n' > "$offline_watch_tmp/added.txt"
+("$bin" -q -F offline_new "$offline_watch_tmp") >/dev/null 2>&1 || true
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  sleep 1
+  if "$bin" -q -F offline_new "$offline_watch_tmp" && "$bin" -q -F offline_added "$offline_watch_tmp"; then
+    break
+  fi
+done
 "$bin" -q -F offline_new "$offline_watch_tmp"
 "$bin" -q -F offline_added "$offline_watch_tmp"
 ! "$bin" -q -F offline_old "$offline_watch_tmp"
 offline_watch_log="$("$tool_bin" log "$offline_watch_tmp")"
-grep -q 'startup-update' <<<"$offline_watch_log"
+grep -q 'startup-reconcile' <<<"$offline_watch_log"
+! grep -q 'startup-update' <<<"$offline_watch_log"
 "$tool_bin" stop "$offline_watch_tmp" >/dev/null
+
+crash_reconcile_tmp="$(mktemp -d)"
+write_project_config "$crash_reconcile_tmp" <<'CFG'
+[IndexSearch.files.include]
+*.txt
+CFG
+printf 'crash_old\n' > "$crash_reconcile_tmp/a.txt"
+"$tool_bin" index "$crash_reconcile_tmp" >/dev/null
+for _ in 1 2 3 4 5; do
+  [[ -f "$crash_reconcile_tmp/.indexsearch/search-daemon.txt" ]] && break
+  sleep 1
+done
+crash_pid="$(awk -F= '$1 == "pid" { print $2 }' "$crash_reconcile_tmp/.indexsearch/search-daemon.txt")"
+kill "$crash_pid" >/dev/null 2>&1 || true
+sleep 1
+printf 'crash_new\n' > "$crash_reconcile_tmp/a.txt"
+printf 'crash_added\n' > "$crash_reconcile_tmp/added.txt"
+"$bin" -q -F crash_new "$crash_reconcile_tmp" >/dev/null 2>&1 || true
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  sleep 1
+  if "$bin" -q -F crash_new "$crash_reconcile_tmp" && "$bin" -q -F crash_added "$crash_reconcile_tmp"; then
+    break
+  fi
+done
+"$bin" -q -F crash_new "$crash_reconcile_tmp"
+"$bin" -q -F crash_added "$crash_reconcile_tmp"
+! "$bin" -q -F crash_old "$crash_reconcile_tmp"
+crash_reconcile_log="$("$tool_bin" log "$crash_reconcile_tmp")"
+grep -q 'startup-reconcile' <<<"$crash_reconcile_log"
+! grep -q 'startup-update' <<<"$crash_reconcile_log"
+"$tool_bin" stop "$crash_reconcile_tmp" >/dev/null
 
 implicit_watch_tmp="$(mktemp -d)"
 write_project_config "$implicit_watch_tmp" <<'CFG'

@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -24,6 +25,9 @@ const RESPONSE_MAGIC: &[u8; 8] = b"ISDRES1\n";
 const STDOUT_FRAME: u8 = 1;
 const STDERR_FRAME: u8 = 2;
 const DONE_FRAME: u8 = 3;
+const SEARCH_DAEMON_SKIP_STARTUP_SYNC_ARG: &str = "--__indexsearch-daemon-skip-startup-sync";
+const SEARCH_DAEMON_BACKGROUND_RECONCILE_ARG: &str =
+    "--__indexsearch-daemon-background-reconcile";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(20);
 #[cfg(windows)]
 const START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1290,8 +1294,10 @@ fn start_project_service(root: &Path) -> Result<(), String> {
     } else {
         Command::new(backend)
     };
-    command.arg("search-daemon").arg("--detach");
-    command.arg(root).stdin(Stdio::null()).stdout(Stdio::null());
+    command
+        .args(search_daemon_detach_args(root))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null());
     if show_progress {
         command.stderr(Stdio::inherit());
     } else {
@@ -1307,6 +1313,16 @@ fn start_project_service(root: &Path) -> Result<(), String> {
             display_path(root)
         ))
     }
+}
+
+fn search_daemon_detach_args(root: &Path) -> Vec<OsString> {
+    vec![
+        OsString::from("search-daemon"),
+        OsString::from("--detach"),
+        root.as_os_str().to_os_string(),
+        OsString::from(SEARCH_DAEMON_SKIP_STARTUP_SYNC_ARG),
+        OsString::from(SEARCH_DAEMON_BACKGROUND_RECONCILE_ARG),
+    ]
 }
 
 fn hide_project_service_startup_parent(show_progress: bool) -> bool {
@@ -1935,6 +1951,26 @@ mod tests {
     fn project_service_startup_process_is_visible_when_showing_progress() {
         assert!(!hide_project_service_startup_parent(true));
         assert!(hide_project_service_startup_parent(false));
+    }
+
+    #[test]
+    fn project_service_start_skips_startup_sync() {
+        let args = search_daemon_detach_args(Path::new(r"D:\Project"));
+        let rendered: Vec<String> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "search-daemon",
+                "--detach",
+                r"D:\Project",
+                SEARCH_DAEMON_SKIP_STARTUP_SYNC_ARG,
+                SEARCH_DAEMON_BACKGROUND_RECONCILE_ARG,
+            ]
+        );
     }
 
     #[test]
