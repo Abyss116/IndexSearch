@@ -1619,8 +1619,7 @@ fn backend_candidate_paths() -> Vec<PathBuf> {
     let Some(dir) = exe.parent() else {
         return Vec::new();
     };
-    let versioned_daemon = format!("is-daemon-{}", display_version());
-    [versioned_daemon.as_str(), "is-daemon", "istool"]
+    ["is-daemon", "istool"]
         .into_iter()
         .map(|name| dir.join(executable_name(name)))
         .collect()

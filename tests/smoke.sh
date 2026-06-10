@@ -699,9 +699,21 @@ printf 'install_reinstall_symbol\n' > "$install_project/a.txt"
 install_projects_before="$("$install_tool" projects)"
 grep -q "$install_project" <<<"$install_projects_before"
 grep -q 'alive=true' <<<"$install_projects_before"
+install_versioned_daemon="$install_tmp/is-daemon-oldtest"
+if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* ]]; then
+  install_versioned_daemon="$install_versioned_daemon.exe"
+fi
+printf 'old daemon placeholder\n' > "$install_versioned_daemon"
 install_reinstall_out="$(INDEXSEARCH_SKIP_STALE_DAEMON_KILL=1 "$tool_bin" install --dir "$install_tmp")"
 grep -q 'stopped [0-9][0-9]* running project service' <<<"$install_reinstall_out"
+grep -q 'removed [0-9][0-9]* old versioned backend file' <<<"$install_reinstall_out"
+grep -q 'restarted [0-9][0-9]* project service' <<<"$install_reinstall_out"
+[[ ! -e "$install_versioned_daemon" ]]
 "$install_alias" --version >/dev/null
+install_projects_after="$("$install_tool" projects)"
+grep -q "$install_project" <<<"$install_projects_after"
+grep -q 'alive=true' <<<"$install_projects_after"
+"$install_alias" -q -F install_reinstall_symbol "$install_project"
 HOME="$skills_home" "$tool_bin" install-skills --target all --scope user >/dev/null
 [[ -f "$skills_home/.codex/skills/indexsearch/SKILL.md" ]]
 [[ -f "$skills_home/.codex/skills/indexsearch/scripts/prefer-isgrep-hook.py" ]]

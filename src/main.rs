@@ -3395,29 +3395,13 @@ fn command_install(args: &[String]) -> Result<i32> {
     let exe_path = dir.join(executable_name("indexsearch"));
     let alias_path = dir.join(executable_name("is"));
     let grep_alias_path = dir.join(executable_name("isgrep"));
+    let restart_roots = active_project_service_roots()?;
     let stopped = stop_all_project_services_quiet()?;
     if stopped != 0 {
         println!("stopped {stopped} running project service(s) before install");
     }
-    #[cfg(windows)]
-    let installed_backend_path = {
-        let versioned_daemon_path =
-            dir.join(executable_name(&format!("is-daemon-{}", display_version())));
-        install_executable(&daemon_src, &versioned_daemon_path)?;
-        if let Err(err) = install_executable(&daemon_src, &daemon_path) {
-            eprintln!(
-                "indexsearch: warning: could not replace {}; installed versioned backend {} instead ({err:#})",
-                display_path(&daemon_path),
-                display_path(&versioned_daemon_path)
-            );
-        }
-        versioned_daemon_path
-    };
-    #[cfg(not(windows))]
-    let installed_backend_path = {
-        install_executable(&daemon_src, &daemon_path)?;
-        daemon_path.clone()
-    };
+    install_executable(&daemon_src, &daemon_path)?;
+    let removed_versioned = remove_versioned_daemon_executables(&dir);
     install_executable(&tool_src, &tool_path)?;
     let frontend_src = src
         .parent()
@@ -3444,14 +3428,18 @@ fn command_install(args: &[String]) -> Result<i32> {
             display_path(&src)
         );
     }
-    println!("installed: {}", display_path(&installed_backend_path));
-    if installed_backend_path != daemon_path {
-        println!("legacy backend: {}", display_path(&daemon_path));
+    println!("installed: {}", display_path(&daemon_path));
+    if removed_versioned != 0 {
+        println!("removed {removed_versioned} old versioned backend file(s)");
     }
     println!("tool: {}", display_path(&tool_path));
     println!("frontend: {}", display_path(&exe_path));
     println!("frontend: {}", display_path(&alias_path));
     println!("frontend: {}", display_path(&grep_alias_path));
+    let restarted = restart_project_services_after_install(&restart_roots, &daemon_path);
+    if restarted != 0 {
+        println!("restarted {restarted} project service(s) after install");
+    }
     if !path_contains(&dir) {
         println!(
             "note: add {} to PATH to use istool, indexsearch, is, and isgrep from any shell",
@@ -3459,6 +3447,49 @@ fn command_install(args: &[String]) -> Result<i32> {
         );
     }
     Ok(0)
+}
+
+fn active_project_service_roots() -> Result<Vec<PathBuf>> {
+    fs::create_dir_all(project_registry_dir())?;
+    let mut roots = Vec::new();
+    let mut seen = HashSet::default();
+    for entry in fs::read_dir(project_registry_dir())?.flatten() {
+        let path = entry.path();
+        if !path.extension().is_some_and(|ext| ext == "project") {
+            continue;
+        }
+        let Ok(record) = read_project_record(&path) else {
+            continue;
+        };
+        if !process_alive(record.pid) || record.pid == std::process::id() {
+            continue;
+        }
+        let key = fs::canonicalize(&record.root)
+            .unwrap_or_else(|_| record.root.clone())
+            .to_string_lossy()
+            .into_owned();
+        if seen.insert(key) {
+            roots.push(record.root);
+        }
+    }
+    Ok(roots)
+}
+
+fn restart_project_services_after_install(roots: &[PathBuf], daemon_path: &Path) -> usize {
+    let mut restarted = 0usize;
+    for root in roots {
+        if let Err(err) = start_search_daemon_with_exe(root, daemon_path)
+            .and_then(|_| wait_for_installed_search_daemon_ready(root, daemon_path))
+        {
+            eprintln!(
+                "indexsearch: warning: could not restart project service for {} ({err:#})",
+                display_path(root)
+            );
+            continue;
+        }
+        restarted += 1;
+    }
+    restarted
 }
 
 fn sibling_executable(src: &Path, stem: &str) -> Option<PathBuf> {
@@ -6008,6 +6039,10 @@ fn append_profile_events<W: Write>(out: &mut W, profile: &SearchProfile) -> Resu
 
 fn start_search_daemon(root: &Path) -> Result<()> {
     let exe = search_daemon_executable()?;
+    start_search_daemon_with_exe(root, &exe)
+}
+
+fn start_search_daemon_with_exe(root: &Path, exe: &Path) -> Result<()> {
     let mut command = hidden_background_command(exe);
     command
         .arg("search-daemon")
@@ -6022,6 +6057,24 @@ fn start_search_daemon(root: &Path) -> Result<()> {
         bail!("failed to start project service for {}", display_path(root));
     }
     Ok(())
+}
+
+fn wait_for_installed_search_daemon_ready(root: &Path, daemon_path: &Path) -> Result<()> {
+    let start = Instant::now();
+    while start.elapsed() < SEARCH_DAEMON_START_TIMEOUT {
+        if let Ok(record) = read_search_daemon_record(&search_daemon_record_path(root))
+            && record.supports_search()
+            && process_alive(record.pid)
+            && same_clean_root(&record.exe_path, daemon_path)
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    bail!(
+        "project service did not become ready for {}",
+        display_path(root)
+    )
 }
 
 #[cfg(windows)]
@@ -6192,10 +6245,6 @@ fn search_daemon_executable() -> Result<PathBuf> {
         return Ok(exe);
     }
     if let Some(dir) = exe.parent() {
-        let versioned = dir.join(executable_name(&format!("is-daemon-{}", display_version())));
-        if versioned.is_file() {
-            return Ok(versioned);
-        }
         let daemon = dir.join(executable_name("is-daemon"));
         if daemon.is_file() {
             return Ok(daemon);
@@ -14641,6 +14690,35 @@ fn install_executable(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+fn remove_versioned_daemon_executables(dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let versioned = if cfg!(windows) {
+            name.starts_with("is-daemon-") && name.ends_with(".exe")
+        } else {
+            name.starts_with("is-daemon-")
+        };
+        if !versioned {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(err) => eprintln!(
+                "indexsearch: warning: could not remove old versioned backend {} ({err})",
+                display_path(&path)
+            ),
+        }
+    }
+    removed
+}
+
 #[cfg(unix)]
 fn install_alias(exe_path: &Path, alias_path: &Path) -> Result<()> {
     if alias_path.exists() {
@@ -14812,7 +14890,6 @@ fn search_daemon_client_exe_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join(executable_name(&format!("is-daemon-{}", display_version()))));
             candidates.push(dir.join(executable_name("is-daemon")));
             candidates.push(dir.join(executable_name("istool")));
         }
